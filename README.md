@@ -3,6 +3,7 @@ A collection of Bash scripts to automate updating, extracting, merging artwork, 
 
 ## Notes
 
+- After downloading the scripts into a directory, you will need to run 'sudo chmod + x *.sh' to make them executable. 
 - All scripts are written to be non-destructive where possible but do perform moves and renames; keeping backups of your WHDLoad tree is recommended before first use. 
 - This README intentionally avoids including any copyrighted third-party content and only describes the behaviour of the provided scripts.
 
