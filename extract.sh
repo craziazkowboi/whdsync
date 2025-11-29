@@ -28,6 +28,46 @@ else
     OS_NAME="Unknown"
 fi
 
+sanitize_amiga_names_macos() {
+    local root="$1"
+    [ -d "$root" ] || return 0
+
+    # Allowed: A–Z a–z 0–9 space _ - + ! () [] .
+    local pattern='[^A-Za-z0-9 _+\-\!\(\)\[\]\.]'
+
+    # Walk deepest paths first so we rename children before parents
+    find "$root" -depth -print0 | while IFS= read -r -d '' path; do
+        name="${path##*/}"
+        dir="${path%/*}"
+
+        # Skip if already clean ASCII/Amiga‑safe
+        if ! printf '%s' "$name" | LC_ALL=C grep -qE "$pattern"; then
+            continue
+        fi
+
+        # Replace disallowed chars with underscore
+        clean="$(printf '%s' "$name" | LC_ALL=C sed -E "s/$pattern/_/g")"
+
+        # Collapse multiple underscores
+        clean="$(printf '%s' "$clean" | sed -E 's/_+/_/g')"
+
+        # Avoid empty names
+        [ -z "$clean" ] && clean="_"
+
+        # If the target already exists, append a numeric suffix
+        target="$dir/$clean"
+        if [ -e "$target" ] && [ "$target" != "$path" ]; then
+            n=1
+            while [ -e "${target}_$n" ]; do
+                n=$((n+1))
+            done
+            target="${target}_$n"
+        fi
+
+        mv -n -- "$path" "$target" 2>/dev/null || mv -- "$path" "$target"
+    done
+}
+
 # Progress bar: block for macOS, text for others
 progress_bar() {
     local current="${1:-0}" total="${2:-1}" width="${3:-40}"
@@ -227,38 +267,87 @@ extract_archive() {
 }
 
 running_jobs=0
+tmpdir="$(mktemp -d "${SRCROOT}/extract_tmp.XXXXXX")" || {
+    echo -e "${RED}Failed to create temp directory for logs${NC}"
+    exit 1
+}
+
+dir_index=0
+
 for srcdir in "${dirs[@]}"; do
     reldir="${srcdir#$SRCROOT/}"
     destdir="$DEST/${reldir}"
-    mkdir -p "$destdir"
+    mkdir -p "$destdir" || continue
+
     abs_destdir="$(_readlinkf "$destdir")"
     if [ -z "$abs_destdir" ] || [ ! -d "$abs_destdir" ]; then
         continue
     fi
-    while IFS= read -r archive; do
-        [ -z "$archive" ] && continue
-        abs_archive="$(_readlinkf "$archive")"
-        if [ -z "$abs_archive" ] || [ ! -f "$abs_archive" ]; then
-            continue
-        fi
-        base="$(basename "$archive")"
-        ext="${base##*.}"
-        if ! extract_archive "$abs_archive" "$abs_destdir" "$ext"; then
-            echo "FAILED: $abs_archive (format: ${ext})" >> "$ERROR_LOG"
-            errors=$((errors+1))
-        fi
-    done < <(echo "${dir_archives["$srcdir"]}")
+
+    dir_index=$((dir_index + 1))
+    dir_log="${tmpdir}/dir_${dir_index}.log"
+
+    # One background job per srcdir
     (
-        true
+        local_errors=0
+        # iterate archives for this dir
+        while IFS= read -r archive; do
+            [ -z "$archive" ] && continue
+            abs_archive="$(_readlinkf "$archive")"
+            if [ -z "$abs_archive" ] || [ ! -f "$abs_archive" ]; then
+                continue
+            fi
+            base="$(basename "$archive")"
+            ext="${base##*.}"
+
+            if ! extract_archive "$abs_archive" "$abs_destdir" "$ext"; then
+                printf 'FAILED: %s (format: %s)\n' "$abs_archive" "$ext" >>"$dir_log"
+                local_errors=$((local_errors + 1))
+            fi
+        done < <(printf '%s\n' "${dir_archives["$srcdir"]}")
+
+        # macOS‑only: clean filenames to ASCII/Amiga‑safe set
+        if [[ "$OS_TYPE" == "darwin" ]]; then
+            sanitize_amiga_names_macos "$abs_destdir"
+        fi
+
+        # exit status = number of errors in this dir (capped at 255)
+        exit $(( local_errors > 255 ? 255 : local_errors ))
     ) &
+
     running_jobs=$((running_jobs + 1))
-    (( running_jobs >= max_parallel )) && { wait -n; running_jobs=$((running_jobs - 1)); }
-    dir_count=$((dir_count + 1))
-    progress_bar "$dir_count" "$total_dirs" 40
+    # throttle parallelism
+    if (( running_jobs >= max_parallel )); then
+        # wait for one job to finish; we don't care which
+        if wait -n; then
+            :
+        else
+            :
+        fi
+        running_jobs=$((running_jobs - 1))
+    fi
+
+    progress_bar "$dir_index" "$total_dirs" 40
 done
 
+# wait for remaining jobs
 wait
 echo
+
+# Aggregate error logs
+ERROR_LOG="$SRCROOT/extract_errors.log"
+: > "$ERROR_LOG"
+
+if [ -d "$tmpdir" ]; then
+    cat "$tmpdir"/dir_*.log 2>/dev/null >>"$ERROR_LOG"
+    rm -rf "$tmpdir"
+fi
+
+if [ -s "$ERROR_LOG" ]; then
+    errors="$(wc -l <"$ERROR_LOG" 2>/dev/null || echo 0)"
+else
+    errors=0
+fi
 
 extraction_end=$(date +%s)
 total_time=$((extraction_end - extraction_start))
