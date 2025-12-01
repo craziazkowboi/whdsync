@@ -353,7 +353,6 @@ shopt -s nullglob
 
 for dest_sub in "${merge_targets[@]}"; do
     [ -z "$dest_sub" ] && exit 0
-
     dest_name="$(basename "$dest_sub")"
     debug_log "Processing target: $dest_name -> $dest_sub"
 
@@ -385,31 +384,74 @@ for dest_sub in "${merge_targets[@]}"; do
 
         debug_log "INDEX: $dest_name -> $best_section -> $best_dir"
 
-        files=("$best_dir"/*)
-        if [ ${#files[@]} -gt 0 ] && [ -e "${files}" ]; then
-            debug_log " Copying ${#files[@]} files from $best_section (priority $priority_idx) to $dest_sub/"
-            for f in "${files[@]}"; do
-                [ -f "$f" ] || continue
-                base="$(basename "$f")"
-                dest_file="$dest_sub/$base"
-
-                # Apply priority-based renaming for iGame.iff
-                if [ "$base" = "iGame.iff" ] || [ "$base" = "igame.iff" ]; then
-                    case "$priority_idx" in
-                        0) dest_file="$dest_sub/iGame.iff" ;;
-                        1) dest_file="$dest_sub/igame1.iff" ;;
-                        2) dest_file="$dest_sub/igame2.iff" ;;
-                    esac
+        # 1) Copy all non-IFF artwork files from this section into the game dir
+        #    Preserve original names; skip any that already exist.
+        for f in "$best_dir"/*; do
+            [ -f "$f" ] || continue
+            base="$(basename "$f")"
+            case "${base,,}" in
+                *.iff) continue ;;  # handled separately below
+            esac
+            dest_file="$dest_sub/$base"
+            if [ ! -e "$dest_file" ]; then
+                debug_log " Non-IFF copy: $base -> $(basename "$dest_file")"
+                if ! cp -p "$f" "$dest_file" 2>/dev/null; then
+                    echo "ERROR copying non-IFF $best_section for $dest_name from $f" >> "$ERROR_LOG"
                 fi
+            fi
+        done
 
-                debug_log " -> $base -> $(basename "$dest_file")"
+        # 2) Handle the iGame.iff file according to priority index
+        chosen_src_iff=""
+        for f in "$best_dir"/*; do
+            [ -f "$f" ] || continue
+            base="$(basename "$f")"
+            case "${base,,}" in
+                igame.iff)
+                    chosen_src_iff="$f"
+                    break
+                    ;;
+            esac
+        done
 
-                if cp -f "$f" "$dest_file" 2>/dev/null; then
-                    igameecs_found=1
+        if [ -n "$chosen_src_iff" ]; then
+            base="$(basename "$chosen_src_iff")"
+            dest_file="$dest_sub/$base"
+
+            # Priority-based renaming for iGame.iff
+            case "$priority_idx" in
+                0) dest_file="$dest_sub/iGame.iff" ;;
+                1) dest_file="$dest_sub/igame1.iff" ;;
+                2) dest_file="$dest_sub/igame2.iff" ;;
+            esac
+
+            debug_log " iGame.iff copy: $(basename "$chosen_src_iff") -> $(basename "$dest_file")"
+            if cp -f "$chosen_src_iff" "$dest_file" 2>/dev/null; then
+                igameecs_found=1
+            else
+                echo "ERROR copying $best_section for $dest_name from $chosen_src_iff" >> "$ERROR_LOG"
+            fi
+
+            # 3) Paired .data handling: same stem as chosen_src_iff, only if missing in target
+            src_stem="${chosen_src_iff%.*}"
+            data_src="${src_stem}.data"
+            if [ -f "$data_src" ]; then
+                data_base="$(basename "$data_src")"
+                data_dst="$dest_sub/$data_base"
+                if [ ! -e "$data_dst" ]; then
+                    debug_log " Paired .data copy: $data_base -> $(basename "$data_dst")"
+                    if ! cp -p "$data_src" "$data_dst" 2>/dev/null; then
+                        echo "ERROR copying .data for $dest_name from $data_src" >> "$ERROR_LOG"
+                    fi
                 else
-                    echo "ERROR copying $best_section for $dest_name from $f" >> "$ERROR_LOG"
+                    debug_log " Paired .data exists, skipping: $data_base"
                 fi
-            done
+            fi
+        fi
+
+        # Log iGame section usage (count files in best_dir just as before)
+        files=("$best_dir"/*)
+        if [ ${#files[@]} -gt 0 ] && [ -e "${files[0]}" ]; then
             echo "$best_section $dest_name: ${#files[@]} files" >> "$IGAMEECS_LOG"
         fi
     fi
@@ -419,10 +461,8 @@ for dest_sub in "${merge_targets[@]}"; do
         for subdir in Game Demo Magazine Beta; do
             search_dir="$TINYLAUNCHER_SRC/$subdir"
             [ ! -d "$search_dir" ] && continue
-
             debug_log "Checking TinyLauncher $subdir: $search_dir"
             tl_src=""
-
             for ext in iff IFF; do
                 candidate="$search_dir/${dest_name}_SCR${tl_primary_index}.${ext}"
                 if [ -f "$candidate" ]; then
@@ -431,11 +471,9 @@ for dest_sub in "${merge_targets[@]}"; do
                     break
                 fi
             done
-
             if [ -n "$tl_src" ]; then
                 dest_file="$dest_sub/iGame.iff"
                 debug_log " Copying TinyLauncher -> $dest_file"
-
                 if cp -f "$tl_src" "$dest_file" 2>/dev/null; then
                     tinylauncher_found=1
                     echo "1" >> "$TINYLAUNCHER_LOG"
@@ -459,7 +497,6 @@ for dest_sub in "${merge_targets[@]}"; do
     fi
 done
 
-wait
 shopt -u nullglob
 
 # Ensure final progress bar at 100% (in case last step missed the modulus)
