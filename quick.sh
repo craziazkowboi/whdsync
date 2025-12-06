@@ -118,7 +118,7 @@ done < "$UPDATE_LOG"
 
 # Run extract.sh on the temporary directory
 cd "$temp_extract_dir" || exit 1
-bash "$SCRIPT_DIR/extract.sh" "$NEWDIR"
+bash "$SCRIPT_DIR/extract.sh" -d "$NEWDIR"
 extract_exit=$?
 cd "$SCRIPT_DIR" || exit 1
 rm -rf "$temp_extract_dir"
@@ -134,9 +134,9 @@ if [ ! -d "$SCRIPT_DIR/iGame_art" ]; then
   echo -e "${YELLOW}Warning: iGame_art directory not found. Skipping artwork merge.${NC}"
 else
   if [ -n "$MODE_OPT" ]; then
-    DEST_OVERRIDE="$NEWDIR" bash "$SCRIPT_DIR/merge.sh" $DEST_OPT "$MODE_OPT"
+    DEST_OVERRIDE="$NEWDIR" bash "$SCRIPT_DIR/merge.sh" -d $DEST_OPT "$MODE_OPT"
   else
-    DEST_OVERRIDE="$NEWDIR" bash "$SCRIPT_DIR/merge.sh" $DEST_OPT
+    DEST_OVERRIDE="$NEWDIR" bash "$SCRIPT_DIR/merge.sh" -d $DEST_OPT
   fi
   merge_exit=$?
   if [ $merge_exit -ne 0 ]; then
@@ -152,7 +152,7 @@ echo
 temp_sort="$SCRIPT_DIR/.temp_sort.sh"
 sed "s|DEST=\"\$HOME/retro\"|DEST=\"$NEWDIR\"|g" "$SCRIPT_DIR/sort.sh" > "$temp_sort"
 chmod +x "$temp_sort"
-bash "$temp_sort" $DEST_OPT
+bash "$temp_sort" -d $DEST_OPT
 sort_exit=$?
 rm -f "$temp_sort"
 if [ $sort_exit -ne 0 ]; then
