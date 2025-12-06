@@ -328,20 +328,15 @@ check_script() {
 # ----- Helper function: Run subscript with debug output -----
 run_sub() {
   local script_name="$1"
-  shift  # Remove script name, keep remaining args
+  shift
 
   if [ "$DEBUG_MODE" -eq 1 ]; then
     echo "[DEBUG] Running: $script_name $*"
   fi
 
-check_script "$script_name"
-# If ACTION is 'quick', append -d "$NEW_DIR" to the call
-if [ "$ACTION" = "quick" ]; then
-"$script_name" "$@" -d "$NEW_DIR"
-else
-"$script_name" "$@"
-fi
+  check_script "$script_name"
 
+  "$script_name" "$@"
 }
 
 # Main dispatcher logic

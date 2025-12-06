@@ -2,6 +2,32 @@
 
 # Requirements: bash, wget
 
+# Check for iGame / TinyLauncher artwork directories in current directory
+required_art_dirs=(
+  "iGame_art"
+  "iGame_ECS"
+  "iGame_RTG"
+  "iGame_AGA"
+  "TinyLauncher"
+)
+
+missing_art=0
+for d in "${required_art_dirs[@]}"; do
+  if [ ! -d "./$d" ]; then
+    missing_art=1
+    break
+  fi
+done
+
+if [ "$missing_art" -ne 0 ]; then
+  echo "One or more iGame/TinyLauncher artwork directories (iGame_art, iGame_ECS, iGame_RTG, iGame_AGA, TinyLauncher) are missing in the directory where this script is run."
+  echo "iGame artwork packs can be downloaded from:"
+  echo "  https://eab.abime.net/showthread.php?t=106096"
+  echo
+  # Uncomment the next line if you want to force setting up artwork before running:
+  # exit 1
+fi
+
 IFS=$'\n'
 
 dirs=(

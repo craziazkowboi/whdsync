@@ -66,7 +66,7 @@ echo -e "${GREEN}Step 1: Downloading new archives...${NC}"
 echo -e "${BLUE}Running update.sh${NC}"
 echo
 
-bash "$SCRIPT_DIR/update.sh" $DEST_OPT
+bash "$SCRIPT_DIR/update.sh"
 update_exit=$?
 if [ $update_exit -ne 0 ]; then
   echo -e "${RED}Error: update.sh failed with exit code $update_exit${NC}"
