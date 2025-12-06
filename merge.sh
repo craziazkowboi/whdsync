@@ -122,14 +122,14 @@ while [ $# -gt 0 ]; do
         --aga) ART_SRC="$IGAME_AGA_SRC"; shift ;;
         --rtg) ART_SRC="$IGAME_RTG_SRC"; shift ;;
         -d|--destination) DEST="$2"; shift 2 ;;
-        --art-order) ART_PRIORITY="$2"; shift 2 ;;
+        --art) ART_PRIORITY="$2"; shift 2 ;;
         --a314) PLATFORM_HINT="a314"; shift ;;
         --debug) DEBUG=1; shift ;;
         -h|--help)
             echo
             echo "Amiga Retroplay iGame Artwork Merger"
             echo "Version: 1.6.0-adaptive-a314 (Priority-ordered merge)"
-            echo "Usage: $(basename "$0") [--custom] [--ecs|--aga|--rtg] [-d DEST] [--art-order ORDER] [--debug]"
+            echo "Usage: $(basename "$0") [--custom] [--ecs|--aga|--rtg] [-d DEST] [--art ORDER] [--debug]"
             echo
             echo "Options:"
             echo "  --custom          Show interactive menu to select artwork set"
@@ -137,8 +137,8 @@ while [ $# -gt 0 ]; do
             echo "  --aga             Use iGame_AGA source"
             echo "  --rtg             Use iGame_RTG source"
             echo "  -d, --destination Set destination directory (default: ./retro)"
-            echo "  --art-order       Set merge priority order (default: Screens,Covers,Titles)"
-            echo "                    Example: --art-order \"Screens,Covers,Titles\""
+            echo "  --art             Set merge priority order (default: Screens,Covers,Titles)"
+            echo "                    Example: --art \"Screens,Covers,Titles\""
             echo "                    Comma-separated list: Screens,Covers,Titles or any other order"
             echo "                    First:  copy as-is (used by iGame)"
             echo "                    Second: iGame.iff -> igame1.iff (not used by iGame)"
@@ -165,7 +165,7 @@ DEST="${DEST%/}"
 # Parse section priority order
 IFS=',' read -r -a ART_ORDER <<< "$ART_PRIORITY"
 
-# Decide which TinyLauncher SCR index becomes iGame.iff based on first art-order entry
+# Decide which TinyLauncher SCR index becomes iGame.iff based on first art entry
 primary_section="${ART_ORDER[0]}"
 case "$primary_section" in
     Covers)  tl_primary_index=0 ;; # iGame.iff from _SCR0

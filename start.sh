@@ -6,6 +6,7 @@
 
 script_start_time=$(date +%s)
 ORIG_PWD=$(pwd)
+NEW_DIR="${ORIG_PWD}/new"
 
 ulimit -n 16384
 
@@ -144,7 +145,7 @@ while [ $# -gt 0 ]; do
       echo "  --ffs                 Run sort.sh with --ffs."
       echo "  --pfs                 Run sort.sh with --pfs."
       echo "  --dest [path]         Set custom destination directory."
-      echo "  --art-order [order]   Set merge priority order (e.g., Screens,Covers,Titles)."
+      echo "  --art [order]   Set merge priority order (e.g., Screens,Covers,Titles)."
       echo "  --debug               Enable debug output."
       echo "  --exit                Exit immediately."
       echo
@@ -198,7 +199,7 @@ while [ $# -gt 0 ]; do
       DEST_OPT="$2"
       shift 2
       ;;
-    --art-order)
+    --art)
       ART_ORDER_OPT="$2"
       shift 2
       ;;
@@ -223,7 +224,7 @@ if [ -z "$ACTION" ]; then
   echo "Version: ${version}"
   echo
   echo "Select an action:"
-  echo "  1) Auto (update, extract, merge, sort)"
+  echo "  1) Auto (update, extract, merge, sort, clean)"
   echo "  2) Update only"
   echo "  3) Extract only"
   echo "  4) Merge artwork"
@@ -325,7 +326,7 @@ check_script() {
 }
 
 # ----- Helper function: Run subscript with debug output -----
-run_subscript() {
+run_sub() {
   local script_name="$1"
   shift  # Remove script name, keep remaining args
 
@@ -333,26 +334,32 @@ run_subscript() {
     echo "[DEBUG] Running: $script_name $*"
   fi
 
-  check_script "$script_name"
-  "$script_name" "$@"
+check_script "$script_name"
+# If ACTION is 'quick', append -d "$NEW_DIR" to the call
+if [ "$ACTION" = "quick" ]; then
+"$script_name" "$@" -d "$NEW_DIR"
+else
+"$script_name" "$@"
+fi
+
 }
 
 # Main dispatcher logic
 if [ "$ACTION" = "auto" ]; then
-  run_subscript ./update.sh
-  run_subscript ./extract.sh
-  run_subscript ./merge.sh "$MERGE_OPT" --art-order "$ART_ORDER_OPT"
-  run_subscript ./sort.sh "$SORT_OPT" --dest "${DEST_OPT:-}"
+  run_sub ./update.sh
+  run_sub ./extract.sh
+  run_sub ./merge.sh "$MERGE_OPT" --art "$ART_ORDER_OPT"
+  run_sub ./sort.sh "$SORT_OPT" --dest "${DEST_OPT:-}"
 elif [ "$ACTION" = "update" ]; then
-  run_subscript ./update.sh
+  run_sub ./update.sh
 elif [ "$ACTION" = "extract" ]; then
-  run_subscript ./extract.sh
+  run_sub ./extract.sh
 elif [ "$ACTION" = "merge" ]; then
-  run_subscript ./merge.sh "$MERGE_OPT" --art-order "$ART_ORDER_OPT"
+  run_sub ./merge.sh "$MERGE_OPT" --art "$ART_ORDER_OPT"
 elif [ "$ACTION" = "sort" ]; then
-  run_subscript ./sort.sh "$SORT_OPT" --dest "${DEST_OPT:-}"
+  run_sub ./sort.sh "$SORT_OPT" --dest "${DEST_OPT:-}"
 elif [ "$ACTION" = "quick" ]; then
-  run_subscript ./quick.sh
+  run_sub ./quick.sh
 else
   echo
   echo "No valid action resolved. Use -h or --help to see available options."

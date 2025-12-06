@@ -21,6 +21,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NEWDIR="$SCRIPT_DIR/new"
 UPDATE_LOG="$SCRIPT_DIR/update.log"
+DEST_OPT=""
 MODE_OPT=""
 
 # --- Parse CLI Options for ECS/AGA/RTG
@@ -30,8 +31,13 @@ while [[ $# -gt 0 ]]; do
       MODE_OPT="$1"
       shift
       ;;
+    -d|--dest)
+      # Pass custom destination or use ./new by default
+      DEST_OPT="-d $2"
+      shift 2
+      ;;
     --help|-h)
-      echo -e "${BOLD}Usage: $0 [--ECS|--AGA|--RTG]${NC}"
+      echo -e "${BOLD}Usage: $0 [--ECS|--AGA|--RTG] [-d DEST]${NC}"
       exit 0
       ;;
     *)
@@ -60,7 +66,7 @@ echo -e "${GREEN}Step 1: Downloading new archives...${NC}"
 echo -e "${BLUE}Running update.sh${NC}"
 echo
 
-bash "$SCRIPT_DIR/update.sh"
+bash "$SCRIPT_DIR/update.sh" $DEST_OPT
 update_exit=$?
 if [ $update_exit -ne 0 ]; then
   echo -e "${RED}Error: update.sh failed with exit code $update_exit${NC}"
@@ -128,9 +134,9 @@ if [ ! -d "$SCRIPT_DIR/iGame_art" ]; then
   echo -e "${YELLOW}Warning: iGame_art directory not found. Skipping artwork merge.${NC}"
 else
   if [ -n "$MODE_OPT" ]; then
-    DEST_OVERRIDE="$NEWDIR" bash "$SCRIPT_DIR/merge.sh" "$MODE_OPT"
+    DEST_OVERRIDE="$NEWDIR" bash "$SCRIPT_DIR/merge.sh" $DEST_OPT "$MODE_OPT"
   else
-    DEST_OVERRIDE="$NEWDIR" bash "$SCRIPT_DIR/merge.sh"
+    DEST_OVERRIDE="$NEWDIR" bash "$SCRIPT_DIR/merge.sh" $DEST_OPT
   fi
   merge_exit=$?
   if [ $merge_exit -ne 0 ]; then
@@ -146,7 +152,7 @@ echo
 temp_sort="$SCRIPT_DIR/.temp_sort.sh"
 sed "s|DEST=\"\$HOME/retro\"|DEST=\"$NEWDIR\"|g" "$SCRIPT_DIR/sort.sh" > "$temp_sort"
 chmod +x "$temp_sort"
-bash "$temp_sort"
+bash "$temp_sort" $DEST_OPT
 sort_exit=$?
 rm -f "$temp_sort"
 if [ $sort_exit -ne 0 ]; then
