@@ -5,10 +5,21 @@
 # Version: 1.6.0-adaptive-a314 (Priority-ordered merge with flexible section names)
 
 BAR_WIDTH=40
+NO_COLOR="${NO_COLOR:-0}"
+
+if [ "$NO_COLOR" = "1" ] || [ ! -t 1 ]; then
+  RED=""; GREEN=""; YELLOW=""; BLUE=""; BOLD=""; NC="";
+else
+  RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m';
+  BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m';
+fi
 DEBUG=0
 processed=0
 CUSTOM=0
-ART_PRIORITY="Screens,Covers,Titles" # default order
+GAME_ART_PRIORITY="Screens,Covers,Titles"       # default order for non-demos
+DEMO_ART_PRIORITY="Titles,Screens,Covers"  # default order for demos
+DEMO_ART_OVERRIDE=0                        # set to 1 if --demo-art is used
+
 
 # Progress update step (tuned later per platform)
 PROGRESS_STEP=100
@@ -20,23 +31,31 @@ progress_bar() {
     local current="${1:-0}" total="${2:-1}" width="${3:-40}"
 
 if [[ "$(uname)" = "Darwin" ]]; then
-    local percent barlen whole partialfrac partialblock left bar
-    local progchars=(' ' '▏' '▎' '▍' '▌' '▋' '▊' '▉' '█')
+  local percent barlen whole partialfrac partialblock left bar
+  local progchars=(' ' '▏' '▎' '▍' '▌' '▋' '▊' '▉' '█')
 
-    (( total > 0 )) && percent=$(( 100 * current / total )) || percent=0
-    barlen=$(awk "BEGIN{printf \"%.2f\", ($width * $current) / $total}")
-    whole=${barlen%.*}
-    partialfrac="0.${barlen#*.}"
-    partialblock=$(awk "BEGIN{print int(${partialfrac}*8+0.5)}")
+  (( total > 0 )) && percent=$(( 100 * current / total )) || percent=0
+  barlen=$(awk "BEGIN{printf \"%.2f\", ($width * $current) / $total}")
+  whole=${barlen%.*}
+  partialfrac="0.${barlen#*.}"
+  partialblock=$(awk "BEGIN{print int(${partialfrac}*8+0.5)}")
 
-    bar=""
-    for ((i=0; i < whole; i++)); do bar+="${progchars}"; done
-    if [ "$partialblock" -gt 0 ]; then bar+="${progchars[$partialblock]}"; fi
+  bar=""
+  # Fill all completed cells with a full block
+  for ((i=0; i < whole; i++)); do bar+="${progchars[8]}"; done
 
-    left=$(( width - ${#bar} ))
-    for ((i=0; i < left; i++)); do bar+="${progchars}"; done
+  # Add one partial cell if needed
+  if [ "$partialblock" -gt 0 ] && [ "$whole" -lt "$width" ]; then
+    bar+="${progchars[$partialblock]}"
+    left=$(( width - whole - 1 ))
+  else
+    left=$(( width - whole ))
+  fi
 
-    printf "\rProgress: %3d%% [%-${width}s] %d/%d" "$percent" "$bar" "$current" "$total"
+  # Pad the rest with spaces
+  for ((i=0; i < left; i++)); do bar+=" "; done
+
+  printf "\rProgress: %3d%% [%-${width}s] %d/%d" "$percent" "$bar" "$current" "$total"
 else
     local percent filled empty bar
 
@@ -75,12 +94,12 @@ debug_log() {
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-IGAME_ECS_SRC="$SCRIPT_DIR/iGame_ECS"
+IGAME_SRC="$SCRIPT_DIR/iGame_ECS"
 IGAME_AGA_SRC="$SCRIPT_DIR/iGame_AGA"
 IGAME_RTG_SRC="$SCRIPT_DIR/iGame_RTG"
 TINYLAUNCHER_SRC="$SCRIPT_DIR/TinyLauncher"
 DEFAULT_DEST="$SCRIPT_DIR/retro"
-ART_SRC="$IGAME_ECS_SRC"
+ART_SRC="$IGAME_SRC"
 DEST=""
 
 show_artwork_menu() {
@@ -106,10 +125,10 @@ show_artwork_menu() {
     fi
 
     case "$choice" in
-        1) ART_SRC="$IGAME_ECS_SRC"; echo "Selected: ECS" ;;
+        1) ART_SRC="$IGAME_SRC"; echo "Selected: ECS" ;;
         2) ART_SRC="$IGAME_AGA_SRC"; echo "Selected: AGA" ;;
         3) ART_SRC="$IGAME_RTG_SRC"; echo "Selected: RTG" ;;
-        *) echo "Invalid choice. Defaulting to ECS."; ART_SRC="$IGAME_ECS_SRC" ;;
+        *) echo "Invalid choice. Defaulting to ECS."; ART_SRC="$IGAME_SRC" ;;
     esac
 }
 
@@ -118,11 +137,19 @@ show_artwork_menu() {
 while [ $# -gt 0 ]; do
     case "$1" in
         --custom) CUSTOM=1; shift ;;
-        --ecs) ART_SRC="$IGAME_ECS_SRC"; shift ;;
+        --ecs) ART_SRC="$IGAME_SRC"; shift ;;
         --aga) ART_SRC="$IGAME_AGA_SRC"; shift ;;
         --rtg) ART_SRC="$IGAME_RTG_SRC"; shift ;;
-        -d|--destination) DEST="$2"; shift 2 ;;
-        --art) ART_PRIORITY="$2"; shift 2 ;;
+        -d|--dest) DEST="$2"; shift 2 ;;
+        --art)
+        GAME_ART_PRIORITY="$2"
+        shift 2
+        ;;
+    --demo-art)
+        DEMO_ART_PRIORITY="$2"
+        DEMO_ART_OVERRIDE=1
+        shift 2
+        ;; 
         --a314) PLATFORM_HINT="a314"; shift ;;
         --debug) DEBUG=1; shift ;;
         -h|--help)
@@ -136,13 +163,11 @@ while [ $# -gt 0 ]; do
             echo "  --ecs             Use iGame_ECS source (default)"
             echo "  --aga             Use iGame_AGA source"
             echo "  --rtg             Use iGame_RTG source"
-            echo "  -d, --destination Set destination directory (default: ./retro)"
-            echo "  --art             Set merge priority order (default: Screens,Covers,Titles)"
-            echo "                    Example: --art \"Screens,Covers,Titles\""
-            echo "                    Comma-separated list: Screens,Covers,Titles or any other order"
-            echo "                    First:  copy as-is (used by iGame)"
-            echo "                    Second: iGame.iff -> igame1.iff (not used by iGame)"
-            echo "                    Third:  iGame.iff -> igame2.iff (not used by iGame)"
+            echo " -d, --dest Set destination directory (default: ./retro)"
+            echo " --art Set merge priority order for non-demos (default: Screens,Covers,Titles)"
+            echo "       Example: --art \"Screens,Covers,Titles\""
+            echo " --demo-art Set merge priority order for Demos (default: Titles,Screens,Covers)"
+            echo "       Example: --demo-art \"Titles,Screens,Covers\""
             echo "  --a314            Hint: running on A314 (lower parallelism, fewer updates)"
             echo "  --debug           Enable debug output to trace artwork matching"
             echo
@@ -159,11 +184,12 @@ if [ "$CUSTOM" -eq 1 ]; then
     show_artwork_menu
 fi
 
+# DEST can be set via -d/--dest or forwarded from start.sh
 DEST="${DEST:-$DEFAULT_DEST}"
 DEST="${DEST%/}"
 
-# Parse section priority order
-IFS=',' read -r -a ART_ORDER <<< "$ART_PRIORITY"
+# Parse section priority order (non-demos baseline)
+IFS=',' read -r -a ART_ORDER <<< "$GAME_ART_PRIORITY"
 
 # Decide which TinyLauncher SCR index becomes iGame.iff based on first art entry
 primary_section="${ART_ORDER[0]}"
@@ -303,25 +329,26 @@ elif [ -e /proc/a314 ] || ls /dev/a314* >/dev/null 2>&1; then
     PROGRESS_STEP=500
 fi
 
-echo "=========================================="
-echo "Amiga Retroplay iGame Artwork Merger"
-echo "Version: 1.6.0-adaptive-a314"
-echo "=========================================="
-echo "Platform: $(uname)"
-echo "Detected CPU core(s): $CORES"
-echo "Parallel job limit: $max_parallel"
-echo "Destination directory: $DEST"
-echo "Selected artwork source: $ART_SRC"
-echo "Section merge order: ${ART_ORDER[*]}"
-[ -d "$TINYLAUNCHER_SRC" ] && echo "TinyLauncher source: $TINYLAUNCHER_SRC"
-[ "$DEBUG" -eq 1 ] && echo "Debug mode: ENABLED"
-echo "=========================================="
+echo -e "${BOLD}==========================================${NC}"
+echo -e "${BOLD} Amiga Retroplay iGame Artwork Merger ${NC}"
+echo -e "${BOLD} Version: 1.6.0-adaptive-a314 ${NC}"
+echo -e "${BOLD}==========================================${NC}"
+echo -e "Platform: ${YELLOW}$(uname)${NC}"
+echo -e "Detected CPU core(s): ${YELLOW}$CORES${NC}"
+echo -e "Parallel job limit: ${YELLOW}$max_parallel${NC}"
+echo -e "Destination directory: ${YELLOW}$DEST${NC}"
+echo -e "Selected artwork source: ${YELLOW}$ART_SRC${NC}"
+echo -e "Game/Mag art order: ${YELLOW}$GAME_ART_PRIORITY${NC}"
+echo -e "Demo art order: ${YELLOW}$DEMO_ART_PRIORITY${NC}"
+[ -d "$TINYLAUNCHER_SRC" ] && echo -e "TinyLauncher source: ${YELLOW}$TINYLAUNCHER_SRC${NC}"
+[ "$DEBUG" -eq 1 ] && echo -e "${YELLOW}Debug mode: ENABLED${NC}"
+echo -e "${BOLD}==========================================${NC}"
 echo
 
 whdload_path="$DEST/WHDLoad"
 whdload_dirs=()
 while IFS= read -r -d '' dir; do
-    whdload_dirs+=("$dir")
+    whdload_dirs+=( "$dir" )
 done < <(find "$whdload_path" -mindepth 1 -maxdepth 4 -type d -print0 2>/dev/null)
 
 total_dirs="${#whdload_dirs[@]}"
@@ -344,20 +371,67 @@ trap 'echo -e "\nAborted by user. Cleaning up..."; pkill -P $$; rm -f "$ERROR_LO
 
 merge_targets=()
 while IFS= read -r -d '' dir; do
-    merge_targets+=("$dir")
-done < <(find "$whdload_path" -maxdepth 4 -type d -print0 2>/dev/null)
+    base="$(basename "$dir")"
+
+    # Skip known non-game helper directories
+    case "$base" in
+        data|Data|txt|TXT|info|Info|cfg|CFG)
+            debug_log "Skipping helper directory: $dir"
+            continue
+            ;;
+    esac
+
+    merge_targets+=( "$dir" )
+done < <(find "$whdload_path" -mindepth 1 -maxdepth 4 -type d -print0 2>/dev/null)
 
 total_targets="${#merge_targets[@]}"
 
 shopt -s nullglob
-
 for dest_sub in "${merge_targets[@]}"; do
     [ -z "$dest_sub" ] && exit 0
     dest_name="$(basename "$dest_sub")"
     debug_log "Processing target: $dest_name -> $dest_sub"
 
+    # Select artwork order for this directory
+    # Default: non-demos use GAME_ART_PRIORITY; Demos use DEMO_ART_PRIORITY (unless overridden)
+    if [[ "$dest_sub" == *"/Demos/"* ]]; then
+        # Use demo-specific order (default Titles,Screens,Covers, or CLI override)
+        IFS=',' read -r -a ART_ORDER <<< "$DEMO_ART_PRIORITY"
+    else
+        # Use standard game/mag order
+        IFS=',' read -r -a ART_ORDER <<< "$GAME_ART_PRIORITY"
+    fi
+
+    # Decide TinyLauncher primary index based on first section for this directory
+    primary_section="${ART_ORDER[0]}"
+    case "$primary_section" in
+        Covers) tl_primary_index=0 ;; # iGame.iff from _SCR0
+        Titles) tl_primary_index=1 ;; # iGame.iff from _SCR1
+        Screens) tl_primary_index=2 ;; # iGame.iff from _SCR2
+        *)      tl_primary_index=0 ;; # sensible default
+    esac
+
     igameecs_found=0
     tinylauncher_found=0
+
+    # Fast pre-check: skip dirs that cannot correspond to any game name
+    has_any_match=0
+    for section in "${ART_ORDER[@]}"; do
+        key="$section|$dest_name"
+        if [ -n "${IGAME_INDEX_BY_SECTION[$key]+_}" ]; then
+            has_any_match=1
+            break
+        fi
+    done
+
+    if [ "$has_any_match" -eq 0 ]; then
+        debug_log "Skipping non-game directory: $dest_name"
+        processed=$((processed + 1))
+        if (( processed % PROGRESS_STEP == 0 || processed == total_targets )); then
+            progress_bar "$processed" "$total_targets" "$BAR_WIDTH"
+        fi
+        continue
+    fi
 
     best_section=""
     best_dir=""
@@ -372,18 +446,7 @@ for dest_sub in "${merge_targets[@]}"; do
         fi
     done
 
-    if [ -n "$best_dir" ] && [ -d "$best_dir" ]; then
-        # Determine priority index (0,1,2) for chosen section
-        priority_idx=-1
-        for i in "${!ART_ORDER[@]}"; do
-            if [ "${ART_ORDER[$i]}" = "$best_section" ]; then
-                priority_idx="$i"
-                break
-            fi
-        done
-
-        debug_log "INDEX: $dest_name -> $best_section -> $best_dir"
-
+        if [ -n "$best_dir" ] && [ -d "$best_dir" ]; then
         # 1) Copy all non-IFF artwork files from this section into the game dir
         #    Preserve original names; skip any that already exist.
         for f in "$best_dir"/*; do
@@ -402,6 +465,14 @@ for dest_sub in "${merge_targets[@]}"; do
         done
 
         # 2) Handle the iGame.iff file according to priority index
+        priority_idx=-1
+        for i in "${!ART_ORDER[@]}"; do
+            if [ "${ART_ORDER[$i]}" = "$best_section" ]; then
+                priority_idx="$i"
+                break
+            fi
+        done
+
         chosen_src_iff=""
         for f in "$best_dir"/*; do
             [ -f "$f" ] || continue
@@ -426,33 +497,41 @@ for dest_sub in "${merge_targets[@]}"; do
             esac
 
             debug_log " iGame.iff copy: $(basename "$chosen_src_iff") -> $(basename "$dest_file")"
+
             if cp -f "$chosen_src_iff" "$dest_file" 2>/dev/null; then
                 igameecs_found=1
+
+                # 3) Paired .data handling: same stem as chosen_src_iff, only if missing in target
+                src_stem="${chosen_src_iff%.*}"
+                data_src="${src_stem}.data"
+                if [ -f "$data_src" ]; then
+                    data_base="$(basename "$data_src")"
+                    data_dst="$dest_sub/$data_base"
+                    if [ ! -e "$data_dst" ]; then
+                        debug_log " Paired .data copy: $data_base -> $(basename "$data_dst")"
+                        if ! cp -p "$data_src" "$data_dst" 2>/dev/null; then
+                            echo "ERROR copying .data for $dest_name from $data_src" >> "$ERROR_LOG"
+                        fi
+                    else
+                        debug_log " Paired .data exists, skipping: $data_base"
+                    fi
+                fi
+
+                # Log iGame section usage (optional) – this drives igameecs_count
+                files=( "$best_dir"/* )
+                if [ ${#files[@]} -gt 0 ] && [ -e "${files[0]}" ]; then
+                    echo "$best_section $dest_name: ${#files[@]} files" >> "$IGAMEECS_LOG"
+                fi
+
+                # Artwork for this directory is done; move to the next dest_sub
+                processed=$((processed + 1))
+                if (( processed % PROGRESS_STEP == 0 || processed == total_targets )); then
+                    progress_bar "$processed" "$total_targets" "$BAR_WIDTH"
+                fi
+                continue
             else
                 echo "ERROR copying $best_section for $dest_name from $chosen_src_iff" >> "$ERROR_LOG"
             fi
-
-            # 3) Paired .data handling: same stem as chosen_src_iff, only if missing in target
-            src_stem="${chosen_src_iff%.*}"
-            data_src="${src_stem}.data"
-            if [ -f "$data_src" ]; then
-                data_base="$(basename "$data_src")"
-                data_dst="$dest_sub/$data_base"
-                if [ ! -e "$data_dst" ]; then
-                    debug_log " Paired .data copy: $data_base -> $(basename "$data_dst")"
-                    if ! cp -p "$data_src" "$data_dst" 2>/dev/null; then
-                        echo "ERROR copying .data for $dest_name from $data_src" >> "$ERROR_LOG"
-                    fi
-                else
-                    debug_log " Paired .data exists, skipping: $data_base"
-                fi
-            fi
-        fi
-
-        # Log iGame section usage (count files in best_dir just as before)
-        files=("$best_dir"/*)
-        if [ ${#files[@]} -gt 0 ] && [ -e "${files[0]}" ]; then
-            echo "$best_section $dest_name: ${#files[@]} files" >> "$IGAMEECS_LOG"
         fi
     fi
 
@@ -463,6 +542,7 @@ for dest_sub in "${merge_targets[@]}"; do
             [ ! -d "$search_dir" ] && continue
             debug_log "Checking TinyLauncher $subdir: $search_dir"
             tl_src=""
+
             for ext in iff IFF; do
                 candidate="$search_dir/${dest_name}_SCR${tl_primary_index}.${ext}"
                 if [ -f "$candidate" ]; then
@@ -471,15 +551,19 @@ for dest_sub in "${merge_targets[@]}"; do
                     break
                 fi
             done
+
             if [ -n "$tl_src" ]; then
                 dest_file="$dest_sub/iGame.iff"
                 debug_log " Copying TinyLauncher -> $dest_file"
+
                 if cp -f "$tl_src" "$dest_file" 2>/dev/null; then
                     tinylauncher_found=1
                     echo "1" >> "$TINYLAUNCHER_LOG"
                 else
                     echo "ERROR: Failed to copy TinyLauncher artwork for '$dest_name' from '$tl_src'" >> "$ERROR_LOG"
                 fi
+
+                # We found one TinyLauncher match for this dest_name; stop checking other TL subdirs
                 break
             fi
         done
@@ -489,8 +573,7 @@ for dest_sub in "${merge_targets[@]}"; do
         debug_log "NO ARTWORK FOUND for $dest_name"
     fi
 
-    wait_for_job_slot "$max_parallel"
-
+    # Progress and counters for this dest_sub
     processed=$((processed + 1))
     if (( processed % PROGRESS_STEP == 0 || processed == total_targets )); then
         progress_bar "$processed" "$total_targets" "$BAR_WIDTH"
@@ -514,24 +597,22 @@ if [ -s "$TINYLAUNCHER_LOG" ]; then tinylauncher_count=$(wc -l < "$TINYLAUNCHER_
 elapsed=$(( $(date +%s) - start_time ))
 fmt_time="$(format_elapsed_time "$elapsed")"
 
-echo "=========================================="
-echo "MERGE REPORT"
-echo "=========================================="
+echo -e "${BOLD}=================== MERGE REPORT ===================${NC}"
 echo "Destination: $DEST"
 echo "Artwork Source: $ART_SRC"
-echo "Section order: ${ART_ORDER[*]}"
+echo "Game/Mag art order: $GAME_ART_PRIORITY"
+echo "Demo art order: $DEMO_ART_PRIORITY"
 echo "Elapsed Time: $fmt_time"
-echo "------------------------------------------"
 echo "iGame artwork merged: $igameecs_count"
 echo "TinyLauncher screenshots: $tinylauncher_count"
 echo "Copy errors: $errors"
-echo "=========================================="
+echo -e "${BOLD}====================================================${NC}"
 
 if [ $errors -ne 0 ]; then
-    cp "$ERROR_LOG" "$SCRIPT_DIR/merge_errors.log"
-    echo
-    echo "ERROR: $errors errors occurred during merge."
-    echo "See $SCRIPT_DIR/merge_errors.log for details."
+  cp "$ERROR_LOG" "$SCRIPT_DIR/merge_errors.log"
+  echo
+  echo -e "${RED}ERROR: $errors errors occurred during merge.${NC}"
+  echo -e "${YELLOW}See $SCRIPT_DIR/merge_errors.log for details.${NC}"
 fi
 
 if [ "$DEBUG" -eq 1 ] && [ -s "$IGAMEECS_LOG" ]; then

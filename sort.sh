@@ -9,10 +9,9 @@ set -euo pipefail
 version="3.0.0-ultimate"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_DEST="$SCRIPT_DIR/retro"
-dest_path="${DEST:-$SCRIPT_DIR/retro}"
+DEFAULT_DEST="${DEST:-$SCRIPT_DIR/retro}"
 DEST_OVERRIDE=""
-DEST="${DEST_OVERRIDE:-$DEFAULT_DEST}"
+DEST="$DEFAULT_DEST"
 OS_TYPE="$(uname -s)"
 
 # Detect if running on Raspberry Pi Zero 2W
@@ -25,9 +24,6 @@ if [[ "$OS_TYPE" != "Darwin" ]] && [ -r /proc/device-tree/model ]; then
             ;;
     esac
 fi
-
-TMP_AMIGA_FS_ROOT="$DEST/.amiga_fstmp"
-mkdir -p "$TMP_AMIGA_FS_ROOT"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -73,7 +69,7 @@ BAR_WIDTH=50
 processed=0
 total_count=0
 FS_TYPE="PFS"
-FFS_LIMIT=27
+FFS_LIMIT=25
 PFS_LIMIT=100
 MAX_FILENAME_LEN=$PFS_LIMIT
 RUN_COMPLIANCE_CHECK=true
@@ -170,187 +166,131 @@ progress_bar() {
 }
 
 # ============================================================================
-# COMPREHENSIVE FILENAME TRANSLITERATION (with normalization + ASCII fallback)
+# FILENAME LENGTH HELPERS (FFS/PFS) – NO TRANSLITERATION
 # ============================================================================
+truncate_filename_preserve_ext() {
+    local name=$1
+    local maxlen=$2
 
-transliterate_filename() {
-    local input="$1"
-    local normalized
-
-    # 1) Normalize to NFC so decomposed characters match our mappings
-    #    Uses Python 3 on macOS (present by default)
-    if command -v python3 >/dev/null 2>&1; then
-        normalized="$(python3 - <<EOF
-import sys, unicodedata
-s = sys.stdin.read()
-sys.stdout.write(unicodedata.normalize("NFC", s))
-EOF
-        <<<"$input")"
-    else
-        # Fallback: no normalization, operate on original
-        normalized="$input"
+    # If already within limit, return as-is
+    if [ "${#name}" -le "$maxlen" ]; then
+        printf '%s' "$name"
+        return 0
     fi
 
-    local output="$normalized"
+    local base ext
+    if [[ "$name" == *.* ]]; then
+        base=${name%.*}
+        ext=.${name##*.}
+    else
+        base=$name
+        ext=
+    fi
 
-    # ---------- PUNCTUATION & SPECIAL MARKS ----------
-    output="${output//—/-}"  # Em dash
-    output="${output//–/-}"  # En dash
-    output="${output//‐/-}"  # Hyphen
-    output="${output//−/-}"  # Minus sign
-    output="${output//―/-}"  # Horizontal bar
-    output="${output//…/...}" # Ellipsis
+    local extlen=${#ext}
+    local allow=$(( maxlen - extlen ))
 
-    # ---------- SMART QUOTES ----------
-    output="${output//‘/\' }"
-    output="${output//’/\' }"
-    output="${output//‚/\' }"
-    output="${output//‹/\' }"
-    output="${output//›/\' }"
+    if [ "$allow" -lt 1 ]; then
+        # Fallback: keep at least 1 char of base
+        allow=1
+    fi
 
-    output="${output//“/\"}"
-    output="${output//”/\"}"
-    output="${output//„/\"}"
-    output="${output//«/\"}"
-    output="${output//»/\"}"
+    # Hard truncate base to allowed length
+    base=${base:0:allow}
+    printf '%s%s' "$base" "$ext"
+}
 
-    # ---------- LATIN ACCENTED CHARACTERS ----------
-    # a / A
-    output="${output//á/a}"; output="${output//à/a}"; output="${output//â/a}"
-    output="${output//ä/a}"; output="${output//ã/a}"; output="${output//å/a}"
-    output="${output//ā/a}"; output="${output//ą/a}"; output="${output//ă/a}"
-    output="${output//Á/A}"; output="${output//À/A}"; output="${output//Â/A}"
-    output="${output//Ä/A}"; output="${output//Ã/A}"; output="${output//Å/A}"
-    output="${output//Ā/A}"; output="${output//Ą/A}"; output="${output//Ă/A}"
+# ============================================================================
+# AMIGA FILESYSTEM COMPLIANCE CHECK (NO TRANSLITERATION)
+# ============================================================================
+check_path_compliance() {
+    local filepath="$1"
+    local filename="${filepath##*/}"
+    local issues=()
+    local needs_fix=false
 
-    # e / E
-    output="${output//é/e}"; output="${output//è/e}"; output="${output//ê/e}"
-    output="${output//ë/e}"; output="${output//ē/e}"; output="${output//ė/e}"
-    output="${output//ę/e}"; output="${output//ě/e}"
-    output="${output//É/E}"; output="${output//È/E}"; output="${output//Ê/E}"
-    output="${output//Ë/E}"; output="${output//Ē/E}"; output="${output//Ė/E}"
-    output="${output//Ę/E}"; output="${output//Ě/E}"
+    # Check for forbidden characters
+    if [[ "$filename" == *:* ]]; then
+        issues+=("contains colon (:) - not allowed")
+        needs_fix=true
+    fi
 
-    # i / I
-    output="${output//í/i}"; output="${output//ì/i}"; output="${output//î/i}"
-    output="${output//ï/i}"; output="${output//ī/i}"; output="${output//į/i}"
-    output="${output//Í/I}"; output="${output//Ì/I}"; output="${output//Î/I}"
-    output="${output//Ï/I}"; output="${output//Ī/I}"; output="${output//Į/I}"
+    if [[ "$filename" == */* ]]; then
+        issues+=("contains forward slash (/) - not allowed in filenames")
+        needs_fix=true
+    fi
 
-    # o / O
-    output="${output//ó/o}"; output="${output//ò/o}"; output="${output//ô/o}"
-    output="${output//ö/o}"; output="${output//õ/o}"; output="${output//ō/o}"
-    output="${output//ő/o}"; output="${output//ø/o}"
-    output="${output//Ó/O}"; output="${output//Ò/O}"; output="${output//Ô/O}"
-    output="${output//Ö/O}"; output="${output//Õ/O}"; output="${output//Ō/O}"
-    output="${output//Ő/O}"; output="${output//Ø/O}"
+    # Check for trailing spaces
+    if [[ "$filename" =~ [[:space:]]$ ]]; then
+        issues+=("filename has trailing space - not recommended")
+        needs_fix=true
+    fi
 
-    # u / U
-    output="${output//ú/u}"; output="${output//ù/u}"; output="${output//û/u}"
-    output="${output//ü/u}"; output="${output//ů/u}"; output="${output//ū/u}"
-    output="${output//Ú/U}"; output="${output//Ù/U}"; output="${output//Û/U}"
-    output="${output//Ü/U}"; output="${output//Ů/U}"; output="${output//Ū/U}"
+    # Check for control characters
+    if [[ "$filename" =~ [[:cntrl:]] ]]; then
+        issues+=("contains control/non-printable characters - not recommended")
+        needs_fix=true
+    fi
 
-    # c / C
-    output="${output//ç/c}"; output="${output//ć/c}"; output="${output//č/c}"
-    output="${output//Ç/C}"; output="${output//Ć/C}"; output="${output//Č/C}"
+    # Check filename length
+    if [ ${#filename} -gt "$MAX_FILENAME_LEN" ]; then
+        issues+=("filename exceeds $MAX_FILENAME_LEN chars (${FS_TYPE} limit): ${#filename} chars")
+        needs_fix=true
+    fi
 
-    # n / N
-    output="${output//ñ/n}"; output="${output//ń/n}"
-    output="${output//Ñ/N}"; output="${output//Ń/N}"
-
-    # s / S
-    output="${output//ś/s}"; output="${output//š/s}"; output="${output//ş/s}"
-    output="${output//Ś/S}"; output="${output//Š/S}"; output="${output//Ş/S}"
-
-    # z / Z
-    output="${output//ź/z}"; output="${output//ż/z}"; output="${output//ž/z}"
-    output="${output//Ź/Z}"; output="${output//Ż/Z}"; output="${output//Ž/Z}"
-
-    # y / Y
-    output="${output//ý/y}"; output="${output//ÿ/y}"
-    output="${output//Ý/Y}"
-
-     # ========== GERMAN SPECIAL CHARACTERS ==========
-    output="${output//ß/ss}"  # German sharp s (Eszett)
-    
-    # ========== LIGATURES ==========
-    output="${output//æ/ae}"; output="${output//Æ/AE}"  # Latin ae ligature
-    output="${output//œ/oe}"; output="${output//Œ/OE}"  # Latin oe ligature
-    
-    # ========== POLISH SPECIAL CHARACTERS ==========
-    output="${output//ł/l}"; output="${output//Ł/L}"  # Polish L with stroke
-    output="${output//ś/s}"; output="${output//Ś/S}"  # Polish S with acute
-    output="${output//ź/z}"; output="${output//Ź/Z}"  # Polish Z with acute
-    output="${output//ż/z}"; output="${output//Ż/Z}"  # Polish Z with dot above
-    
-    # ========== CZECH/SLOVAK SPECIAL CHARACTERS ==========
-    output="${output//ď/d}"; output="${output//Ď/D}"  # D with caron
-    output="${output//ř/r}"; output="${output//Ř/R}"  # R with caron
-    output="${output//š/s}"; output="${output//Š/S}"  # S with caron
-    output="${output//ť/t}"; output="${output//Ť/T}"  # T with caron
-    output="${output//ž/z}"; output="${output//Ž/Z}"  # Z with caron
-    
-    # ========== SPECIAL SYMBOLS & COPYRIGHT ==========
-    output="${output//°/deg}"   # Degree sign
-    output="${output//©/(c)}"   # Copyright symbol
-    output="${output//®/(R)}"   # Registered trademark
-    output="${output//™/(TM)}"  # Trademark symbol
-    
-    # ========== CURRENCY SYMBOLS ==========
-    output="${output//€/EUR}"  # Euro
-    output="${output//£/GBP}"  # Pound sterling
-    output="${output//¥/YEN}"  # Yen
-    output="${output//¢/c}"    # Cent
-    
-    # ========== MATHEMATICAL SYMBOLS ==========
-    output="${output//×/x}"    # Multiplication sign
-    output="${output//÷//}"    # Division sign
-    output="${output//±/+-}"   # Plus-minus sign
-    output="${output//•/*}"    # Bullet
-    output="${output//·/.}"    # Middle dot
-
-    # ========== ORDINAL INDICATORS ==========
-    output="${output//ª/a}"   # Feminine ordinal indicator
-    output="${output//º/o}"   # Masculine ordinal indicator
-    
-    # ========== AMIGA-FORBIDDEN CHARACTERS ==========
-    output="${output//:/-}"    # Colon (forbidden on Amiga)
-    
-    # Remove trailing spaces (causes issues on Amiga filesystems)
-    output="$(printf "%s" "$output" | sed 's/[[:space:]]\+$//')"
-
-    # ---------- ASCII SAFETY FALLBACK ----------
-    # Replace any remaining non-ASCII bytes with '_'
-    # This guarantees that filenames like "gläfs", "Français", "Déjà_Vu",
-    # or "München" will always change from their original forms.
-    local c out_ascii=""
-    local i byte
-    for (( i=0; i<${#output}; i++ )); do
-        c=${output:i:1}
-        byte=$(printf '%d\n' "'$c")
-        if (( byte >= 32 && byte <= 126 )); then
-            out_ascii+="$c"
-        else
-            out_ascii+="_"
+    # Check path component lengths
+    local IFS='/'
+    for component in $filepath; do
+        if [ -n "$component" ] && [ ${#component} -gt "$MAX_FILENAME_LEN" ]; then
+            issues+=("path component exceeds $MAX_FILENAME_LEN chars (${FS_TYPE} limit): '$component' (${#component} chars)")
+            needs_fix=true
+            break
         fi
     done
 
-    printf '%s\n' "$out_ascii"
+    # Auto-fix only the length, by truncating, no transliteration
+    if $needs_fix; then
+        local dirpath
+        dirpath=$(dirname "$filepath")
+
+        local newfilename="$filename"
+
+        # Apply truncation if length is the problem
+        if [ ${#newfilename} -gt "$MAX_FILENAME_LEN" ]; then
+            newfilename=$(truncate_filename_preserve_ext "$newfilename" "$MAX_FILENAME_LEN")
+        fi
+
+        if [ "$newfilename" != "$filename" ] && [ ! -e "$dirpath/$newfilename" ]; then
+            mv "$filepath" "$dirpath/$newfilename" 2>/dev/null
+            printf 'FIXED: %s -> %s\n' "$filename" "$newfilename"
+            return 0
+        fi
+    fi
+
+    # Report issues if any remain
+    if [ ${#issues[@]} -gt 0 ]; then
+        printf '%s\n' "${issues[@]}"
+        return 1
+    fi
+
+    return 0
 }
 
 # ============================================================================
 # PRE-CLEAN FILENAMES WITH DETOX (macOS/Linux)
 # ============================================================================
 if command -v detox >/dev/null 2>&1; then
-    echo "Pre-cleaning filenames with detox in: $DEST"
-    # Recursive, in-place cleanup; adjust sequences as desired
-    detox -r -s utf_8 "$DEST" >/dev/null 2>&1
-    echo "detox pre-clean complete."
+    # Only pre-clean a custom destination if explicitly passed via -d/--dest.
+    if [ -n "$DEST_OVERRIDE" ]; then
+        echo "Pre-cleaning filenames with detox in: $DEST_OVERRIDE"
+        detox -r -s utf_8 "$DEST_OVERRIDE" >/dev/null 2>&1
+        echo "detox pre-clean complete."
+    else
+        echo "detox not run (no -d/--dest override specified)."
+    fi
 else
     echo "detox not found; skipping pre-clean (optional dependency)."
 fi
-
 
 # ============================================================================
 # CPU CORE DETECTION (macOS/Linux/Debian compatible)
@@ -358,31 +298,34 @@ fi
 get_cpu_cores() {
     # Try Linux nproc first (Debian/Ubuntu/etc)
     if command -v nproc >/dev/null 2>&1; then
-        local c=$(nproc 2>/dev/null || echo "")
+        local c
+        c=$(nproc 2>/dev/null || echo "")
         if [ -n "$c" ] && [ "$c" -gt 0 ]; then
             echo "$c"
             return 0
         fi
     fi
-    
+
     # Try macOS sysctl
     if command -v sysctl >/dev/null 2>&1; then
-        local c=$(sysctl -n hw.ncpu 2>/dev/null || echo "")
+        local c
+        c=$(sysctl -n hw.ncpu 2>/dev/null || echo "")
         if [ -n "$c" ] && [ "$c" -gt 0 ]; then
             echo "$c"
             return 0
         fi
     fi
-    
+
     # Try Linux getconf fallback
     if command -v getconf >/dev/null 2>&1; then
-        local c=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo "")
+        local c
+        c=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo "")
         if [ -n "$c" ] && [ "$c" -gt 0 ]; then
             echo "$c"
             return 0
         fi
     fi
-    
+
     # Final fallback
     echo 4
 }
@@ -401,7 +344,7 @@ _start_job() {
     "$@" &
     local pid=$!
     running_pids+=("$pid")
-    
+
     # Wait if job limit reached
     while [ "${#running_pids[@]}" -ge "$NUM_JOBS" ]; do
         for i in "${!running_pids[@]}"; do
@@ -428,15 +371,15 @@ wait_all_jobs() {
 # ============================================================================
 for arg in "$@"; do
     case "$arg" in
-        --ffs) 
+        --ffs)
             FS_TYPE="FFS"
             MAX_FILENAME_LEN=$FFS_LIMIT
             ;;
-        --pfs) 
+        --pfs)
             FS_TYPE="PFS"
             MAX_FILENAME_LEN=$PFS_LIMIT
             ;;
-        --skipchk) 
+        --skipchk)
             RUN_COMPLIANCE_CHECK=false
             ;;
         --help)
@@ -454,13 +397,9 @@ for arg in "$@"; do
             echo "Platform: macOS, Linux, Debian 12/13, Amiga A314 compatible"
             echo ""
             echo "Features:"
-            echo "  • Comprehensive transliteration (100+ international character mappings)"
             echo "  • Parallel processing (auto-detects CPU cores)"
             echo "  • Adaptive progress bar (smooth Unicode on macOS, ASCII elsewhere)"
-            echo "  • Amiga filesystem compliance checking with auto-fix"
-            echo "  • Handles European accented characters (Polish, Czech, German, French, etc.)"
-            echo "  • Converts special symbols (©, ®, ™, €, £, ×, ÷, etc.)"
-            echo "  • Smart quote normalization"
+            echo "  • Amiga filesystem compliance checking with length-based auto-fix"
             echo "  • Progress updates every 1000 files during compliance check"
             echo "  • Detailed logging to sort.log and amiga_filename_issues.log"
             echo ""
@@ -496,7 +435,9 @@ LANG_ROOT="$DEST/WHDLoad/Languages"
 
 langs=(
     "French:Fr" "German:De" "Spanish:Es" "Italian:It" "Polish:Pl" "Czech:Cz" "Czech:Cs"
-    "Dutch:Nl" "Danish:Dk" "Finnish:Fi" "Swedish:Sv" "Sweden:Se" "Norwegian:No" "Portuguese:Pt" "Hungarian:Hu" "Russian:Ru" "Greek:Gr" "Turkish:Tr" "Slovak:Sk" "Croatian:Hr" "Serbian:Sr" "Bulgarian:Bg" "Romanian:Ro" "Slovenian:Si" "Estonian:Et" "Latvian:Lv" "Lithuanian:Lt" 
+    "Dutch:Nl" "Danish:Dk" "Finnish:Fi" "Swedish:Sv" "Sweden:Se" "Norwegian:No" "Portuguese:Pt"
+    "Hungarian:Hu" "Russian:Ru" "Greek:Gr" "Turkish:Tr" "Slovak:Sk" "Croatian:Hr" "Serbian:Sr"
+    "Bulgarian:Bg" "Romanian:Ro" "Slovenian:Si" "Estonian:Et" "Latvian:Lv" "Lithuanian:Lt"
 )
 
 # ============================================================================
@@ -507,9 +448,10 @@ move_and_tag() {
     local src_dir="$2"
     local rel_path="${src_dir#$SRC/}"
     local language_found=""
-    
+
     # Check for language suffix
-    local name="$(basename "$src_dir")"
+    local name
+    name="$(basename "$src_dir")"
     for entry in "${langs[@]}"; do
         local lang="${entry%%:*}"
         local code="${entry##*:}"
@@ -526,17 +468,19 @@ move_and_tag() {
     else
         dest_path="$SRC/$variant/$rel_path"
     fi
-    
+
     # Move .info file
-    local info_file="$(dirname "$src_dir")/$(basename "$src_dir").info"
-    local new_info_file="$(dirname "$dest_path")/$(basename "$dest_path").info"
-    
+    local info_file
+    info_file="$(dirname "$src_dir")/$(basename "$src_dir").info"
+    local new_info_file
+    new_info_file="$(dirname "$dest_path")/$(basename "$dest_path").info"
+
     mkdir -p "$(dirname "$new_info_file")"
-    
+
     if [ -e "$info_file" ] && [ ! -e "$new_info_file" ]; then
         mv "$info_file" "$new_info_file" > /dev/null 2>> "$LOGFILE"
     fi
-    
+
     # Move directory
     mkdir -p "$(dirname "$dest_path")"
     if [ ! -e "$dest_path" ]; then
@@ -551,21 +495,22 @@ move_lang() {
     local lang="$1" code="$2" dir="$3" lang_dir="$4"
     local relpath="${dir#$SRC/}"
     local newpath="$lang_dir/$relpath"
-    local info_file="$(dirname "$dir")/$(basename "$dir").info"
-    local new_info_path="$(dirname "$newpath")/$(basename "$dir").info"
-    
+    local info_file
+    info_file="$(dirname "$dir")/$(basename "$dir").info"
+    local new_info_path
+    new_info_path="$(dirname "$newpath")/$(basename "$dir").info"
+
     mkdir -p "$(dirname "$new_info_path")"
-    
+
     if [ -f "$info_file" ] && [ ! -e "$new_info_path" ]; then
         mv "$info_file" "$new_info_path" > /dev/null 2>> "$LOGFILE"
     fi
-    
+
     mkdir -p "$(dirname "$newpath")"
     if [ ! -e "$newpath" ]; then
         mv "$dir" "$newpath" > /dev/null 2>> "$LOGFILE"
     fi
 }
-
 
 # ============================================================================
 # VARIANT SORTING (CD32, AGA, NTSC, MT32, CDTV) - with parallel processing
@@ -574,12 +519,13 @@ variant_sort_strict() {
     local variant="$1"
     echo "Sorting $variant"
     local found_dirs=()
-    
+
     for search_dir in "$SRC" "$SRC/Games" "$SRC/Demos" "$SRC/Magazines"; do
         if [ -d "$search_dir" ]; then
             while IFS= read -r -d '' dir; do
-                local name="$(basename "$dir")"
-                
+                local name
+                name="$(basename "$dir")"
+
                 case "$variant" in
                     CD32)
                         # Highest priority: exact end with _AGA_CD32
@@ -598,7 +544,8 @@ variant_sort_strict() {
                             found_dirs+=("$dir")
                         elif echo "$name" | grep -Eq 'AGA[a-zA-Z]{2}$'; then
                             found_dirs+=("$dir")
-                        elif echo "$name" | grep -Eq 'AGA([0-9][0-9]?MB)?$|AGA$|AGA_.*$' && ! echo "$name" | grep -Eq 'CD32AGA$'; then
+                        elif echo "$name" | grep -Eq 'AGA([0-9][0-9]?MB)?$|AGA$|AGA_.*$' && \
+                             ! echo "$name" | grep -Eq 'CD32AGA$'; then
                             found_dirs+=("$dir")
                         fi
                         ;;
@@ -611,29 +558,28 @@ variant_sort_strict() {
             done < <(find "$search_dir" -mindepth 1 -maxdepth 2 -type d -print0 2>/dev/null || true)
         fi
     done
-    
+
     sort_summary+=("$variant | ${#found_dirs[@]} found")
     [ ${#found_dirs[@]} -eq 0 ] && return 0
-    
+
     local variant_total=${#found_dirs[@]}
     local variant_processed=0
-    
+
     for src_dir in "${found_dirs[@]}"; do
         _start_job move_and_tag "$variant" "$src_dir"
         variant_processed=$((variant_processed + 1))
         progress_bar "$variant_processed" "$variant_total" "$BAR_WIDTH"
     done
-    
+
     printf "\n"
     wait_all_jobs
 }
 
-## ============================================================================ #
+## ============================================================================
 # LANGUAGE SORTING - with parallel processing and progress bar
-# ============================================================================ #
-
+# ============================================================================
 lang_sort() {
-    echo "Sorting Languages (Be pateint...)"
+    echo "Sorting Languages (Be patient...)"
 
     # Determine source root: /retro/WHDLoad or /WHDLoad under custom destination
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -657,7 +603,8 @@ lang_sort() {
         for search_dir in "${variant_dirs[@]}"; do
             if [ -d "$search_dir" ]; then
                 while IFS= read -r -d '' dir; do
-                    local name="$(basename "$dir")"
+                    local name
+                    name="$(basename "$dir")"
                     # Case-sensitive, exact language code at end of basename
                     if [[ "$name" =~ ${code}$ ]]; then
                         dir_matches+=("$dir")
@@ -678,7 +625,8 @@ lang_sort() {
         for search_dir in "${variant_dirs[@]}"; do
             if [ -d "$search_dir" ]; then
                 while IFS= read -r -d '' dir; do
-                    local name="$(basename "$dir")"
+                    local name
+                    name="$(basename "$dir")"
                     # Case-sensitive, exact language code at end of basename
                     if [[ "$name" =~ ${code}$ ]]; then
                         dir_matches+=("$dir")
@@ -729,15 +677,21 @@ echo
 if [ "$RUN_COMPLIANCE_CHECK" = true ]; then
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     DEFAULT_DEST="$SCRIPT_DIR/retro"
-    DEST="${DEST_OVERRIDE:-$DEFAULT_DEST}"
 
-    echo "Performing Amiga filesystem compliance check ($FS_TYPE: max $MAX_FILENAME_LEN chars) in: $DEST"
+    # If -d/--dest was given, only check that path; otherwise behave as before.
+    if [ -n "$DEST_OVERRIDE" ]; then
+        CHECK_ROOT="$DEST_OVERRIDE"
+    else
+        CHECK_ROOT="${DEST_OVERRIDE:-$DEFAULT_DEST}"
+    fi
+
+    echo "Performing Amiga filesystem compliance check ($FS_TYPE: max $MAX_FILENAME_LEN chars) in: $CHECK_ROOT"
     echo
 
     issues_found=0
     total_scanned=0
     files_fixed=0
-    total_files=$(find "$DEST" -type f 2>/dev/null | wc -l)
+    total_files=$(find "$CHECK_ROOT" -type f 2>/dev/null | wc -l)
 
     while IFS= read -r -d '' file; do
         total_scanned=$((total_scanned + 1))
@@ -767,11 +721,12 @@ if [ "$RUN_COMPLIANCE_CHECK" = true ]; then
                 done <<< "$issues"
             fi
         fi
-    done < <(find "$DEST" -type f -print0 2>/dev/null)
+    done < <(find "$CHECK_ROOT" -type f -print0 2>/dev/null)
 
     printf "\r%-60s\n" " "
+
     if [ $files_fixed -gt 0 ]; then
-        echo "✓ Fixed $files_fixed file(s) by transliterating special characters."
+        echo "✓ Fixed $files_fixed file(s) by truncating long filenames to ${MAX_FILENAME_LEN} chars."
     fi
 
     if [ $issues_found -gt 0 ]; then
@@ -781,6 +736,7 @@ if [ "$RUN_COMPLIANCE_CHECK" = true ]; then
     else
         echo "✓ All $total_scanned filenames are Amiga filesystem compliant ($FS_TYPE)."
     fi
+
     echo
 fi
 
@@ -788,6 +744,6 @@ fi
 # CLEANUP EMPTY DIRECTORIES
 # ============================================================================
 echo "Deleting empty directories in $DEST ..."
-find "$(dirname "$dest_path")" -type d -empty -delete 2>/dev/null || true
+find "$DEST" -type d -empty -delete 2>/dev/null || true
 
 echo "✓ Sort operation complete. (Check contents of $DEST)"

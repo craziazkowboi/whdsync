@@ -145,7 +145,7 @@ while [ $# -gt 0 ]; do
       echo "  --ffs                 Run sort.sh with --ffs."
       echo "  --pfs                 Run sort.sh with --pfs."
       echo "  --dest [path]         Set custom destination directory."
-      echo "  --art [order]   Set merge priority order (e.g., Screens,Covers,Titles)."
+      echo "  --art [order]         Set merge priority order (e.g., Screens,Covers,Titles)."
       echo "  --debug               Enable debug output."
       echo "  --exit                Exit immediately."
       echo
@@ -343,14 +343,26 @@ run_sub() {
 if [ "$ACTION" = "auto" ]; then
   run_sub ./update.sh
   run_sub ./extract.sh
-  run_sub ./merge.sh "$MERGE_OPT" --art "$ART_ORDER_OPT"
+
+  merge_args=()
+  [ -n "$MERGE_OPT" ] && merge_args+=("$MERGE_OPT")
+  [ -n "$ART_ORDER_OPT" ] && merge_args+=(--art "$ART_ORDER_OPT")
+  [ -n "$DEST_OPT" ] && merge_args+=(-d "$DEST_OPT")
+
+  run_sub ./merge.sh "${merge_args[@]}"
+
   run_sub ./sort.sh "$SORT_OPT" --dest "${DEST_OPT:-}"
+
+elif [ "$ACTION" = "merge" ]; then
+  merge_args=()
+  [ -n "$MERGE_OPT" ] && merge_args+=("$MERGE_OPT")
+  [ -n "$ART_ORDER_OPT" ] && merge_args+=(--art "$ART_ORDER_OPT")
+  run_sub ./merge.sh "${merge_args[@]}"
+
 elif [ "$ACTION" = "update" ]; then
   run_sub ./update.sh
 elif [ "$ACTION" = "extract" ]; then
   run_sub ./extract.sh
-elif [ "$ACTION" = "merge" ]; then
-  run_sub ./merge.sh "$MERGE_OPT" --art "$ART_ORDER_OPT"
 elif [ "$ACTION" = "sort" ]; then
   run_sub ./sort.sh "$SORT_OPT" --dest "${DEST_OPT:-}"
 elif [ "$ACTION" = "quick" ]; then
@@ -393,6 +405,15 @@ for f in "${non_empty_logs[@]}"; do
         printf '\n\n'
     } >> "$retro_log"
 done
+
+# Delete all log files except the merged $retro_log in the start directory
+if [ -s "$retro_log" ]; then
+  for f in ./*.log; do
+    [ "$f" = "./$retro_log" ] && continue
+    [ -e "$f" ] || continue
+    rm -f -- "$f"
+  done
+fi
 
 # Ask user whether to view or delete the error log (default: view)
 if [ -s "$retro_log" ]; then
