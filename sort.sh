@@ -279,15 +279,13 @@ check_path_compliance() {
 # ============================================================================
 # PRE-CLEAN FILENAMES WITH DETOX (macOS/Linux)
 # ============================================================================
+# ============================================================================ 
+# PRE-CLEAN FILENAMES WITH DETOX (macOS/Linux)
+# ============================================================================
 if command -v detox >/dev/null 2>&1; then
-    # Only pre-clean a custom destination if explicitly passed via -d/--dest.
-    if [ -n "$DEST_OVERRIDE" ]; then
-        echo "Pre-cleaning filenames with detox in: $DEST_OVERRIDE"
-        detox -r -s utf_8 "$DEST_OVERRIDE" >/dev/null 2>&1
-        echo "detox pre-clean complete."
-    else
-        echo "detox not run (no -d/--dest override specified)."
-    fi
+    echo "Pre-cleaning filenames with detox in: $DEST"
+    detox -r -s utf_8 "$DEST" >/dev/null 2>&1
+    echo "detox pre-clean complete."
 else
     echo "detox not found; skipping pre-clean (optional dependency)."
 fi
