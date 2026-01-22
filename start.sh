@@ -143,7 +143,6 @@ while [ $# -gt 0 ]; do
       echo "  --aga                 Run merge.sh with --aga."
       echo "  --rtg                 Run merge.sh with --rtg."
       echo "  --ffs                 Run sort.sh with --ffs."
-      echo "  --pfs                 Run sort.sh with --pfs."
       echo "  --dest [path]         Set custom destination directory."
       echo "  --art [order]         Set merge priority order (e.g., Screens,Covers,Titles)."
       echo "  --debug               Enable debug output."
@@ -189,10 +188,6 @@ while [ $# -gt 0 ]; do
       ;;
     --ffs)
       SORT_OPT="--ffs"
-      shift
-      ;;
-    --pfs)
-      SORT_OPT="--pfs"
       shift
       ;;
     --dest)
