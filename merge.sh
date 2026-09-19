@@ -1,5 +1,22 @@
 #!/usr/bin/env bash
 
+# This script's artwork-set indexing uses associative arrays and other
+# Bash 4+ features. macOS ships Bash 3.2 by default, so auto-upgrade to a
+# newer Bash if one is available (e.g. via Homebrew), or fail clearly.
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+    for _cand in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+        if [ -x "$_cand" ]; then
+            exec "$_cand" "$0" "$@"
+        fi
+    done
+    echo "ERROR: This script requires Bash 4.0 or newer (found ${BASH_VERSION:-an unknown version})." >&2
+    echo "macOS ships an old Bash 3.2 by default. Install a modern one with:" >&2
+    echo "  brew install bash" >&2
+    echo "then re-run this script - it will be detected and used automatically." >&2
+    exit 1
+fi
+unset _cand
+
 # Amiga Retroplay iGame Artwork Merger
 # macOS 10.15.7+ | Debian 12 | Debian 13 | Raspberry Pi Compatible
 # Version: 1.6.0-adaptive-a314 (Priority-ordered merge with flexible section names)
@@ -94,52 +111,117 @@ debug_log() {
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-IGAME_SRC="$SCRIPT_DIR/iGame_ECS"
-IGAME_AGA_SRC="$SCRIPT_DIR/iGame_AGA"
-IGAME_RTG_SRC="$SCRIPT_DIR/iGame_RTG"
 TINYLAUNCHER_SRC="$SCRIPT_DIR/TinyLauncher"
 DEFAULT_DEST="$SCRIPT_DIR/retro"
-ART_SRC="$IGAME_SRC"
+ART_SRC=""
+SET_OPT=""
 DEST=""
+
+# -----------------------------------------------------------------------------
+# Artwork SET discovery: any directory named "iGame_<something>" directly
+# under SCRIPT_DIR is a selectable artwork set - not just ECS/AGA/RTG.
+# This lets people drop in iGame_CD32, iGame_NTSC, iGame_MyPack, etc. and have
+# it show up automatically, with no code changes needed here.
+# -----------------------------------------------------------------------------
+declare -a IGAME_SET_NAMES=()   # display names, in discovery order
+declare -A IGAME_SET_DIR=()     # NAME (uppercased) -> full directory path
+
+shopt -s nullglob
+for _igdir in "$SCRIPT_DIR"/iGame_*/; do
+    _igdir="${_igdir%/}"
+    [ -d "$_igdir" ] || continue
+    _igbase="$(basename "$_igdir")"
+    _igname="${_igbase#iGame_}"
+    [ -z "$_igname" ] && continue
+    _igkey="${_igname^^}"
+    # keep the first match if two directories somehow map to the same key
+    if [ -z "${IGAME_SET_DIR[$_igkey]+_}" ]; then
+        IGAME_SET_NAMES+=("$_igname")
+        IGAME_SET_DIR["$_igkey"]="$_igdir"
+    fi
+done
+shopt -u nullglob
+unset _igdir _igbase _igname _igkey
+
+# Resolve a requested set name (any case) to ART_SRC. Returns 1 if not found.
+# On success also records the uppercased key in SELECTED_SET_KEY, used to
+# build the artwork fallback chain later.
+SELECTED_SET_KEY=""
+resolve_art_set() {
+    local key="${1^^}"
+    if [ -n "${IGAME_SET_DIR[$key]+_}" ]; then
+        ART_SRC="${IGAME_SET_DIR[$key]}"
+        SELECTED_SET_KEY="$key"
+        return 0
+    fi
+    return 1
+}
+
+# Prefer ECS for backward compatibility; otherwise take whatever was found first.
+default_art_set() {
+    resolve_art_set "ECS" && return 0
+    [ "${#IGAME_SET_NAMES[@]}" -gt 0 ] && resolve_art_set "${IGAME_SET_NAMES[0]}"
+}
 
 show_artwork_menu() {
     echo
     echo "=========================================="
     echo "Select iGame Artwork Set"
     echo "=========================================="
-    echo "1) ECS (Enhanced Chip Set)"
-    echo "2) AGA (Advanced Graphics Architecture)"
-    echo "3) RTG (Retargetable Graphics)"
+
+    if [ "${#IGAME_SET_NAMES[@]}" -eq 0 ]; then
+        echo "No iGame_* artwork directories found in: $SCRIPT_DIR"
+        echo "=========================================="
+        exit 1
+    fi
+
+    local i=1
+    for name in "${IGAME_SET_NAMES[@]}"; do
+        echo "$i) $name"
+        i=$((i + 1))
+    done
     echo "=========================================="
     echo
-    echo "No input within 30 seconds will default to: ECS"
+    echo "No input within 30 seconds will default to: ${IGAME_SET_NAMES[0]}"
     echo
 
-    # read with timeout, default to ECS if no input
-    if read -t 30 -p "Enter your choice (1-3): " choice; then
+    if read -t 30 -p "Enter your choice (1-${#IGAME_SET_NAMES[@]}): " choice; then
         :
     else
         echo    # ensure newline after timeout
-        echo "No selection made, defaulting to ECS."
+        echo "No selection made, defaulting to ${IGAME_SET_NAMES[0]}."
         choice="1"
     fi
 
-    case "$choice" in
-        1) ART_SRC="$IGAME_SRC"; echo "Selected: ECS" ;;
-        2) ART_SRC="$IGAME_AGA_SRC"; echo "Selected: AGA" ;;
-        3) ART_SRC="$IGAME_RTG_SRC"; echo "Selected: RTG" ;;
-        *) echo "Invalid choice. Defaulting to ECS."; ART_SRC="$IGAME_SRC" ;;
-    esac
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#IGAME_SET_NAMES[@]}" ]; then
+        local picked="${IGAME_SET_NAMES[$((choice - 1))]}"
+        resolve_art_set "$picked"
+        echo "Selected: $picked"
+    else
+        echo "Invalid choice. Defaulting to ${IGAME_SET_NAMES[0]}."
+        resolve_art_set "${IGAME_SET_NAMES[0]}"
+    fi
 }
 
 # ----- argument parsing -----
 
 while [ $# -gt 0 ]; do
-    case "$1" in
+    opt_lc="${1,,}"
+    case "$opt_lc" in
         --custom) CUSTOM=1; shift ;;
-        --ecs) ART_SRC="$IGAME_SRC"; shift ;;
-        --aga) ART_SRC="$IGAME_AGA_SRC"; shift ;;
-        --rtg) ART_SRC="$IGAME_RTG_SRC"; shift ;;
+        --ecs) SET_OPT="ECS"; shift ;;
+        --aga) SET_OPT="AGA"; shift ;;
+        --rtg) SET_OPT="RTG"; shift ;;
+        --ecs-lo) SET_OPT="ECS_LO"; shift ;;
+        --aga-lo) SET_OPT="AGA_LO"; shift ;;
+        --set)
+            if [ -z "${2:-}" ]; then
+                echo "Error: --set requires a NAME argument (matching an iGame_NAME directory)" >&2
+                exit 1
+            fi
+            SET_OPT="$2"
+            shift 2
+            ;;
         -d|--dest) DEST="$2"; shift 2 ;;
         --art)
         GAME_ART_PRIORITY="$2"
@@ -155,14 +237,28 @@ while [ $# -gt 0 ]; do
         -h|--help)
             echo
             echo "Amiga Retroplay iGame Artwork Merger"
-            echo "Version: 1.6.0-adaptive-a314 (Priority-ordered merge)"
-            echo "Usage: $(basename "$0") [--custom] [--ecs|--aga|--rtg] [-d DEST] [--art ORDER] [--debug]"
+            echo "Version: 1.8.0-fallback-chain (Priority-ordered merge, dynamic artwork sets, tier fallback)"
+            echo "Usage: $(basename "$0") [--custom] [--ecs|--aga|--rtg|--ecs-lo|--aga-lo|--set NAME] [-d DEST] [--art ORDER] [--debug]"
+            echo
+            echo "Artwork sets:"
+            echo "  Any directory named iGame_<NAME> next to this script is a usable artwork"
+            echo "  set - not just ECS/AGA/RTG. Drop in iGame_CD32, iGame_MyPack, etc. and it"
+            echo "  is picked up automatically; no code changes needed."
+            if [ "${#IGAME_SET_NAMES[@]}" -gt 0 ]; then
+                echo "  Sets found here: ${IGAME_SET_NAMES[*]}"
+            else
+                echo "  No iGame_* directories were found here."
+            fi
             echo
             echo "Options:"
-            echo "  --custom          Show interactive menu to select artwork set"
-            echo "  --ecs             Use iGame_ECS source (default)"
-            echo "  --aga             Use iGame_AGA source"
-            echo "  --rtg             Use iGame_RTG source"
+            echo "  --custom          Show interactive menu listing every discovered set"
+            echo "  --ecs             Shortcut for --set ECS (default if present)"
+            echo "  --aga             Shortcut for --set AGA"
+            echo "  --rtg             Shortcut for --set RTG"
+            echo "  --ecs-lo          Shortcut for --set ECS_LO (matches iGame_ECS_Lo)"
+            echo "  --aga-lo          Shortcut for --set AGA_LO (matches iGame_AGA_Lo)"
+            echo "  --set NAME        Use the iGame_NAME directory as the artwork source"
+            echo "                    (case-insensitive, e.g. --set cd32 matches iGame_CD32)"
             echo " -d, --dest Set destination directory (default: ./retro)"
             echo " --art Set merge priority order for non-demos (default: Screens,Covers,Titles)"
             echo "       Example: --art \"Screens,Covers,Titles\""
@@ -170,6 +266,18 @@ while [ $# -gt 0 ]; do
             echo "       Example: --demo-art \"Titles,Screens,Covers\""
             echo "  --a314            Hint: running on A314 (lower parallelism, fewer updates)"
             echo "  --debug           Enable debug output to trace artwork matching"
+            echo
+            echo "Artwork fallback chain:"
+            echo "  If a game has no artwork in the selected/requested set, these sets are"
+            echo "  tried next, in order, before giving up on iGame artwork for that game:"
+            echo "    --rtg   : RTG -> AGA -> AGA_Lo -> iGame_art -> ECS -> ECS_Lo"
+            echo "    --aga   : AGA -> AGA_Lo -> iGame_art -> ECS -> ECS_Lo"
+            echo "    --aga-lo: AGA_Lo -> iGame_art -> ECS -> ECS_Lo"
+            echo "    --ecs   : ECS -> ECS_Lo -> iGame_art"
+            echo "    --ecs-lo: ECS_Lo -> iGame_art"
+            echo "    --set/--custom (anything else): the chosen set -> iGame_art"
+            echo "  TinyLauncher is tried after all of the above, then any other"
+            echo "  discovered iGame_* directory not already covered."
             echo
             echo "Platforms: macOS 10.15.7+ | Debian 12/13 | Raspberry Pi"
             echo "Merges artwork from Screens/Screen/Titles/Title/Covers/Cover hierarchies and TinyLauncher."
@@ -179,9 +287,22 @@ while [ $# -gt 0 ]; do
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+unset opt_lc
 
 if [ "$CUSTOM" -eq 1 ]; then
     show_artwork_menu
+elif [ -n "$SET_OPT" ]; then
+    if ! resolve_art_set "$SET_OPT"; then
+        echo "NOTE: No iGame_$SET_OPT directory found under: $SCRIPT_DIR"
+        echo "Will still try the artwork fallback chain (see --help) for a match."
+        SELECTED_SET_KEY="${SET_OPT^^}"
+        ART_SRC=""
+    fi
+else
+    if ! default_art_set; then
+        echo "ERROR: No iGame_* artwork directories found under: $SCRIPT_DIR"
+        exit 1
+    fi
 fi
 
 # DEST can be set via -d/--dest or forwarded from start.sh
@@ -201,25 +322,72 @@ case "$primary_section" in
 esac
 
 # -----------------------------------------------------------------------------
-# Artwork index: pre-scan ART_SRC once and map game name -> directory by section
+# Artwork fallback chain: when the requested/selected set doesn't have a
+# match for a given game, these are the other iGame_* sets (and finally
+# TinyLauncher) to try instead, in order. TINYLAUNCHER is a sentinel handled
+# separately below, not an iGame_* directory.
+# -----------------------------------------------------------------------------
+case "$SELECTED_SET_KEY" in
+    RTG)
+        FALLBACK_CHAIN=(RTG AGA AGA_LO ART ECS ECS_LO TINYLAUNCHER)
+        ;;
+    AGA)
+        FALLBACK_CHAIN=(AGA AGA_LO ART ECS ECS_LO TINYLAUNCHER)
+        ;;
+    AGA_LO)
+        FALLBACK_CHAIN=(AGA_LO ART ECS ECS_LO TINYLAUNCHER)
+        ;;
+    ECS)
+        FALLBACK_CHAIN=(ECS ECS_LO ART TINYLAUNCHER)
+        ;;
+    ECS_LO)
+        FALLBACK_CHAIN=(ECS_LO ART TINYLAUNCHER)
+        ;;
+    "")
+        # Nothing selected at all (shouldn't normally happen - default_art_set
+        # always sets SELECTED_SET_KEY on success)
+        FALLBACK_CHAIN=(ART TINYLAUNCHER)
+        ;;
+    *)
+        # A custom --set NAME or an interactive --custom pick outside the
+        # named tiers above: try it, then the generic pool, then TinyLauncher.
+        FALLBACK_CHAIN=("$SELECTED_SET_KEY" ART TINYLAUNCHER)
+        ;;
+esac
+
+# Append any other discovered iGame_* sets not already in the chain, so a
+# fresh iGame_MyPack directory is still tried as a last resort even though
+# nothing above knows its name in advance.
+for _fbname in "${IGAME_SET_NAMES[@]}"; do
+    _fbkey="${_fbname^^}"
+    _fbalready=0
+    for _fbc in "${FALLBACK_CHAIN[@]}"; do
+        [ "$_fbc" = "$_fbkey" ] && _fbalready=1 && break
+    done
+    [ "$_fbalready" -eq 0 ] && FALLBACK_CHAIN+=("$_fbkey")
+done
+unset _fbname _fbkey _fbalready _fbc
+
+debug_log "Artwork fallback chain: ${FALLBACK_CHAIN[*]}"
+
+# -----------------------------------------------------------------------------
+# Artwork index: pre-scan every source in the fallback chain once, so
+# per-game lookups are pure associative-array hits with no filesystem I/O.
+# Key: "SRC|Section|GameName" -> directory path (SRC is a FALLBACK_CHAIN
+# entry like RTG, AGA_LO, ART, or a custom set name).
 # -----------------------------------------------------------------------------
 
-declare -A IGAME_INDEX_BY_SECTION # key: "Section|GameName" -> directory path
+declare -A IGAME_INDEX
 
-generate_art_index_for_source() {
-    local src_root="$1"
+index_source() {
+    local src_key="$1" src_root="$2"
     local sec category dir_prefix sec_name cat_name base_path game_dir game_name key
 
-    # Clear any existing index
-    IGAME_INDEX_BY_SECTION=()
-
-    for sec in "${ART_ORDER[@]}"; do
-        # Allow singular/plural section names
+    for sec in Screens Covers Titles; do
         case "$sec" in
             Screens) section_variants=(Screens Screen) ;;
             Covers)  section_variants=(Covers Cover) ;;
             Titles)  section_variants=(Titles Title) ;;
-            *)       section_variants=("$sec") ;;
         esac
 
         for category in Games Magazines Demos; do
@@ -238,10 +406,10 @@ generate_art_index_for_source() {
                         # One non-recursive level: children are expected to be game dirs
                         while IFS= read -r -d '' game_dir; do
                             game_name="$(basename "$game_dir")"
-                            key="$sec|$game_name"
-                            # Only keep the first hit per section+game
-                            if [ -z "${IGAME_INDEX_BY_SECTION[$key]+_}" ]; then
-                                IGAME_INDEX_BY_SECTION["$key"]="$game_dir"
+                            key="$src_key|$sec|$game_name"
+                            # Only keep the first hit per source+section+game
+                            if [ -z "${IGAME_INDEX[$key]+_}" ]; then
+                                IGAME_INDEX["$key"]="$game_dir"
                             fi
                         done < <(find "$base_path" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
                     done
@@ -252,17 +420,26 @@ generate_art_index_for_source() {
 }
 
 debug_log "Script directory: $SCRIPT_DIR"
-debug_log "Artwork source: $ART_SRC"
+debug_log "Primary artwork source: ${ART_SRC:-<none - relying on fallback chain>}"
 debug_log "Destination: $DEST"
 debug_log "Art merge order: ${ART_ORDER[*]}"
 
-if [ ! -d "$ART_SRC" ]; then
-    echo "ERROR: Source artwork directory not found: $ART_SRC"
+indexed_any_source=0
+for _fbc in "${FALLBACK_CHAIN[@]}"; do
+    [ "$_fbc" = "TINYLAUNCHER" ] && continue
+    if [ -n "${IGAME_SET_DIR[$_fbc]+_}" ]; then
+        index_source "$_fbc" "${IGAME_SET_DIR[$_fbc]}"
+        indexed_any_source=1
+        debug_log "Indexed artwork source: $_fbc -> ${IGAME_SET_DIR[$_fbc]}"
+    fi
+done
+unset _fbc
+
+if [ "$indexed_any_source" -eq 0 ] && [ ! -d "$TINYLAUNCHER_SRC" ]; then
+    echo "ERROR: none of the artwork fallback chain's directories exist, and no"
+    echo "TinyLauncher directory was found either: ${FALLBACK_CHAIN[*]}"
     exit 1
 fi
-
-# Build artwork index for primary source tree to avoid per-game find calls
-generate_art_index_for_source "$ART_SRC"
 
 if [ ! -d "$DEST/WHDLoad" ]; then
     echo "ERROR: No WHDLoad directory found at: $DEST/WHDLoad"
@@ -337,7 +514,8 @@ echo -e "Platform: ${YELLOW}$(uname)${NC}"
 echo -e "Detected CPU core(s): ${YELLOW}$CORES${NC}"
 echo -e "Parallel job limit: ${YELLOW}$max_parallel${NC}"
 echo -e "Destination directory: ${YELLOW}$DEST${NC}"
-echo -e "Selected artwork source: ${YELLOW}$ART_SRC${NC}"
+echo -e "Selected artwork source: ${YELLOW}${ART_SRC:-<none found - using fallback chain>}${NC}"
+echo -e "Artwork fallback chain: ${YELLOW}${FALLBACK_CHAIN[*]}${NC}"
 echo -e "Game/Mag art order: ${YELLOW}$GAME_ART_PRIORITY${NC}"
 echo -e "Demo art order: ${YELLOW}$DEMO_ART_PRIORITY${NC}"
 [ -d "$TINYLAUNCHER_SRC" ] && echo -e "TinyLauncher source: ${YELLOW}$TINYLAUNCHER_SRC${NC}"
@@ -388,7 +566,7 @@ total_targets="${#merge_targets[@]}"
 
 shopt -s nullglob
 for dest_sub in "${merge_targets[@]}"; do
-    [ -z "$dest_sub" ] && exit 0
+    [ -z "$dest_sub" ] && continue
     dest_name="$(basename "$dest_sub")"
     debug_log "Processing target: $dest_name -> $dest_sub"
 
@@ -414,37 +592,32 @@ for dest_sub in "${merge_targets[@]}"; do
     igameecs_found=0
     tinylauncher_found=0
 
-    # Fast pre-check: skip dirs that cannot correspond to any game name
-    has_any_match=0
-    for section in "${ART_ORDER[@]}"; do
-        key="$section|$dest_name"
-        if [ -n "${IGAME_INDEX_BY_SECTION[$key]+_}" ]; then
-            has_any_match=1
-            break
-        fi
-    done
-
-    if [ "$has_any_match" -eq 0 ]; then
-        debug_log "Skipping non-game directory: $dest_name"
-        processed=$((processed + 1))
-        if (( processed % PROGRESS_STEP == 0 || processed == total_targets )); then
-            progress_bar "$processed" "$total_targets" "$BAR_WIDTH"
-        fi
-        continue
-    fi
-
     best_section=""
     best_dir=""
+    best_src=""
 
-    # Find best matching section/dir from index
-    for section in "${ART_ORDER[@]}"; do
-        key="$section|$dest_name"
-        if [ -n "${IGAME_INDEX_BY_SECTION[$key]+_}" ]; then
-            best_section="$section"
-            best_dir="${IGAME_INDEX_BY_SECTION[$key]}"
-            break
-        fi
+    # Walk the fallback chain in order; within each source, respect this
+    # target's section priority (ART_ORDER). First hit anywhere wins.
+    # (Obvious helper directories like data/txt/cfg were already filtered
+    # out of merge_targets above, so every dest_sub here is worth checking
+    # against both the iGame index and, below, TinyLauncher - a game that
+    # only has TinyLauncher artwork and no iGame_* match must still reach
+    # that check rather than being skipped early.)
+    for _fbc in "${FALLBACK_CHAIN[@]}"; do
+        [ "$_fbc" = "TINYLAUNCHER" ] && break
+        for section in "${ART_ORDER[@]}"; do
+            key="$_fbc|$section|$dest_name"
+            if [ -n "${IGAME_INDEX[$key]+_}" ]; then
+                best_section="$section"
+                best_dir="${IGAME_INDEX[$key]}"
+                best_src="$_fbc"
+                break 2
+            fi
+        done
     done
+    if [ -n "$best_src" ]; then
+        debug_log "Matched $dest_name via $best_src ($best_section)"
+    fi
 
         if [ -n "$best_dir" ] && [ -d "$best_dir" ]; then
         # 1) Copy all non-IFF artwork files from this section into the game dir
@@ -452,6 +625,9 @@ for dest_sub in "${merge_targets[@]}"; do
         for f in "$best_dir"/*; do
             [ -f "$f" ] || continue
             base="$(basename "$f")"
+            case "$base" in
+                *:a314) continue ;;  # A314 bridge metadata sidecar file, not real artwork
+            esac
             case "${base,,}" in
                 *.iff) continue ;;  # handled separately below
             esac
@@ -477,6 +653,9 @@ for dest_sub in "${merge_targets[@]}"; do
         for f in "$best_dir"/*; do
             [ -f "$f" ] || continue
             base="$(basename "$f")"
+            case "$base" in
+                *:a314) continue ;;  # A314 bridge metadata sidecar file
+            esac
             case "${base,,}" in
                 igame.iff)
                     chosen_src_iff="$f"

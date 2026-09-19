@@ -25,43 +25,6 @@ if [[ "$OS_TYPE" != "Darwin" ]] && [ -r /proc/device-tree/model ]; then
     esac
 fi
 
-while [ $# -gt 0 ]; do
-    case "$1" in
-        -d|--dest)
-            DEST_OVERRIDE="$2"
-            shift 2
-            ;;
-        --custom)
-            # Accept --custom from start.sh but no special behaviour needed here
-            shift
-            ;;
-        -h|--help)
-            echo "Usage: $(basename "$0") [options]"
-            echo "Options:"
-            echo "  -d, --dest [path]  Set custom destination directory (default: ./retro)"
-            echo "  -h, --help         Show this help"
-            echo "  --ffs              Sort for Amiga FFS compliance (PFS is the default)"
-            echo "  --skipchk          Skip compliance check"
-            echo "  --custom           Reserved for dispatcher integration (no-op here)"
-            exit 0
-            ;;
-        --)
-            shift
-            break
-            ;;
-        -*)
-            echo "Unknown option: $1" >&2
-            exit 1
-            ;;
-        *)
-            break
-            ;;
-    esac
-done
-
-# Use either CLI override, or default
-DEST="${DEST_OVERRIDE:-$DEFAULT_DEST}"
-
 declare -a sort_summary=()
 trap 'exit 130' INT TERM
 
@@ -73,6 +36,89 @@ FFS_LIMIT=25
 PFS_LIMIT=107
 MAX_FILENAME_LEN=$PFS_LIMIT
 RUN_COMPLIANCE_CHECK=true
+SKIP_DETOX=false
+
+print_sort_help() {
+    echo "Amiga Retroplay Archive Organizer & Sorter - Ultimate Edition"
+    echo "Version: $version"
+    echo ""
+    echo "Usage: $(basename "$0") [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  -d, --dest [path]  Set custom destination directory (default: ./retro)"
+    echo "  --ffs              Use FFS filesystem limits ($FFS_LIMIT character filenames)"
+    echo "  --pfs              Use PFS filesystem limits ($PFS_LIMIT character filenames) [default]"
+    echo "  --skipchk          Skip the Amiga filesystem compliance check entirely"
+    echo "  --no-detox         Do not run detox, even if it's installed"
+    echo "  --custom           Reserved for dispatcher integration (no-op here)"
+    echo "  -h, --help         Show this help message"
+    echo ""
+    echo "Platform: macOS, Linux, Debian 12/13, Amiga A314 compatible"
+    echo ""
+    echo "Features:"
+    echo "  • Parallel processing (auto-detects CPU cores)"
+    echo "  • Adaptive progress bar (smooth Unicode on macOS, ASCII elsewhere)"
+    echo "  • Amiga filesystem compliance checking with length-based auto-fix"
+    echo "  • Progress updates every 1000 files during compliance check"
+    echo "  • Detailed logging to sort.log and amiga_filename_issues.log"
+    echo ""
+}
+
+# ----------------------------------------------------------------------------
+# Single unified argument parser (this used to be two separate, conflicting
+# loops - one that errored out on --ffs/--pfs/--skipchk before a second loop
+# ever got to see them, and silently dropped --dest whenever the caller
+# passed an empty placeholder argument, as start.sh does). An empty string
+# argument (as start.sh passes when no --ffs/--pfs was chosen) is tolerated.
+# ----------------------------------------------------------------------------
+while [ $# -gt 0 ]; do
+    case "$1" in
+        "")
+            shift
+            ;;
+        -d|--dest)
+            DEST_OVERRIDE="$2"
+            shift 2
+            ;;
+        --custom)
+            # Accept --custom from start.sh but no special behaviour needed here
+            shift
+            ;;
+        --ffs)
+            FS_TYPE="FFS"
+            MAX_FILENAME_LEN=$FFS_LIMIT
+            shift
+            ;;
+        --pfs)
+            FS_TYPE="PFS"
+            MAX_FILENAME_LEN=$PFS_LIMIT
+            shift
+            ;;
+        --skipchk)
+            RUN_COMPLIANCE_CHECK=false
+            shift
+            ;;
+        --no-detox)
+            SKIP_DETOX=true
+            shift
+            ;;
+        -h|--help)
+            print_sort_help
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Use either CLI override, or default
+DEST="${DEST_OVERRIDE:-$DEFAULT_DEST}"
 
 LOGFILE="$(pwd)/sort.log"
 AMIGA_ISSUES_LOG="$(pwd)/amiga_filename_issues.log"
@@ -282,10 +328,37 @@ check_path_compliance() {
 # ============================================================================ 
 # PRE-CLEAN FILENAMES WITH DETOX (macOS/Linux)
 # ============================================================================
-if command -v detox >/dev/null 2>&1; then
+if [ "$SKIP_DETOX" = true ]; then
+    echo "Skipping detox pre-clean (--no-detox given)."
+elif command -v detox >/dev/null 2>&1; then
     echo "Pre-cleaning filenames with detox in: $DEST"
     detox -r -s utf_8 "$DEST" >/dev/null 2>&1
     echo "detox pre-clean complete."
+elif [ -t 0 ]; then
+    echo "detox is not installed (optional - used to pre-clean filenames)."
+    if [[ "$OS_TYPE" == "Darwin" ]]; then
+        reply=""
+        printf 'Install it now via Homebrew (brew install detox)? [y/N] '
+        read -r reply
+        case "$reply" in
+            [Yy]*)
+                brew install detox
+                if command -v detox >/dev/null 2>&1; then
+                    echo "Pre-cleaning filenames with detox in: $DEST"
+                    detox -r -s utf_8 "$DEST" >/dev/null 2>&1
+                    echo "detox pre-clean complete."
+                else
+                    echo "detox install did not succeed; skipping pre-clean."
+                fi
+                ;;
+            *)
+                echo "Skipping pre-clean."
+                ;;
+        esac
+    else
+        echo "On Linux/A314, detox needs building from source (run start.sh, which can"
+        echo "offer to build it automatically) or use --no-detox to silence this prompt."
+    fi
 else
     echo "detox not found; skipping pre-clean (optional dependency)."
 fi
@@ -364,47 +437,7 @@ wait_all_jobs() {
     running_pids=()
 }
 
-# ============================================================================
-# COMMAND LINE ARGUMENT PROCESSING
-# ============================================================================
-for arg in "$@"; do
-    case "$arg" in
-        --ffs)
-            FS_TYPE="FFS"
-            MAX_FILENAME_LEN=$FFS_LIMIT
-            ;;
-        --pfs)
-            FS_TYPE="PFS"
-            MAX_FILENAME_LEN=$PFS_LIMIT
-            ;;
-        --skipchk)
-            RUN_COMPLIANCE_CHECK=false
-            ;;
-        --help)
-            echo "Amiga Retroplay Archive Organizer & Sorter - Ultimate Edition"
-            echo "Version: $version"
-            echo ""
-            echo "Usage: $0 [OPTIONS]"
-            echo ""
-            echo "Options:"
-            echo "  --ffs       Use FFS filesystem limits (30 character filenames)"
-            echo "  --pfs       Use PFS filesystem limits (107 character filenames) [default]"
-            echo "  --skipchk   Skip the Amiga filesystem compliance check entirely"
-            echo "  --help      Show this help message"
-            echo ""
-            echo "Platform: macOS, Linux, Debian 12/13, Amiga A314 compatible"
-            echo ""
-            echo "Features:"
-            echo "  • Parallel processing (auto-detects CPU cores)"
-            echo "  • Adaptive progress bar (smooth Unicode on macOS, ASCII elsewhere)"
-            echo "  • Amiga filesystem compliance checking with length-based auto-fix"
-            echo "  • Progress updates every 1000 files during compliance check"
-            echo "  • Detailed logging to sort.log and amiga_filename_issues.log"
-            echo ""
-            exit 0
-            ;;
-    esac
-done
+# (Argument parsing already happened in the single unified loop above.)
 
 # Determine progress bar style message
 if [[ "$OS_TYPE" == "Darwin" ]]; then
@@ -689,9 +722,12 @@ if [ "$RUN_COMPLIANCE_CHECK" = true ]; then
     issues_found=0
     total_scanned=0
     files_fixed=0
-    total_files=$(find "$CHECK_ROOT" -type f 2>/dev/null | wc -l)
+    total_files=$(find "$CHECK_ROOT" -type f ! -name '*:a314' 2>/dev/null | wc -l)
 
     while IFS= read -r -d '' file; do
+        case "$file" in
+            *:a314) continue ;;  # A314 bridge metadata sidecar file, not a real file
+        esac
         total_scanned=$((total_scanned + 1))
 
         # Progress update every 1000 files
@@ -719,7 +755,7 @@ if [ "$RUN_COMPLIANCE_CHECK" = true ]; then
                 done <<< "$issues"
             fi
         fi
-    done < <(find "$CHECK_ROOT" -type f -print0 2>/dev/null)
+    done < <(find "$CHECK_ROOT" -type f ! -name '*:a314' -print0 2>/dev/null)
 
     printf "\r%-60s\n" " "
 

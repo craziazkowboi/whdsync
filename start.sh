@@ -5,28 +5,99 @@
 # License: Creative Commons BY‑NC 4.0 International
 
 script_start_time=$(date +%s)
-ORIG_PWD=$(pwd)
-NEW_DIR="${ORIG_PWD}/new"
+
+# Resolve to this script's own directory and work from there, regardless of
+# where the caller's shell happened to be (previously this used bare "./x.sh"
+# calls that only worked if you'd already cd'ed into the scripts' folder).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR" || { echo "ERROR: cannot cd to script directory: $SCRIPT_DIR" >&2; exit 1; }
+NEW_DIR="${SCRIPT_DIR}/new"
 
 ulimit -n 16384
 
 # DO NOT set -e here - we need to parse options first
 set -uo pipefail
 
-version="1.2.2 macOS 10.15.7 Compatible (no color)"
+version="1.2.3 macOS 10.15.7 Compatible (no color)"
 
 ACTION=""
 MERGE_OPT=""
+SET_OPT=""
 SORT_OPT=""
 DEST_OPT=""
 ART_ORDER_OPT=""
+DEMO_ART_OPT=""
 MENU_DEST_OVERRIDE=""
 DEBUG_MODE=0
+NO_DETOX=0
 
 # Basic environment / colors (no color for now)
 OS_TYPE="$(uname -s | tr '[:upper:]' '[:lower:]')"
 RED=""
 NC=""
+
+# Prompts to auto-install a missing tool via the platform's package manager.
+# Returns 0 if the tool is available afterwards, 1 otherwise. Declines
+# automatically (no prompt hang) if stdin isn't a terminal.
+offer_install_pkg() {
+  local tool_name="$1" apt_pkg="$2" brew_pkg="$3" reply
+  if [ ! -t 0 ]; then
+    echo "  (no terminal attached to answer a prompt - skipping auto-install of $tool_name)"
+    return 1
+  fi
+  if [[ "$OS_TYPE" == "darwin" ]]; then
+    printf '%s is missing. Install it now via Homebrew (brew install %s)? [y/N] ' "$tool_name" "$brew_pkg"
+  else
+    printf '%s is missing. Install it now via apt (sudo apt install %s)? [y/N] ' "$tool_name" "$apt_pkg"
+  fi
+  read -r reply
+  case "$reply" in
+    [Yy]*)
+      if [[ "$OS_TYPE" == "darwin" ]]; then
+        brew install "$brew_pkg"
+      else
+        sudo apt-get update && sudo apt-get install -y "$apt_pkg"
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  command -v "$tool_name" >/dev/null 2>&1
+}
+
+# Offers to build detox 3.0.1 from source on Linux/A314, using the exact
+# commands this script already documents as manual instructions.
+offer_build_detox() {
+  local reply
+  if [ ! -t 0 ]; then
+    echo "  (no terminal attached to answer a prompt - skipping auto-build of detox)"
+    return 1
+  fi
+  printf 'Build and install detox 3.0.1 from source now? [y/N] '
+  read -r reply
+  case "$reply" in
+    [Yy]*) : ;;
+    *) return 1 ;;
+  esac
+  local build_dir
+  build_dir="$(mktemp -d)" || return 1
+  (
+    set -e
+    sudo apt-get update
+    sudo apt-get install -y git autoconf automake bison flex gcc make pkg-config
+    cd "$build_dir"
+    wget -q https://github.com/dharple/detox/releases/download/v3.0.1/detox-3.0.1.tar.gz
+    tar xzf detox-3.0.1.tar.gz
+    cd detox-3.0.1
+    ./configure
+    make
+    sudo make install
+  )
+  local build_status=$?
+  rm -rf "$build_dir"
+  [ "$build_status" -eq 0 ] && command -v detox >/dev/null 2>&1
+}
 
 # ----- Tool dependency check (lha, 7z, unar detox) -----
 missing=()
@@ -38,20 +109,46 @@ done
 
 if [ ${#missing[@]} -ne 0 ]; then
     echo "Missing tools: ${missing[*]}"
-    if [[ "$OS_TYPE" == "darwin" ]]; then
-        echo "Install via Homebrew (macOS): brew install lha p7zip unar detox"
-        echo "Also: brew install coreutils (for greadlink)"
-    else
-        echo "Or via apt (Linux): sudo apt install lhasa p7zip-full unar"
+    still_missing=()
+    for tool in "${missing[@]}"; do
+        case "$tool" in
+            lha)  apt_pkg="lhasa";      brew_pkg="lha" ;;
+            7z)   apt_pkg="p7zip-full"; brew_pkg="p7zip" ;;
+            unar) apt_pkg="unar";       brew_pkg="unar" ;;
+        esac
+        if offer_install_pkg "$tool" "$apt_pkg" "$brew_pkg"; then
+            echo "  $tool is now available."
+        else
+            still_missing+=("$tool")
+        fi
+    done
+    if [ ${#still_missing[@]} -ne 0 ]; then
+        echo
+        echo "Still missing: ${still_missing[*]}"
+        if [[ "$OS_TYPE" == "darwin" ]]; then
+            echo "Install via Homebrew (macOS): brew install ${still_missing[*]}"
+            echo "Also: brew install coreutils (for greadlink)"
+        else
+            apt_names=()
+            for t in "${still_missing[@]}"; do
+                case "$t" in
+                    lha) apt_names+=("lhasa") ;;
+                    7z)  apt_names+=("p7zip-full") ;;
+                    *)   apt_names+=("$t") ;;
+                esac
+            done
+            echo "Or via apt (Linux): sudo apt install ${apt_names[*]}"
+        fi
+        exit 1
     fi
-    exit 1
 fi
 
 # ----- unlzx check and detailed help -----
 if ! command -v unlzx >/dev/null 2>&1; then
-    echo "ERROR: 'unlzx' is not installed or not in PATH."
-    echo
+    echo "'unlzx' is not installed or not in PATH."
     echo "unlzx is required to extract LZX archives used by Retroplay sets."
+    echo "It has no standard apt/brew package, so it can't be auto-installed -"
+    echo "it must be downloaded from Aminet and built from source:"
     echo
     echo "You can download unlzx from Aminet (Amiga archive site):"
     echo "  https://aminet.net/package/util/arc/unlzx"
@@ -77,14 +174,36 @@ if ! command -v unlzx >/dev/null 2>&1; then
     exit 1
 fi
 # ----- Detox version check (Debian/A314 only) -----
-if [[ "$OS_TYPE" != "darwin" ]]; then
+# This gate runs before normal option parsing (further below), so do a quick
+# pre-scan of the raw arguments for --no-detox here rather than moving the
+# whole dependency-check block after parsing.
+_no_detox_requested=0
+for _a in "$@"; do
+    [ "$_a" = "--no-detox" ] && _no_detox_requested=1 && break
+done
+
+if [ "$_no_detox_requested" -eq 1 ]; then
+    echo "Skipping detox dependency check (--no-detox given)."
+elif [[ "$OS_TYPE" != "darwin" ]]; then
+  detox_ok=0
   if command -v detox >/dev/null 2>&1; then
     DETOX_VER_RAW="$(detox -V 2>/dev/null || true)"
     DETOX_VER="$(printf '%s\n' "$DETOX_VER_RAW" | sed -n 's/[^0-9]*\([0-9]\+\.[0-9]\+\).*/\1/p')"
+    if [ -n "$DETOX_VER" ] && ! awk "BEGIN{exit !($DETOX_VER < 3.0)}"; then
+        detox_ok=1
+    fi
+  fi
 
-    if [ -z "$DETOX_VER" ] || awk "BEGIN{exit !($DETOX_VER < 3.0)}"; then
+  if [ "$detox_ok" -eq 0 ]; then
+    if [ -n "${DETOX_VER_RAW:-}" ]; then
       echo "Detected detox version '$DETOX_VER_RAW' (need 3.0 or greater)."
-      echo "Install Detox 3.0.1 on Debian 12/A314 with:"
+    else
+      echo "detox not found on this Debian/A314 system."
+    fi
+    if offer_build_detox; then
+      echo "  detox is now available."
+    else
+      echo "Install Detox 3.0.1 manually with:"
       echo "  sudo apt install -y git autoconf automake bison flex gcc make pkg-config"
       echo "  wget https://github.com/dharple/detox/releases/download/v3.0.1/detox-3.0.1.tar.gz"
       echo "  tar xzf detox-3.0.1.tar.gz"
@@ -93,20 +212,9 @@ if [[ "$OS_TYPE" != "darwin" ]]; then
       echo "  make"
       echo "  sudo make install"
       echo "  detox -V"
+      echo "Or skip detox entirely with --no-detox."
       exit 1
     fi
-  else
-    echo "detox not found on this Debian/A314 system."
-    echo "Install Detox 3.0.1 with:"
-    echo "  sudo apt install -y git autoconf automake bison flex gcc make pkg-config"
-    echo "  wget https://github.com/dharple/detox/releases/download/v3.0.1/detox-3.0.1.tar.gz"
-    echo "  tar xzf detox-3.0.1.tar.gz"
-    echo "  cd detox-3.0.1"
-    echo "  ./configure"
-    echo "  make"
-    echo "  sudo make install"
-    echo "  detox -V"
-    exit 1
   fi
 fi
 
@@ -142,10 +250,17 @@ while [ $# -gt 0 ]; do
       echo "  --ecs                 Run merge.sh with --ecs."
       echo "  --aga                 Run merge.sh with --aga."
       echo "  --rtg                 Run merge.sh with --rtg."
-      echo "  --ffs                 Run sort.sh with --ffs."
+      echo "  --ecs-lo              Run merge.sh with --ecs-lo (matches iGame_ECS_Lo)."
+      echo "  --aga-lo              Run merge.sh with --aga-lo (matches iGame_AGA_Lo)."
+      echo "  --set [name]          Run merge.sh with --set NAME (any iGame_NAME directory)."
+      echo "  --ffs                 Run sort.sh with --ffs (FFS filename limits)."
+      echo "  --pfs                 Run sort.sh with --pfs (PFS filename limits, default)."
       echo "  --dest [path]         Set custom destination directory."
-      echo "  --art [order]         Set merge priority order (e.g., Screens,Covers,Titles)."
-      echo "  --debug               Enable debug output."
+      echo "  --art [order]         Set merge priority order for non-demos (e.g., Screens,Covers,Titles)."
+      echo "  --demo-art [order]    Set merge priority order for demos (e.g., Titles,Screens,Covers)."
+      echo "  --no-detox            Skip detox entirely - the startup dependency check and"
+      echo "                        the pre-clean step in sort.sh."
+      echo "  --debug               Enable debug output (also passed to extract.sh/merge.sh)."
       echo "  --exit                Exit immediately."
       echo
       exit 0
@@ -186,17 +301,41 @@ while [ $# -gt 0 ]; do
       MERGE_OPT="--rtg"
       shift
       ;;
+    --ecs-lo)
+      MERGE_OPT="--ecs-lo"
+      shift
+      ;;
+    --aga-lo)
+      MERGE_OPT="--aga-lo"
+      shift
+      ;;
+    --set)
+      SET_OPT="$2"
+      shift 2
+      ;;
     --ffs)
       SORT_OPT="--ffs"
       shift
       ;;
-    --dest)
+    --pfs)
+      SORT_OPT="--pfs"
+      shift
+      ;;
+    -d|--dest)
       DEST_OPT="$2"
       shift 2
       ;;
     --art)
       ART_ORDER_OPT="$2"
       shift 2
+      ;;
+    --demo-art)
+      DEMO_ART_OPT="$2"
+      shift 2
+      ;;
+    --no-detox)
+      NO_DETOX=1
+      shift
       ;;
     --debug)
       DEBUG_MODE=1
@@ -307,61 +446,111 @@ fi
 
 # ----- Helper function: Check if subscript exists -----
 check_script() {
-  local script_name="$1"
-  if [ ! -f "$script_name" ]; then
-    echo "ERROR: Required script not found: $script_name"
-    echo "Current directory: $(pwd)"
+  local script_path="$1"
+  if [ ! -f "$script_path" ]; then
+    echo "ERROR: Required script not found: $script_path"
+    echo "Script directory: $SCRIPT_DIR"
     exit 1
   fi
-  if [ ! -x "$script_name" ]; then
-    echo "ERROR: Script is not executable: $script_name"
-    echo "Run: chmod +x $script_name"
+  if [ ! -x "$script_path" ]; then
+    echo "ERROR: Script is not executable: $script_path"
+    echo "Run: chmod +x $script_path"
     exit 1
   fi
 }
 
 # ----- Helper function: Run subscript with debug output -----
+# Resolves the script name against SCRIPT_DIR so this works no matter what
+# directory the caller's shell was in when start.sh was invoked.
 run_sub() {
-  local script_name="$1"
+  local script_rel="$1"
   shift
+  local script_path="$SCRIPT_DIR/${script_rel#./}"
 
   if [ "$DEBUG_MODE" -eq 1 ]; then
-    echo "[DEBUG] Running: $script_name $*"
+    echo "[DEBUG] Running: $script_path $*"
   fi
 
-  check_script "$script_name"
+  check_script "$script_path"
 
-  "$script_name" "$@"
+  "$script_path" "$@"
+}
+
+# Build the merge.sh argument list from whatever the user specified.
+#
+# NOTE: every one of these ends with `return 0`. Under `set -e`, a bare
+# statement like `[ -n "$X" ] && arr+=(...)` makes the *whole function*
+# return non-zero whenever that particular test is false - and since these
+# are called as plain statements (not inside an `if`), that would abort the
+# entire script right there. `return 0` guarantees a clean exit status
+# regardless of which of the conditionals above it matched.
+#
+build_merge_args() {
+  merge_args=()
+  [ -n "$MERGE_OPT" ] && merge_args+=("$MERGE_OPT")
+  [ -n "$SET_OPT" ] && merge_args+=(--set "$SET_OPT")
+  [ -n "$ART_ORDER_OPT" ] && merge_args+=(--art "$ART_ORDER_OPT")
+  [ -n "$DEMO_ART_OPT" ] && merge_args+=(--demo-art "$DEMO_ART_OPT")
+  [ -n "$DEST_OPT" ] && merge_args+=(-d "$DEST_OPT")
+  [ "$DEBUG_MODE" -eq 1 ] && merge_args+=(--debug)
+  return 0
+}
+
+# Build the sort.sh argument list. sort.sh tolerates an empty SORT_OPT.
+build_sort_args() {
+  sort_args=()
+  [ -n "$SORT_OPT" ] && sort_args+=("$SORT_OPT")
+  [ -n "$DEST_OPT" ] && sort_args+=(--dest "$DEST_OPT")
+  [ "$NO_DETOX" -eq 1 ] && sort_args+=(--no-detox)
+  return 0
+}
+
+# Build the extract.sh argument list.
+build_extract_args() {
+  extract_args=()
+  [ "$DEBUG_MODE" -eq 1 ] && extract_args+=(--debug)
+  return 0
+}
+
+# Build the quick.sh argument list, forwarding every option it understands.
+build_quick_args() {
+  quick_args=()
+  [ -n "$MERGE_OPT" ] && quick_args+=("$MERGE_OPT")
+  [ -n "$SET_OPT" ] && quick_args+=(--set "$SET_OPT")
+  [ -n "$ART_ORDER_OPT" ] && quick_args+=(--art "$ART_ORDER_OPT")
+  [ -n "$DEMO_ART_OPT" ] && quick_args+=(--demo-art "$DEMO_ART_OPT")
+  [ -n "$DEST_OPT" ] && quick_args+=(-d "$DEST_OPT")
+  [ "$NO_DETOX" -eq 1 ] && quick_args+=(--no-detox)
+  return 0
 }
 
 # Main dispatcher logic
 if [ "$ACTION" = "auto" ]; then
+  build_extract_args
   run_sub ./update.sh
-  run_sub ./extract.sh
+  run_sub ./extract.sh "${extract_args[@]}"
 
-  merge_args=()
-  [ -n "$MERGE_OPT" ] && merge_args+=("$MERGE_OPT")
-  [ -n "$ART_ORDER_OPT" ] && merge_args+=(--art "$ART_ORDER_OPT")
-  [ -n "$DEST_OPT" ] && merge_args+=(-d "$DEST_OPT")
-
+  build_merge_args
   run_sub ./merge.sh "${merge_args[@]}"
 
-  run_sub ./sort.sh "$SORT_OPT" --dest "${DEST_OPT:-}"
+  build_sort_args
+  run_sub ./sort.sh "${sort_args[@]}"
 
 elif [ "$ACTION" = "merge" ]; then
-  merge_args=()
-  [ -n "$MERGE_OPT" ] && merge_args+=("$MERGE_OPT")
-  [ -n "$ART_ORDER_OPT" ] && merge_args+=(--art "$ART_ORDER_OPT")
+  build_merge_args
   run_sub ./merge.sh "${merge_args[@]}"
 
 elif [ "$ACTION" = "update" ]; then
   run_sub ./update.sh
 elif [ "$ACTION" = "extract" ]; then
-  run_sub ./extract.sh
+  build_extract_args
+  run_sub ./extract.sh "${extract_args[@]}"
 elif [ "$ACTION" = "sort" ]; then
-  run_sub ./sort.sh "$SORT_OPT" --dest "${DEST_OPT:-}"
+  build_sort_args
+  run_sub ./sort.sh "${sort_args[@]}"
 elif [ "$ACTION" = "quick" ]; then
-  run_sub ./quick.sh
+  build_quick_args
+  run_sub ./quick.sh "${quick_args[@]}"
 else
   echo
   echo "No valid action resolved. Use -h or --help to see available options."
@@ -371,8 +560,9 @@ fi
 
 # ----- Post-run log handling -----
 
-# Work in the directory the script was started from
-cd "$ORIG_PWD" || true
+# We never left SCRIPT_DIR (sub-scripts run as child processes, so their own
+# internal `cd`s don't affect us) - this is just a defensive re-assertion.
+cd "$SCRIPT_DIR" || true
 
 # Find candidate log files (adjust pattern if needed)
 log_files=()

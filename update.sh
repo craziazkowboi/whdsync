@@ -2,6 +2,34 @@
 
 # Requirements: bash, wget
 
+OS_TYPE="$(uname -s | tr '[:upper:]' '[:lower:]')"
+
+# ----- wget dependency check, with an offer to auto-install if missing -----
+if ! command -v wget >/dev/null 2>&1; then
+    echo "wget is not installed (required to download update archives)."
+    if [ -t 0 ]; then
+        if [[ "$OS_TYPE" == "darwin" ]]; then
+            printf 'Install it now via Homebrew (brew install wget)? [y/N] '
+        else
+            printf 'Install it now via apt (sudo apt install wget)? [y/N] '
+        fi
+        read -r reply
+        case "$reply" in
+            [Yy]*)
+                if [[ "$OS_TYPE" == "darwin" ]]; then
+                    brew install wget
+                else
+                    sudo apt-get update && sudo apt-get install -y wget
+                fi
+                ;;
+        esac
+    fi
+    if ! command -v wget >/dev/null 2>&1; then
+        echo "Error: wget not found. Please install wget before running this script."
+        exit 2
+    fi
+fi
+
 # Check for iGame / TinyLauncher artwork directories in current directory
 required_art_dirs=(
   "iGame_art"
@@ -27,8 +55,6 @@ if [ "$missing_art" -ne 0 ]; then
   # Uncomment the next line if you want to force setting up artwork before running:
   # exit 1
 fi
-
-IFS=$'\n'
 
 dirs=(
     "HD_Loaders/Games"
@@ -65,12 +91,6 @@ do
     dirtemp="Commodore_Amiga_-_${dir//\//_-_}"
     dirpath="${dirtemp// /_}"
 
-    # Make sure wget is installed; if not, print warning
-    if ! command -v wget > /dev/null; then
-        echo "Error: wget not found. Please install wget before running this script."
-        exit 2
-    fi
-
     wget -q --mirror -np -nH --cut-dirs=2 "ftp://ftp:amiga@grandis.nu/Retroplay%20WHDLoad%20Packs/$dirpath" > /dev/null
 
     popd > /dev/null || exit 1
@@ -80,7 +100,7 @@ do
 
     # Identify new files and count them
     new_files=0
-    while read nf; do
+    while IFS= read -r nf; do
         if [ -n "$nf" ]; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') $nf" >> "$logfile"
             new_files=$((new_files + 1))
