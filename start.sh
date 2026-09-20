@@ -731,13 +731,13 @@ if [ "$ACTION" = "auto" ]; then
   if [ "$INCREMENTAL" -eq 0 ]; then
     # ----- Full / clean rebuild: exactly the original --auto behaviour -----
     build_extract_args
-    run_step "extract.sh" ./extract.sh "${extract_args[@]}"
+    run_step "extract.sh" ./extract.sh "${extract_args[@]+"${extract_args[@]}"}"
 
     build_merge_args
-    run_step "merge.sh" ./merge.sh "${merge_args[@]}"
+    run_step "merge.sh" ./merge.sh "${merge_args[@]+"${merge_args[@]}"}"
 
     build_sort_args
-    run_step "sort.sh" ./sort.sh "${sort_args[@]}"
+    run_step "sort.sh" ./sort.sh "${sort_args[@]+"${sort_args[@]}"}"
   else
     # ----- Incremental update into an existing $DEST_OPT -----
     # Stage just the newly downloaded files (the same technique quick.sh
@@ -785,14 +785,14 @@ if [ "$ACTION" = "auto" ]; then
       STEP_NUM=$((STEP_NUM + 1))
       echo
       echo "===== Step $STEP_NUM of $TOTAL_STEPS: extract.sh (new files) ====="
-      (cd "$TEMP_SRC_DIR" && bash "$SCRIPT_DIR/extract.sh" "${extract_args[@]}")
+      (cd "$TEMP_SRC_DIR" && bash "$SCRIPT_DIR/extract.sh" "${extract_args[@]+"${extract_args[@]}"}")
       rm -rf "$TEMP_SRC_DIR"
 
       build_merge_args
-      run_step "merge.sh (new files)" ./merge.sh "${merge_args[@]}"
+      run_step "merge.sh (new files)" ./merge.sh "${merge_args[@]+"${merge_args[@]}"}"
 
       build_sort_args
-      run_step "sort.sh (new files)" ./sort.sh "${sort_args[@]}"
+      run_step "sort.sh (new files)" ./sort.sh "${sort_args[@]+"${sort_args[@]}"}"
 
       DEST_OPT="$_real_dest"
 
@@ -803,7 +803,7 @@ if [ "$ACTION" = "auto" ]; then
     fi
 
     build_merge_args
-    run_step "merge.sh (fill missing artwork)" ./merge.sh "${merge_args[@]}" --only-missing
+    run_step "merge.sh (fill missing artwork)" ./merge.sh "${merge_args[@]+"${merge_args[@]}"}" --only-missing
 
     if [ -d "$STAGING_DIR" ]; then
       new_dir_name="new_${VARIANT_SUFFIX:-all}"
@@ -815,7 +815,7 @@ if [ "$ACTION" = "auto" ]; then
 
 elif [ "$ACTION" = "merge" ]; then
   build_merge_args
-  run_step "merge.sh" ./merge.sh "${merge_args[@]}"
+  run_step "merge.sh" ./merge.sh "${merge_args[@]+"${merge_args[@]}"}"
 
 elif [ "$ACTION" = "update" ]; then
   # Standalone --update: pass update.sh's own exit code straight through
@@ -830,13 +830,13 @@ elif [ "$ACTION" = "update" ]; then
   exit "$update_status"
 elif [ "$ACTION" = "extract" ]; then
   build_extract_args
-  run_step "extract.sh" ./extract.sh "${extract_args[@]}"
+  run_step "extract.sh" ./extract.sh "${extract_args[@]+"${extract_args[@]}"}"
 elif [ "$ACTION" = "sort" ]; then
   build_sort_args
-  run_step "sort.sh" ./sort.sh "${sort_args[@]}"
+  run_step "sort.sh" ./sort.sh "${sort_args[@]+"${sort_args[@]}"}"
 elif [ "$ACTION" = "quick" ]; then
   build_quick_args
-  run_step "quick.sh" ./quick.sh "${quick_args[@]}"
+  run_step "quick.sh" ./quick.sh "${quick_args[@]+"${quick_args[@]}"}"
 else
   echo
   echo "No valid action resolved. Use -h or --help to see available options."
@@ -872,7 +872,7 @@ done
 
 # Delete 0‑byte log files and keep non‑empty ones for merging
 non_empty_logs=()
-for f in "${log_files[@]}"; do
+for f in "${log_files[@]+"${log_files[@]}"}"; do
     if [ ! -s "$f" ]; then
         rm -f -- "$f"
     else
@@ -889,7 +889,7 @@ done
 if [ "${RETROPLAY_ALL_SH:-}" != "1" ]; then
     : > "$retro_log"
 fi
-for f in "${non_empty_logs[@]}"; do
+for f in "${non_empty_logs[@]+"${non_empty_logs[@]}"}"; do
     {
         printf '===== %s =====\n' "$(basename "$f")"
         cat "$f"
@@ -901,7 +901,7 @@ done
 # (same explicit list as above - never touches all_cron.log or anything
 # else that happens to share this directory).
 if [ -s "$retro_log" ]; then
-  for f in "${log_files[@]}"; do
+  for f in "${log_files[@]+"${log_files[@]}"}"; do
     [ -e "$f" ] || continue
     rm -f -- "$f"
   done

@@ -54,7 +54,7 @@ BAR_WIDTH=50
 processed=0
 total_count=0
 FS_TYPE="PFS"
-FFS_LIMIT=25
+FFS_LIMIT=30
 PFS_LIMIT=107
 MAX_FILENAME_LEN=$PFS_LIMIT
 RUN_COMPLIANCE_CHECK=true
@@ -482,6 +482,7 @@ _start_job() {
 
     # Wait if job limit reached
     while [ "${#running_pids[@]}" -ge "$NUM_JOBS" ]; do
+        [ ${#running_pids[@]} -eq 0 ] && break
         for i in "${!running_pids[@]}"; do
             if ! kill -0 "${running_pids[$i]}" 2>/dev/null; then
                 # Job has already exited - reap it and check HOW it exited.
@@ -523,8 +524,8 @@ _start_job() {
                 fi
                 unset 'running_pids[$i]'
                 unset 'running_descs[$i]'
-                running_pids=( "${running_pids[@]}" )
-                running_descs=( "${running_descs[@]}" )
+                running_pids=( "${running_pids[@]+"${running_pids[@]}"}" )
+                running_descs=( "${running_descs[@]+"${running_descs[@]}"}" )
                 break
             fi
         done
@@ -534,6 +535,7 @@ _start_job() {
 
 wait_all_jobs() {
     local i status sig
+    if [ ${#running_pids[@]} -gt 0 ]; then
     for i in "${!running_pids[@]}"; do
         # See the matching comment in _start_job above re: macOS sometimes
         # already having reaped a finished job by the time we wait for it,
@@ -553,6 +555,7 @@ wait_all_jobs() {
             killed_job_descs+=("${running_descs[$i]:-unknown}")
         fi
     done
+    fi
     running_pids=()
     running_descs=()
 }
@@ -751,7 +754,7 @@ lang_sort() {
         local lang="${entry%%:*}"
         local code="${entry##*:}"
         local dir_matches=()
-        for search_dir in "${variant_dirs[@]}"; do
+        for search_dir in "${variant_dirs[@]+"${variant_dirs[@]}"}"; do
             if [ -d "$search_dir" ]; then
                 while IFS= read -r -d '' dir; do
                     local name
@@ -773,7 +776,7 @@ lang_sort() {
         local code="${entry##*:}"
         local lang_dir="$SRC/Languages/$lang"
         local dir_matches=()
-        for search_dir in "${variant_dirs[@]}"; do
+        for search_dir in "${variant_dirs[@]+"${variant_dirs[@]}"}"; do
             if [ -d "$search_dir" ]; then
                 while IFS= read -r -d '' dir; do
                     local name
@@ -828,11 +831,12 @@ fi
 merge_duplicate_summary_lines() {
     local -a names=() totals=()
     local line name count i found
-    for line in "${sort_summary[@]}"; do
+    for line in "${sort_summary[@]+"${sort_summary[@]}"}"; do
         name="${line%% | *}"
         count="${line##* | }"
         count="${count% found}"
         found=0
+        if [ ${#names[@]} -gt 0 ]; then
         for i in "${!names[@]}"; do
             if [ "${names[$i]}" = "$name" ]; then
                 totals[$i]=$((totals[$i] + count))
@@ -840,21 +844,24 @@ merge_duplicate_summary_lines() {
                 break
             fi
         done
+        fi
         if [ "$found" -eq 0 ]; then
             names+=("$name")
             totals+=("$count")
         fi
     done
     sort_summary=()
+    if [ ${#names[@]} -gt 0 ]; then
     for i in "${!names[@]}"; do
         sort_summary+=("${names[$i]} | ${totals[$i]} found")
     done
+    fi
 }
 merge_duplicate_summary_lines
 
 echo
 echo "======== SORTING SUMMARY ========"
-for summary_line in "${sort_summary[@]}"; do
+for summary_line in "${sort_summary[@]+"${sort_summary[@]}"}"; do
     echo "$summary_line"
 done
 echo "================================="
@@ -864,7 +871,7 @@ if [ "${#killed_job_descs[@]}" -gt 0 ]; then
     echo "WARNING: ${#killed_job_descs[@]} background sorting job(s) were killed mid-run"
     echo "(most likely out-of-memory on this device). Some files may not have been"
     echo "moved/sorted. Affected jobs:"
-    printf '  %s\n' "${killed_job_descs[@]}"
+    printf '  %s\n' "${killed_job_descs[@]+"${killed_job_descs[@]}"}"
     echo "Re-running sort.sh is safe - already-sorted files are left alone."
     echo
 fi
@@ -995,11 +1002,11 @@ if [ "$RUN_COMPLIANCE_CHECK" = true ]; then
         # Poll aggregate progress across all workers while they run.
         while :; do
             still_running=0
-            for pid in "${compliance_pids[@]}"; do
+            for pid in "${compliance_pids[@]+"${compliance_pids[@]}"}"; do
                 kill -0 "$pid" 2>/dev/null && still_running=1
             done
             sum=0
-            for pf in "${compliance_progress_files[@]}"; do
+            for pf in "${compliance_progress_files[@]+"${compliance_progress_files[@]}"}"; do
                 n=$(cat "$pf" 2>/dev/null) || n=0
                 [ -n "$n" ] && sum=$((sum + n))
             done
@@ -1009,7 +1016,7 @@ if [ "$RUN_COMPLIANCE_CHECK" = true ]; then
         done
         printf "\r%-60s\n" " "
 
-        for pid in "${compliance_pids[@]}"; do
+        for pid in "${compliance_pids[@]+"${compliance_pids[@]}"}"; do
             # `wait` must be `if`-guarded, not bare, under this script's
             # `set -e` - see _start_job's comment for why - and the 127
             # case (macOS job-table quirk) is treated as fine, not an
@@ -1022,7 +1029,7 @@ if [ "$RUN_COMPLIANCE_CHECK" = true ]; then
             fi
         done
 
-        for rf in "${compliance_result_files[@]}"; do
+        for rf in "${compliance_result_files[@]+"${compliance_result_files[@]}"}"; do
             [ -f "$rf" ] || continue
             read -r rs rfx ri < "$rf" || true
             total_scanned=$((total_scanned + ${rs:-0}))
@@ -1031,7 +1038,7 @@ if [ "$RUN_COMPLIANCE_CHECK" = true ]; then
         done
 
         : > "$AMIGA_ISSUES_LOG"
-        for f in "${compliance_issue_files[@]}"; do
+        for f in "${compliance_issue_files[@]+"${compliance_issue_files[@]}"}"; do
             [ -s "$f" ] && cat "$f" >> "$AMIGA_ISSUES_LOG"
         done
 

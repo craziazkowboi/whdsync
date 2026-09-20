@@ -1,5 +1,13 @@
 # whdsync
 
+> ⚠️ **Before copying anything onto a PFS Amiga partition:** set its filename size to 107, or PFS's default limit can corrupt the partition when it encounters the longer filenames some Retroplay archives extract to.
+>
+> ```
+> setfnsize <drive:> 107
+> ```
+>
+> `setfnsize` ships in the PFS package on [Aminet](https://aminet.net/). Run this once per partition before your first sync — it is **not** something these scripts can do for you from the Pi/macOS/Linux side, since it has to be set on the Amiga itself.
+
 A collection of Bash scripts to automate downloading, extracting, merging artwork into, sorting, and deploying Retroplay WHDLoad archives for Amiga setups. Designed to run unattended (e.g. via cron) on modest hardware such as a Raspberry Pi Zero 2W, as well as on macOS and Linux desktops.
 
 ## Notes
@@ -168,7 +176,7 @@ The final pipeline step. Runs three largely independent passes:
 Options:
 
 - `-d, --dest <path>` — Destination root (default `./retro`).
-- `--ffs` — FFS filename limits (25 characters — shorter).
+- `--ffs` — FFS filename limits (30 characters — shorter).
 - `--pfs` — PFS filename limits (107 characters — default, more permissive).
 - `--skipchk` — Skip the compliance check entirely.
 - `--no-detox` — Skip detox, even if installed.
