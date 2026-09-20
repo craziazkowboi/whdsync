@@ -4,6 +4,18 @@ set -o pipefail
 # Amiga Retroplay Quick Update & Process Script
 # This script downloads new archives, extracts them to a "new" directory,
 # merges artwork, and sorts the files - all in one go!
+#
+# WHY A SEPARATE "new" STAGING DIRECTORY: unlike start.sh --auto (which
+# extracts/merges/sorts your WHOLE collection every time), quick.sh only
+# processes files that update.sh finds are genuinely new since last run,
+# and keeps them isolated under ./new/ rather than mixing them straight
+# into your main ./retro/ collection. That way a bad run only affects the
+# small "new" batch, and you can review it before folding it into your
+# main collection yourself.
+#
+# THE FIVE STEPS (each calls one of the other scripts, except step 2 which
+# is just a directory creation): download -> stage -> extract -> merge
+# artwork -> sort. See the "Step N of 5" markers below for each one.
 
 version="1.0.2"
 
@@ -27,6 +39,9 @@ MODE_OPT=""      # holds --ecs / --aga / --rtg, if the user gave one (forwarded 
 SET_OPT=""       # holds --set NAME, if the user gave one (forwarded to merge.sh)
 ART_ORDER_OPT=""     # holds --art ORDER, if given (forwarded to merge.sh)
 DEMO_ART_OPT=""      # holds --demo-art ORDER, if given (forwarded to merge.sh)
+SKIP_UPDATE=0        # holds --skip-update - skip step 1 entirely and reuse
+                     # the existing update.log (used when a caller like
+                     # start.sh has already run update.sh itself this run)
 NO_DETOX=0           # holds --no-detox, if given (forwarded to sort.sh)
 
 # List whatever iGame_* artwork sets exist here, for the help text and error messages.
@@ -46,7 +61,7 @@ list_igame_sets() {
 print_usage() {
   echo -e "${BOLD}Amiga Retroplay Quick Processor v${version}${NC}"
   echo
-  echo -e "${BOLD}Usage:${NC} $0 [--ecs|--aga|--rtg|--ecs-lo|--aga-lo|--set NAME] [-d DEST | --dest DEST] [-h|--help]"
+  echo -e "${BOLD}Usage:${NC} $0 [--ecs|--aga|--rtg|--ecs-laced|--aga-laced|--set NAME] [-d DEST | --dest DEST] [-h|--help]"
   echo
   echo -e "${BOLD}What it does:${NC}"
   echo "  Runs update.sh -> extract.sh -> merge.sh -> sort.sh in sequence,"
@@ -57,8 +72,8 @@ print_usage() {
   echo "  --ecs            Shortcut for --set ECS when merging artwork."
   echo "  --aga            Shortcut for --set AGA when merging artwork."
   echo "  --rtg            Shortcut for --set RTG when merging artwork."
-  echo "  --ecs-lo         Shortcut for --set ECS_LO (matches iGame_ECS_Lo)."
-  echo "  --aga-lo         Shortcut for --set AGA_LO (matches iGame_AGA_Lo)."
+  echo "  --ecs-laced      Shortcut for --set ECS_LACED (matches iGame_ECS_Laced)."
+  echo "  --aga-laced      Shortcut for --set AGA_LACED (matches iGame_AGA_Laced)."
   echo "  --set NAME       Use the iGame_NAME artwork directory (case-insensitive)."
   echo "                   Any directory named iGame_<NAME> next to these scripts"
   echo "                   works, not just ECS/AGA/RTG."
@@ -86,10 +101,14 @@ print_usage() {
 
 # --- Parse CLI Options for artwork set / destination ---
 while [[ $# -gt 0 ]]; do
-  opt_lc="${1,,}"
+  opt_lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
   case "$opt_lc" in
-    --ecs|--aga|--rtg|--ecs-lo|--aga-lo)
+    --ecs|--aga|--rtg|--ecs-laced|--aga-laced)
       MODE_OPT="$opt_lc"
+      shift
+      ;;
+    --skip-update)
+      SKIP_UPDATE=1
       shift
       ;;
     --set)
@@ -156,15 +175,30 @@ for script in update.sh extract.sh merge.sh sort.sh; do
 done
 
 # Step 1: Run update.sh
-echo -e "${GREEN}Step 1: Downloading new archives...${NC}"
-echo -e "${BLUE}Running update.sh${NC}"
-echo
+echo -e "${GREEN}Step 1 of 5: Downloading new archives...${NC}"
 
-bash "$SCRIPT_DIR/update.sh"
-update_exit=$?
-if [ $update_exit -ne 0 ]; then
-  echo -e "${RED}Error: update.sh failed with exit code $update_exit${NC}"
-  exit 1
+if [ "$SKIP_UPDATE" -eq 1 ]; then
+  echo -e "${BLUE}Skipping update.sh - already checked by the caller this run.${NC}"
+else
+  echo -e "${BLUE}Running update.sh${NC}"
+  echo
+
+  bash "$SCRIPT_DIR/update.sh"
+  update_exit=$?
+  # update.sh signals its outcome via exit code: 3 = a wget error occurred
+  # (stop, don't trust anything below), 2 = nothing new (nothing to do,
+  # not an error), 0 = ran fine. Anything else is a genuine unexpected
+  # failure.
+  if [ "$update_exit" -eq 3 ]; then
+    echo -e "${RED}Error: update.sh reported a wget error - stopping.${NC}"
+    exit 1
+  elif [ "$update_exit" -eq 2 ]; then
+    echo -e "${YELLOW}No new archives available. Nothing to process.${NC}"
+    exit 0
+  elif [ "$update_exit" -ne 0 ]; then
+    echo -e "${RED}Error: update.sh failed with exit code $update_exit${NC}"
+    exit 1
+  fi
 fi
 
 # Check if update.log exists and has new files
@@ -184,13 +218,13 @@ echo -e "${GREEN}Found $new_file_count new files to process.${NC}"
 echo
 
 # Step 2: Create "new" directory
-echo -e "${GREEN}Step 2: Creating 'new' directory...${NC}"
+echo -e "${GREEN}Step 2 of 5: Creating 'new' directory...${NC}"
 mkdir -p "$NEWDIR"
 echo -e "Created: ${NEWDIR}"
 echo
 
 # Step 3: Extract only new archives to "new" directory
-echo -e "${GREEN}Step 3: Extracting new archives to 'new' directory...${NC}"
+echo -e "${GREEN}Step 3 of 5: Extracting new archives to 'new' directory...${NC}"
 echo
 
 temp_extract_dir="$SCRIPT_DIR/.temp_new_archives"
@@ -222,7 +256,7 @@ fi
 
 echo
 # Step 4: Merge artwork for files in "new" directory
-echo -e "${GREEN}Step 4: Merging artwork for new files...${NC}"
+echo -e "${GREEN}Step 4 of 5: Merging artwork for new files...${NC}"
 echo
 
 have_igame_dir=0
@@ -263,7 +297,7 @@ fi
 
 echo
 # Step 5: Sort files in "new" directory
-echo -e "${GREEN}Step 5: Sorting files in 'new' directory...${NC}"
+echo -e "${GREEN}Step 5 of 5: Sorting files in 'new' directory...${NC}"
 echo
 
 # Default to the staging "new" directory unless the user gave a custom -d.
@@ -304,5 +338,14 @@ echo -e "${YELLOW}Next steps:${NC}"
 echo -e " Review the files in: ${NEWDIR}"
 echo -e " When ready, move them to your main collection"
 echo
+
+# Clean up any 0-byte logs from this run. update.log is handled separately
+# since it's a useful standalone record (what was downloaded), not an
+# error log - only deleted if genuinely empty, never touched otherwise.
+[ -e "$SCRIPT_DIR/update.log" ] && [ ! -s "$SCRIPT_DIR/update.log" ] && rm -f -- "$SCRIPT_DIR/update.log"
+for _logf in extract_errors.log merge_errors.log sort.log amiga_filename_issues.log; do
+    [ -e "$SCRIPT_DIR/$_logf" ] && [ ! -s "$SCRIPT_DIR/$_logf" ] && rm -f -- "$SCRIPT_DIR/$_logf"
+done
+unset _logf
 
 exit 0

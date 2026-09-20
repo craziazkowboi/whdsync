@@ -3,6 +3,20 @@
 # Amiga Retroplay Archive Minimal CLI Dispatcher
 # Copyright (c) 2025 Craziazkowboi
 # License: Creative Commons BY‑NC 4.0 International
+#
+# WHAT THIS SCRIPT DOES:
+#   The main entry point for the whole toolkit - a single command line (or
+#   interactive menu, if run with no options) that runs whichever of
+#   update.sh / extract.sh / merge.sh / sort.sh / quick.sh you need,
+#   forwarding the right options to each. --auto runs all four of the
+#   first scripts in sequence (a full collection refresh); the other
+#   single-word actions (--update/--extract/--merge/--sort/--quick) run
+#   just one step, for when you only need to redo part of the pipeline.
+#
+#   Every option this script accepts is really just collected here and
+#   then handed off to the relevant sub-script - see build_merge_args,
+#   build_sort_args, build_extract_args and build_quick_args further down
+#   for exactly which options go where.
 
 script_start_time=$(date +%s)
 
@@ -18,7 +32,7 @@ ulimit -n 16384
 # DO NOT set -e here - we need to parse options first
 set -uo pipefail
 
-version="1.2.3 macOS 10.15.7 Compatible (no color)"
+version="1.2.4 macOS 10.15.7 Compatible (no color)"
 
 ACTION=""
 MERGE_OPT=""
@@ -30,6 +44,17 @@ DEMO_ART_OPT=""
 MENU_DEST_OVERRIDE=""
 DEBUG_MODE=0
 NO_DETOX=0
+SKIPCHK_OPT=0
+SKIP_VARIANT_SORT_OPT=0
+SKIP_UPDATE=0
+FORCE_REBUILD=0   # set only by menu option 7: rebuild unconditionally,
+                  # without even checking update.log's content first (the
+                  # whole point of that option is "just rebuild from
+                  # whatever's on disk now" - unlike --skip-update on its
+                  # own, which still checks update.log so all.sh's
+                  # variant-chaining can tell whether anything was new).
+CLEAN_OPT=0
+NOTHING_NEW_FALLBACK=0
 
 # Basic environment / colors (no color for now)
 OS_TYPE="$(uname -s | tr '[:upper:]' '[:lower:]')"
@@ -231,7 +256,8 @@ error_handler() {
 
 # Option parsing (Bash 3.2/macOS compatible)
 while [ $# -gt 0 ]; do
-  case "$1" in
+  opt_lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$opt_lc" in
     -h|--help)
       echo
       echo "Amiga Retroplay Archive Minimal CLI Dispatcher"
@@ -239,7 +265,7 @@ while [ $# -gt 0 ]; do
       echo
       echo "Usage: $(basename "$0") [options]"
       echo
-      echo "Options:"
+      echo "Options (case-insensitive - --AGA and --aga both work):"
       echo "  -h, --help            Show this help and exit."
       echo "  --auto                Run full automation: update, extract, merge, sort."
       echo "  --update              Only update archives."
@@ -250,8 +276,8 @@ while [ $# -gt 0 ]; do
       echo "  --ecs                 Run merge.sh with --ecs."
       echo "  --aga                 Run merge.sh with --aga."
       echo "  --rtg                 Run merge.sh with --rtg."
-      echo "  --ecs-lo              Run merge.sh with --ecs-lo (matches iGame_ECS_Lo)."
-      echo "  --aga-lo              Run merge.sh with --aga-lo (matches iGame_AGA_Lo)."
+      echo "  --ecs-laced           Run merge.sh with --ecs-laced (matches iGame_ECS_Laced)."
+      echo "  --aga-laced           Run merge.sh with --aga-laced (matches iGame_AGA_Laced)."
       echo "  --set [name]          Run merge.sh with --set NAME (any iGame_NAME directory)."
       echo "  --ffs                 Run sort.sh with --ffs (FFS filename limits)."
       echo "  --pfs                 Run sort.sh with --pfs (PFS filename limits, default)."
@@ -260,6 +286,12 @@ while [ $# -gt 0 ]; do
       echo "  --demo-art [order]    Set merge priority order for demos (e.g., Titles,Screens,Covers)."
       echo "  --no-detox            Skip detox entirely - the startup dependency check and"
       echo "                        the pre-clean step in sort.sh."
+      echo "  --skipchk             Run sort.sh with --skipchk (skip the Amiga filesystem"
+      echo "                        compliance check entirely)."
+      echo "  --skip-variant-sort   Run sort.sh with --skip-variant-sort (skip moving games"
+      echo "                        into CD32/AGA/NTSC/MT32/CDTV and language subfolders -"
+      echo "                        for when that reorganization was already done earlier"
+      echo "                        on a shared base tree)."
       echo "  --debug               Enable debug output (also passed to extract.sh/merge.sh)."
       echo "  --exit                Exit immediately."
       echo
@@ -301,12 +333,12 @@ while [ $# -gt 0 ]; do
       MERGE_OPT="--rtg"
       shift
       ;;
-    --ecs-lo)
-      MERGE_OPT="--ecs-lo"
+    --ecs-laced)
+      MERGE_OPT="--ecs-laced"
       shift
       ;;
-    --aga-lo)
-      MERGE_OPT="--aga-lo"
+    --aga-laced)
+      MERGE_OPT="--aga-laced"
       shift
       ;;
     --set)
@@ -337,6 +369,14 @@ while [ $# -gt 0 ]; do
       NO_DETOX=1
       shift
       ;;
+    --skipchk)
+      SKIPCHK_OPT=1
+      shift
+      ;;
+    --skip-variant-sort)
+      SKIP_VARIANT_SORT_OPT=1
+      shift
+      ;;
     --debug)
       DEBUG_MODE=1
       shift
@@ -344,12 +384,30 @@ while [ $# -gt 0 ]; do
     --exit)
       exit 0
       ;;
+    --skip-update)
+      SKIP_UPDATE=1
+      shift
+      ;;
+    --clean)
+      CLEAN_OPT=1
+      shift
+      ;;
+    --nothing-new-fallback)
+      # Internal only (not in --help): used when --auto's own update.sh call
+      # found nothing new. Shows the same interactive menu, but exiting it
+      # without a real choice (timeout or blank/0) propagates exit code 2
+      # instead of 0, so a caller further up (e.g. all.sh) can still tell
+      # "nothing new" apart from "did something" even after this handoff.
+      NOTHING_NEW_FALLBACK=1
+      shift
+      ;;
     *)
       echo "Unknown option: $1"
       exit 1
       ;;
   esac
 done
+unset opt_lc
 
 # If no action was specified via CLI, show interactive menu
 if [ -z "$ACTION" ]; then
@@ -364,11 +422,26 @@ if [ -z "$ACTION" ]; then
   echo "  4) Merge artwork"
   echo "  5) Sort languages"
   echo "  6) Quick (process new files)"
+  echo "  7) Full rebuild, skip update (update already ran, or use option 1 instead)"
   echo "  0) Exit"
   echo
 
-  printf "Enter choice [0-6]: "
-  read -r menu_choice
+  printf "Enter choice [0-7]: "
+  # 3-minute timeout: if this menu is here because --auto's own update.sh
+  # found nothing new (NOTHING_NEW_FALLBACK), don't wait forever for a
+  # human who isn't there - and propagate that "nothing happened" outcome
+  # as exit code 2 (matching update.sh's own convention) rather than a
+  # plain 0, so a caller like all.sh can still tell this apart from a run
+  # that actually did something.
+  if ! read -t 180 -r menu_choice; then
+    echo
+    echo "No input received within 3 minutes."
+    if [ "$NOTHING_NEW_FALLBACK" -eq 1 ]; then
+      exit 2
+    fi
+    echo "Exiting."
+    exit 0
+  fi
 
   case "$menu_choice" in
     1)
@@ -389,8 +462,16 @@ if [ -z "$ACTION" ]; then
     6)
       ACTION="quick"
       ;;
+    7)
+      ACTION="auto"
+      SKIP_UPDATE=1
+      FORCE_REBUILD=1
+      ;;
     0|"")
       echo "Exiting."
+      if [ "$NOTHING_NEW_FALLBACK" -eq 1 ]; then
+        exit 2
+      fi
       exit 0
       ;;
     *)
@@ -502,12 +583,15 @@ build_sort_args() {
   [ -n "$SORT_OPT" ] && sort_args+=("$SORT_OPT")
   [ -n "$DEST_OPT" ] && sort_args+=(--dest "$DEST_OPT")
   [ "$NO_DETOX" -eq 1 ] && sort_args+=(--no-detox)
+  [ "$SKIPCHK_OPT" -eq 1 ] && sort_args+=(--skipchk)
+  [ "$SKIP_VARIANT_SORT_OPT" -eq 1 ] && sort_args+=(--skip-variant-sort)
   return 0
 }
 
 # Build the extract.sh argument list.
 build_extract_args() {
   extract_args=()
+  [ -n "$DEST_OPT" ] && extract_args+=(-d "$DEST_OPT")
   [ "$DEBUG_MODE" -eq 1 ] && extract_args+=(--debug)
   return 0
 }
@@ -525,32 +609,234 @@ build_quick_args() {
 }
 
 # Main dispatcher logic
+#
+# Announce progress as "Step N of TOTAL: scriptname" before running each
+# sub-script, so it's clear how far through a multi-script run (like
+# --auto's update -> extract -> merge -> sort) things are. TOTAL_STEPS
+# depends on which ACTION was chosen - --auto runs 4 sub-scripts, every
+# other single action runs exactly 1.
+case "$ACTION" in
+  auto) TOTAL_STEPS=4 ;;
+  *)    TOTAL_STEPS=1 ;;
+esac
+STEP_NUM=0
+
+run_step() {
+  local label="$1"
+  shift
+  STEP_NUM=$((STEP_NUM + 1))
+  echo
+  echo "===== Step $STEP_NUM of $TOTAL_STEPS: $label ====="
+  run_sub "$@"
+}
+
 if [ "$ACTION" = "auto" ]; then
-  build_extract_args
-  run_sub ./update.sh
-  run_sub ./extract.sh "${extract_args[@]}"
+  # Derive the per-variant output directory (retro_aga/retro_ecs/retro_rtg/
+  # etc.) from whichever artwork option was chosen, unless the user gave an
+  # explicit --dest. This is what makes each variant build directly into
+  # its own named directory instead of always writing to a plain "retro"
+  # that something else has to rename afterward.
+  case "$MERGE_OPT" in
+    --aga)    VARIANT_SUFFIX="aga" ;;
+    --ecs)    VARIANT_SUFFIX="ecs" ;;
+    --rtg)    VARIANT_SUFFIX="rtg" ;;
+    --aga-laced) VARIANT_SUFFIX="aga_laced" ;;
+    --ecs-laced) VARIANT_SUFFIX="ecs_laced" ;;
+    *)
+      if [ -n "$SET_OPT" ]; then
+        VARIANT_SUFFIX="$(printf '%s' "$SET_OPT" | tr '[:upper:]' '[:lower:]')"
+      else
+        VARIANT_SUFFIX=""
+      fi
+      ;;
+  esac
+  if [ -z "$DEST_OPT" ]; then
+    if [ -n "$VARIANT_SUFFIX" ]; then
+      DEST_OPT="retro_$VARIANT_SUFFIX"
+    else
+      DEST_OPT="retro"
+    fi
+  fi
 
-  build_merge_args
-  run_sub ./merge.sh "${merge_args[@]}"
+  # --clean removes any existing output for this variant and forces a full
+  # rebuild, exactly like every --auto run used to behave. Without --clean,
+  # an existing output directory is updated incrementally (new downloads
+  # only, plus a gap-fill artwork pass) instead of being fully rebuilt.
+  if [ "$CLEAN_OPT" -eq 1 ] && [ -e "$DEST_OPT" ]; then
+    echo "Removing existing '$DEST_OPT' (--clean given)..."
+    rm -rf "$DEST_OPT"
+  fi
+  INCREMENTAL=0
+  [ "$CLEAN_OPT" -ne 1 ] && [ -d "$DEST_OPT" ] && INCREMENTAL=1
 
-  build_sort_args
-  run_sub ./sort.sh "${sort_args[@]}"
+  if [ "$INCREMENTAL" -eq 1 ]; then
+    TOTAL_STEPS=5
+  else
+    TOTAL_STEPS=3
+  fi
+  [ "$SKIP_UPDATE" -eq 0 ] && TOTAL_STEPS=$((TOTAL_STEPS + 1))
+
+  # update.sh signals its outcome via exit code (see update.sh itself for
+  # the full rationale): 0 = new files found, continue as normal; 2 =
+  # nothing new anywhere, nothing to process; 3 = a wget error occurred and
+  # "0 new" can't be trusted. Capturing the status this way (as the
+  # condition of an `if`) is what keeps `set -e` from treating a non-zero
+  # exit as a crash before we get a chance to look at which case it is.
+  # --skip-update (used when a caller like all.sh has already run
+  # update.sh itself this pass) reads the existing update.log instead of
+  # running update.sh again.
+  if [ "$FORCE_REBUILD" -eq 1 ]; then
+    update_status=0
+  elif [ "$SKIP_UPDATE" -eq 1 ]; then
+    if [ ! -s "$SCRIPT_DIR/update.log" ] || [ "$(grep -c '^' "$SCRIPT_DIR/update.log" 2>/dev/null || echo 0)" -eq 0 ]; then
+      update_status=2
+    else
+      update_status=0
+    fi
+  elif run_step "update.sh" ./update.sh; then
+    update_status=0
+  else
+    update_status=$?
+  fi
+
+  if [ "$update_status" -eq 3 ]; then
+    echo
+    echo "Stopping: update.sh reported a wget error (see above). Not continuing" >&2
+    echo "with extract/merge/sort." >&2
+    exit 1
+  elif [ "$update_status" -eq 2 ]; then
+    echo
+    echo "Nothing new to process - handing off to start.sh's menu instead of a full rebuild."
+    # Carry the current variant selection through the re-exec, so the
+    # fallback menu (and anything chosen from it, e.g. "full rebuild") acts
+    # on the SAME variant this run was building - exec starts a genuinely
+    # fresh process, so without this, --aga/--set/--dest/etc. would all be
+    # silently lost and the menu would fall back to whatever the defaults
+    # happen to be.
+    fallback_args=(--nothing-new-fallback)
+    [ -n "$MERGE_OPT" ] && fallback_args+=("$MERGE_OPT")
+    [ -n "$SET_OPT" ] && fallback_args+=(--set "$SET_OPT")
+    [ -n "$DEST_OPT" ] && fallback_args+=(--dest "$DEST_OPT")
+    [ -n "$ART_ORDER_OPT" ] && fallback_args+=(--art "$ART_ORDER_OPT")
+    [ -n "$DEMO_ART_OPT" ] && fallback_args+=(--demo-art "$DEMO_ART_OPT")
+    [ "$NO_DETOX" -eq 1 ] && fallback_args+=(--no-detox)
+    [ "$DEBUG_MODE" -eq 1 ] && fallback_args+=(--debug)
+    exec ./start.sh "${fallback_args[@]}"
+  elif [ "$update_status" -ne 0 ]; then
+    echo
+    echo "Stopping: update.sh failed unexpectedly (exit $update_status)." >&2
+    exit "$update_status"
+  fi
+
+  if [ "$INCREMENTAL" -eq 0 ]; then
+    # ----- Full / clean rebuild: exactly the original --auto behaviour -----
+    build_extract_args
+    run_step "extract.sh" ./extract.sh "${extract_args[@]}"
+
+    build_merge_args
+    run_step "merge.sh" ./merge.sh "${merge_args[@]}"
+
+    build_sort_args
+    run_step "sort.sh" ./sort.sh "${sort_args[@]}"
+  else
+    # ----- Incremental update into an existing $DEST_OPT -----
+    # Stage just the newly downloaded files (the same technique quick.sh
+    # uses: copy exactly the paths named in update.log, preserving their
+    # relative layout, into a SOURCE-only temp dir), extract THAT into a
+    # SEPARATE output staging dir, then merge/sort just that small batch,
+    # merge its result into the existing output, then a light
+    # "--only-missing" artwork pass over the whole thing catches anything
+    # pre-existing that's still missing artwork (e.g. from an earlier
+    # interrupted run) without re-touching everything that's already merged.
+    #
+    # The source and output staging dirs MUST be different directories:
+    # extract.sh scans its current directory for archives and writes
+    # results to wherever -d points - if those were the same directory,
+    # the original .lha files would end up sitting alongside (and get
+    # merged/duplicated together with) the extracted output.
+    TEMP_SRC_DIR="$SCRIPT_DIR/.staging_src_$$"
+    STAGING_DIR="$SCRIPT_DIR/.staging_out_$$"
+    rm -rf "$TEMP_SRC_DIR" "$STAGING_DIR"
+    mkdir -p "$TEMP_SRC_DIR" "$STAGING_DIR"
+
+    STEP_NUM=$((STEP_NUM + 1))
+    echo
+    echo "===== Step $STEP_NUM of $TOTAL_STEPS: staging new downloads ====="
+    staged_any=0
+    if [ -f "$SCRIPT_DIR/update.log" ]; then
+      while IFS= read -r logline; do
+        filepath=$(printf '%s\n' "$logline" | sed 's/^[0-9-]* [0-9:]* //')
+        [ -f "$filepath" ] || continue
+        relpath="${filepath#./}"
+        destpath="$TEMP_SRC_DIR/$relpath"
+        mkdir -p "$(dirname "$destpath")"
+        cp -f "$filepath" "$destpath" 2>/dev/null && staged_any=1
+      done < "$SCRIPT_DIR/update.log"
+    fi
+
+    if [ "$staged_any" -eq 0 ]; then
+      echo "Nothing to stage - update.log had no readable entries."
+      rm -rf "$TEMP_SRC_DIR" "$STAGING_DIR"
+    else
+      _real_dest="$DEST_OPT"
+      DEST_OPT="$STAGING_DIR"
+
+      build_extract_args
+      STEP_NUM=$((STEP_NUM + 1))
+      echo
+      echo "===== Step $STEP_NUM of $TOTAL_STEPS: extract.sh (new files) ====="
+      (cd "$TEMP_SRC_DIR" && bash "$SCRIPT_DIR/extract.sh" "${extract_args[@]}")
+      rm -rf "$TEMP_SRC_DIR"
+
+      build_merge_args
+      run_step "merge.sh (new files)" ./merge.sh "${merge_args[@]}"
+
+      build_sort_args
+      run_step "sort.sh (new files)" ./sort.sh "${sort_args[@]}"
+
+      DEST_OPT="$_real_dest"
+
+      echo
+      echo "Merging newly processed files into $DEST_OPT..."
+      mkdir -p "$DEST_OPT"
+      cp -a "$STAGING_DIR/." "$DEST_OPT/"
+    fi
+
+    build_merge_args
+    run_step "merge.sh (fill missing artwork)" ./merge.sh "${merge_args[@]}" --only-missing
+
+    if [ -d "$STAGING_DIR" ]; then
+      new_dir_name="new_${VARIANT_SUFFIX:-all}"
+      rm -rf "$new_dir_name"
+      mv "$STAGING_DIR" "$new_dir_name"
+      echo "New-files duplicate: $new_dir_name"
+    fi
+  fi
 
 elif [ "$ACTION" = "merge" ]; then
   build_merge_args
-  run_sub ./merge.sh "${merge_args[@]}"
+  run_step "merge.sh" ./merge.sh "${merge_args[@]}"
 
 elif [ "$ACTION" = "update" ]; then
-  run_sub ./update.sh
+  # Standalone --update: pass update.sh's own exit code straight through
+  # rather than letting set -e's crash handler fire for its non-zero-but-
+  # not-actually-broken outcomes (2 = nothing new, 3 = wget error) - its
+  # own output already explains which case it was.
+  if run_step "update.sh" ./update.sh; then
+    update_status=0
+  else
+    update_status=$?
+  fi
+  exit "$update_status"
 elif [ "$ACTION" = "extract" ]; then
   build_extract_args
-  run_sub ./extract.sh "${extract_args[@]}"
+  run_step "extract.sh" ./extract.sh "${extract_args[@]}"
 elif [ "$ACTION" = "sort" ]; then
   build_sort_args
-  run_sub ./sort.sh "${sort_args[@]}"
+  run_step "sort.sh" ./sort.sh "${sort_args[@]}"
 elif [ "$ACTION" = "quick" ]; then
   build_quick_args
-  run_sub ./quick.sh "${quick_args[@]}"
+  run_step "quick.sh" ./quick.sh "${quick_args[@]}"
 else
   echo
   echo "No valid action resolved. Use -h or --help to see available options."
@@ -564,11 +850,25 @@ fi
 # internal `cd`s don't affect us) - this is just a defensive re-assertion.
 cd "$SCRIPT_DIR" || true
 
-# Find candidate log files (adjust pattern if needed)
+# update.log is a useful standalone record of what was downloaded each run
+# (not an error log), so it's handled separately from the error-log
+# aggregation below: deleted only if genuinely empty, never merged away.
+if [ -e "update.log" ] && [ ! -s "update.log" ]; then
+    rm -f -- "update.log"
+fi
+
+# Candidate log files: an EXPLICIT list of the specific files the
+# sub-scripts are known to produce, rather than a blanket "*.log" glob.
+# A glob would also catch things that just happen to live in this same
+# directory and end in .log but aren't ours to touch - most notably
+# all_cron.log, which install_cron.sh sets up to accumulate cron output
+# right here via `>>`; sweeping that into retroerror.log and deleting it
+# would silently break the cron log the moment it existed.
+retro_log="retroerror.log"
 log_files=()
-while IFS= read -r -d '' f; do
-    log_files+=("$f")
-done < <(find . -maxdepth 1 -type f -name "*.log" -print0 2>/dev/null)
+for f in extract_errors.log merge_errors.log sort.log amiga_filename_issues.log; do
+    [ -f "$f" ] && log_files+=("./$f")
+done
 
 # Delete 0‑byte log files and keep non‑empty ones for merging
 non_empty_logs=()
@@ -580,9 +880,15 @@ for f in "${log_files[@]}"; do
     fi
 done
 
-# Merge remaining logs into retroerror.log with section headers
-retro_log="retroerror.log"
-: > "$retro_log"
+# Merge remaining logs into retroerror.log with section headers. Under
+# all.sh (RETROPLAY_ALL_SH=1), don't truncate first - all.sh resets this
+# file once at the very start of its own run, and each variant (aga/ecs/
+# rtg) then appends its own section here in turn, so the whole all.sh run
+# ends with ONE combined log covering all three variants, rather than
+# each variant's start.sh wiping out what the previous variant just wrote.
+if [ "${RETROPLAY_ALL_SH:-}" != "1" ]; then
+    : > "$retro_log"
+fi
 for f in "${non_empty_logs[@]}"; do
     {
         printf '===== %s =====\n' "$(basename "$f")"
@@ -591,33 +897,57 @@ for f in "${non_empty_logs[@]}"; do
     } >> "$retro_log"
 done
 
-# Delete all log files except the merged $retro_log in the start directory
+# Delete the individual logs now that they're consolidated into $retro_log
+# (same explicit list as above - never touches all_cron.log or anything
+# else that happens to share this directory).
 if [ -s "$retro_log" ]; then
-  for f in ./*.log; do
-    [ "$f" = "./$retro_log" ] && continue
+  for f in "${log_files[@]}"; do
     [ -e "$f" ] || continue
     rm -f -- "$f"
   done
 fi
 
-# Ask user whether to view or delete the error log (default: view)
+# retroerror.log itself: if this run genuinely had nothing to report, don't
+# leave a 0-byte file sitting around.
+if [ -e "$retro_log" ] && [ ! -s "$retro_log" ]; then
+    rm -f -- "$retro_log"
+fi
+
+# Ask user whether to view or delete the error log (default: view) - but
+# only if there's actually a terminal to ask on, AND we're not running as
+# part of an all.sh pass. Under cron (or any other non-interactive run),
+# stdin is closed/redirected, so `read` would return immediately with an
+# empty answer, defaulting to "view" and trying to launch `less` with no
+# controlling terminal - which fails and, under set -e, would crash the
+# whole script right at the finish line even though everything before
+# this point genuinely succeeded. Under all.sh specifically, even a
+# genuinely attached terminal is skipped deliberately: prompting here
+# would stall the pipeline after variant 1 waiting on input before
+# variant 2 (ecs.sh) even starts, which defeats the entire point of
+# all.sh being able to run straight through unattended.
 if [ -s "$retro_log" ]; then
     echo
     echo "Error log has been written to: $retro_log"
-    printf "View error log, delete it, or skip? [V/d/s]: "
-    read -r log_choice
-    case "${log_choice:-V}" in
-        [Vv])
-            ${PAGER:-less} "$retro_log"
-            ;;
-        [Dd])
-            rm -f -- "$retro_log"
-            echo "Error log deleted."
-            ;;
-        *)
-            echo "Leaving error log in place."
-            ;;
-    esac
+    if [ "${RETROPLAY_ALL_SH:-}" = "1" ]; then
+        echo "(running as part of all.sh - leaving it in place for review once all variants finish; view it with: less $retro_log)"
+    elif [ -t 0 ]; then
+        printf "View error log, delete it, or skip? [V/d/s]: "
+        read -r log_choice
+        case "${log_choice:-V}" in
+            [Vv])
+                ${PAGER:-less} "$retro_log"
+                ;;
+            [Dd])
+                rm -f -- "$retro_log"
+                echo "Error log deleted."
+                ;;
+            *)
+                echo "Leaving error log in place."
+                ;;
+        esac
+    else
+        echo "(no terminal attached - leaving it in place; view it with: less $retro_log)"
+    fi
 fi
 
 exit 0

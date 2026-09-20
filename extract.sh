@@ -2,6 +2,25 @@
 
 # Amiga Retroplay Archive Extractor (OS-adaptive, encoding-robust)
 # Version: 1.4.0-bash32-compatible
+#
+# WHAT THIS SCRIPT DOES:
+#   Finds every .lha/.lzx/.zip archive under the current directory and
+#   extracts each one into the same relative path under DEST (default:
+#   ./retro), trying several tools and encodings per archive until one
+#   works (Amiga-era filenames are often not valid UTF-8). This is the
+#   "extract" step of the pipeline, run after update.sh downloads new
+#   archives and before merge.sh/sort.sh process the extracted files.
+#
+# WHY GROUPED BY DIRECTORY, IN PARALLEL: archives are grouped by their
+# containing directory and one background job handles each directory's
+# whole batch, up to a memory-aware parallelism limit (see the CORES/mem_kb
+# section below) - decompression is memory-hungry, and running too many at
+# once on a small device (e.g. a Pi Zero 2W's 512MB) risks the OS silently
+# killing a job outright. Each archive extraction also runs under a time
+# limit, so one hung/corrupt archive can't block its whole directory's job
+# (and everything queued behind it) forever. See the "JOB KILLED"/TIMEOUT
+# handling further down for how both failure modes are detected and
+# reported, since neither shows up in a plain `wait`.
 
 export LANG="${LANG:-en_AU.UTF-8}"
 export LC_ALL="${LC_ALL:-en_AU.UTF-8}"
@@ -131,13 +150,14 @@ UNATTENDED=0
 DEBUG=0
 
 while [ $# -gt 0 ]; do
-    case "$1" in
+    opt_lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    case "$opt_lc" in
     -d|--dest) DESTOVERRIDE="$2"; CUSTOM=1; shift 2 ;;
     -u|--unattended) UNATTENDED=1; shift ;;
     --debug) DEBUG=1; shift ;;
     -h|--help)
         echo "Usage: $(basename $0) [options]"
-        echo "Options:"
+        echo "Options (case-insensitive):"
         echo " -d, --dest Set custom destination directory"
         echo " -u, --unattended Run without prompts"
         echo " --debug Enable debug output"
@@ -150,6 +170,7 @@ while [ $# -gt 0 ]; do
     *) echo -e "${RED}Unknown option: $1${NC}"; exit 1 ;;
     esac
 done
+unset opt_lc
 
 DEST="${DESTOVERRIDE:-$DEFAULTDEST}"
 
@@ -278,12 +299,28 @@ fi
 
 SRCROOT="$(pwd)"
 
+# Scope the search to only the real download roots (HD_Loaders/JST/WHDLoad
+# - matching update.sh's own directory list). Without this, a blanket scan
+# of "." also picks up whatever sits alongside them in the same script
+# directory - notably the iGame_* artwork directories, some of which are
+# themselves distributed as compressed .lha/.zip archives. Scanning those
+# too meant artwork-pack archives could get mistaken for WHDLoad games and
+# extracted straight into the output (e.g. an "Archive_image_packs" or
+# "IGame_Covers_ECS_LoRes" folder showing up in retro_*, which they have no
+# business being in). If none of the known roots exist (e.g. a caller uses
+# a different top-level layout), fall back to scanning "." as before.
+find_roots=()
+for _root in HD_Loaders JST WHDLoad; do
+    [ -d "$_root" ] && find_roots+=("$_root")
+done
+[ "${#find_roots[@]}" -eq 0 ] && find_roots=(".")
+
 # Bash-3.2-safe replacement for `mapfile`
 archives=()
 while IFS= read -r _line; do
     [ -n "$_line" ] && archives+=("$_line")
-done < <(find . -maxdepth 4 -type f \( -iname "*.lha" -o -iname "*.lzx" -o -iname "*.zip" \))
-unset _line
+done < <(find "${find_roots[@]}" -maxdepth 4 -type f \( -iname "*.lha" -o -iname "*.lzx" -o -iname "*.zip" \))
+unset _line _root
 
 if [ "${#archives[@]}" -eq 0 ]; then
     echo -e "${RED}No archives found!${NC}"
@@ -291,30 +328,56 @@ if [ "${#archives[@]}" -eq 0 ]; then
 fi
 
 # Bash-3.2-safe replacement for the associative-array grouping: build a
-# tab-separated "dir<TAB>archive" map, sort it by directory, then derive the
-# unique directory list from that. Per-directory archive lookups later use
-# awk against this same sorted file instead of an associative array.
+# tab-separated "dir<TAB>archive" map keyed by RESOLVED directory, then
+# derive the unique directory list from that. Per-directory archive lookups
+# later use awk against this same file instead of an associative array.
+#
+# Performance note: dirname+readlink used to run once PER ARCHIVE. With
+# thousands of archives sharing a much smaller number of directories (e.g.
+# 5521 archives in 114 directories on a real run), that's thousands of
+# redundant subprocess forks for a value that's identical across every
+# archive in the same folder. Instead: extract the raw directory cheaply via
+# bash parameter expansion (no subprocess) for every archive, then resolve
+# each UNIQUE raw directory with _readlinkf exactly once, then join the two
+# back together - cutting readlink calls from "one per archive" to "one per
+# directory".
 tmpdir="$(mktemp -d "${SRCROOT}/extract_tmp.XXXXXX")" || {
     echo -e "${RED}Failed to create temp directory for logs${NC}"
     exit 1
 }
-DIR_MAP="$tmpdir/dir_archive_map.tsv"
-: > "$DIR_MAP"
+
+RAW_MAP="$tmpdir/raw_dir_archive_map.tsv"
+: > "$RAW_MAP"
 for archive in "${archives[@]}"; do
-    srcdir="$(_readlinkf "$(dirname "$archive")")"
-    printf '%s\t%s\n' "$srcdir" "$archive" >> "$DIR_MAP"
+    rawdir="${archive%/*}"
+    [ "$rawdir" = "$archive" ] && rawdir="."
+    printf '%s\t%s\n' "$rawdir" "$archive" >> "$RAW_MAP"
 done
-sort -t "$(printf '\t')" -k1,1 "$DIR_MAP" -o "$DIR_MAP"
+sort -t "$(printf '\t')" -k1,1 "$RAW_MAP" -o "$RAW_MAP"
+
+uniq_raw_dirs=()
+_last_raw=""
+while IFS=$'\t' read -r _rd _rest; do
+    if [ "$_rd" != "$_last_raw" ]; then
+        uniq_raw_dirs+=("$_rd")
+        _last_raw="$_rd"
+    fi
+done < "$RAW_MAP"
+unset _rd _rest _last_raw
+
+RESOLVE_MAP="$tmpdir/resolve_map.tsv"
+: > "$RESOLVE_MAP"
+for rd in "${uniq_raw_dirs[@]}"; do
+    printf '%s\t%s\n' "$rd" "$(_readlinkf "$rd")" >> "$RESOLVE_MAP"
+done
+
+DIR_MAP="$tmpdir/dir_archive_map.tsv"
+join -t "$(printf '\t')" -1 1 -2 1 -o 2.2,1.2 "$RAW_MAP" "$RESOLVE_MAP" > "$DIR_MAP"
 
 dirs=()
-_last_dir=""
-while IFS=$'\t' read -r _d _rest; do
-    if [ "$_d" != "$_last_dir" ]; then
-        dirs+=("$_d")
-        _last_dir="$_d"
-    fi
-done < "$DIR_MAP"
-unset _d _rest _last_dir
+while IFS= read -r d; do
+    [ -n "$d" ] && dirs+=("$d")
+done < <(cut -f2 "$RESOLVE_MAP" | sort -u)
 
 total_dirs=${#dirs[@]}
 echo -e "${NC}Found ${#archives[@]} archives in $total_dirs directories.${NC}"
@@ -328,8 +391,54 @@ if [ -z "$CORES" ] && command -v sysctl >/dev/null 2>&1; then
 fi
 CORES=${CORES:-3}
 [ "$CORES" -gt 8 ] && CORES=8
+
+# Cap parallelism based on available memory, not just CPU core count.
+# Running several simultaneous decompression processes on a memory-limited
+# device (e.g. a Raspberry Pi Zero 2W's 512MB) risks the kernel's OOM killer
+# silently terminating a background job outright. A plain `wait` at the end
+# of the run can't tell that apart from a clean finish - the job just
+# vanishes mid-batch, and every archive after that point in its directory
+# is left unextracted with no entry anywhere in the error log.
+mem_kb=""
+if [ -r /proc/meminfo ]; then
+    mem_kb=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null)
+elif command -v sysctl >/dev/null 2>&1; then
+    mem_bytes=$(sysctl -n hw.memsize 2>/dev/null)
+    if [ -n "$mem_bytes" ]; then
+        mem_kb=$((mem_bytes / 1024))
+    fi
+fi
+
+if [ -n "$mem_kb" ] && [ "$mem_kb" -gt 0 ]; then
+    if [ "$mem_kb" -lt 786432 ]; then
+        mem_cap=1     # under ~768MB (e.g. Pi Zero 2W's 512MB): serialize extraction
+    elif [ "$mem_kb" -lt 1572864 ]; then
+        mem_cap=2     # under ~1.5GB
+    else
+        mem_cap=8
+    fi
+    if [ "$CORES" -gt "$mem_cap" ]; then
+        echo "Detected ~$((mem_kb / 1024))MB RAM - capping parallel extraction to $mem_cap job(s) to reduce the risk of out-of-memory kills."
+        CORES="$mem_cap"
+    fi
+fi
+
 max_parallel="$CORES"
-echo "Detected $CORES CPU core(s) for parallel extraction."
+echo "Detected $CORES CPU core(s); using $max_parallel parallel extraction job(s)."
+
+# Per-archive timeout, so one hung/corrupt archive can't stall its whole
+# directory's job forever (and, since a stalled job never frees its
+# wait_for_job_slot slot, can't stall every directory queued behind it).
+TIMEOUT_SECS=120
+TIMEOUT_CMD=""
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="timeout ${TIMEOUT_SECS}s"
+elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="gtimeout ${TIMEOUT_SECS}s"
+else
+    echo "Note: no 'timeout' command found - extraction attempts have no time limit."
+    echo "On macOS: brew install coreutils (provides gtimeout)."
+fi
 
 trap 'echo -e "\n${RED}Interrupted. Killing all background jobs and exiting...${NC}"; pkill -P $$; exit 130' INT TERM
 
@@ -398,8 +507,12 @@ extract_archive() {
     esac
     return $((1 - success))
 }
+export -f extract_archive
 
 dir_index=0
+declare -a JOB_PIDS=()
+declare -a JOB_DIRS=()
+declare -a JOB_LOGS=()
 
 for srcdir in "${dirs[@]}"; do
     reldir="${srcdir#$SRCROOT/}"
@@ -429,8 +542,20 @@ for srcdir in "${dirs[@]}"; do
             base="$(basename "$archive")"
             ext="${base##*.}"
 
-            if ! extract_archive "$abs_archive" "$abs_destdir" "$ext"; then
-                printf 'FAILED: %s (format: %s)\n' "$abs_archive" "$ext" >>"$dir_log"
+            if [ -n "$TIMEOUT_CMD" ]; then
+                $TIMEOUT_CMD bash -c 'extract_archive "$1" "$2" "$3"' _ "$abs_archive" "$abs_destdir" "$ext"
+                extract_rc=$?
+            else
+                extract_archive "$abs_archive" "$abs_destdir" "$ext"
+                extract_rc=$?
+            fi
+
+            if [ "$extract_rc" -ne 0 ]; then
+                if [ "$extract_rc" -eq 124 ]; then
+                    printf 'FAILED: %s (format: %s) - TIMED OUT after %ss\n' "$abs_archive" "$ext" "$TIMEOUT_SECS" >>"$dir_log"
+                else
+                    printf 'FAILED: %s (format: %s)\n' "$abs_archive" "$ext" >>"$dir_log"
+                fi
                 local_errors=$((local_errors + 1))
             fi
         done < <(awk -F'\t' -v d="$srcdir" '$1==d' "$DIR_MAP")
@@ -443,15 +568,50 @@ for srcdir in "${dirs[@]}"; do
         # exit status = number of errors in this dir (capped at 255)
         exit $(( local_errors > 255 ? 255 : local_errors ))
     ) &
+    JOB_PIDS+=("$!")
+    JOB_DIRS+=("$srcdir")
+    JOB_LOGS+=("$dir_log")
 
     progress_bar "$dir_index" "$total_dirs" 40
 done
 
-# wait for remaining jobs
-wait
+# Wait for each job individually (rather than a bare `wait`) so we can tell
+# a clean finish apart from a job that was killed outright - e.g. by the
+# OOM killer on a memory-constrained device. A signal kill shows up as an
+# exit status of 128+signal; a plain `wait` would just silently return once
+# the job was gone either way, with no record of which directory it was or
+# that anything went wrong.
+killed_dirs=()
+for _ji in "${!JOB_PIDS[@]}"; do
+    # On macOS in particular, bash can lose track of a background job's
+    # PID by the time we get here - typically because wait_for_job_slot's
+    # `jobs -r` polling above already noticed it finished and reaped it
+    # internally, so this explicit `wait` can no longer retrieve its exit
+    # status at all. That shows up as "wait: pid N is not a child of this
+    # shell" (exit status 127) - not a real problem, just bash's job table
+    # having already let go of a job that (almost always) finished
+    # normally, so it's treated as such rather than surfaced as an error.
+    wait "${JOB_PIDS[$_ji]}" 2>/dev/null
+    job_status=$?
+    if [ "$job_status" -eq 127 ]; then
+        continue
+    fi
+    if [ "$job_status" -ge 128 ]; then
+        sig=$((job_status - 128))
+        printf 'JOB KILLED: directory %s (signal %d - likely killed by the OS, e.g. out-of-memory). Archives not yet reached in this directory were NOT extracted and have no FAILED entry above.\n' \
+            "${JOB_DIRS[$_ji]}" "$sig" >> "${JOB_LOGS[$_ji]}"
+        killed_dirs+=("${JOB_DIRS[$_ji]}")
+    fi
+done
+unset _ji
 echo
 
-# Aggregate error logs
+# Aggregate per-directory error logs into one file. Each background job
+# wrote its own "FAILED: ..." lines (one per archive it couldn't extract)
+# and, if it was itself killed mid-run, a "JOB KILLED: ..." line was added
+# by the wait-loop above. These two kinds of line mean different things
+# (one bad archive vs. an entire batch cut short), so they're counted
+# separately below rather than lumped into a single "errors" number.
 ERROR_LOG="$SRCROOT/extract_errors.log"
 : > "$ERROR_LOG"
 
@@ -461,7 +621,7 @@ if [ -d "$tmpdir" ]; then
 fi
 
 if [ -s "$ERROR_LOG" ]; then
-    errors="$(wc -l <"$ERROR_LOG" 2>/dev/null || echo 0)"
+    errors="$(grep -c '^FAILED:' "$ERROR_LOG" 2>/dev/null || echo 0)"
 else
     errors=0
 fi
@@ -476,5 +636,16 @@ echo "Elapsed Time: $fmt_time"
 echo "Extraction Errors: $errors"
 if [ $errors -ne 0 ]; then
     echo -e "\n${RED}Failed archives are logged in:${NC} $ERROR_LOG"
+fi
+if [ "${#killed_dirs[@]}" -gt 0 ]; then
+    echo
+    echo -e "${RED}WARNING: ${#killed_dirs[@]} extraction job(s) were killed mid-run:${NC}"
+    printf '  %s\n' "${killed_dirs[@]}"
+    echo "This usually means the device ran out of memory running $max_parallel job(s) in parallel."
+    echo "Some archives in these directories may not have been extracted at all - re-run"
+    echo "extract.sh to pick up anything missed (already-extracted files are left alone)."
+    echo "(These killed jobs are NOT included in the 'Extraction Errors' count above,"
+    echo "since a killed job can leave an unknown number of archives unattempted -"
+    echo "not a fixed count of individual failures.)"
 fi
 echo -e "${BOLD}======================================================${NC}"

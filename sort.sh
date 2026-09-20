@@ -3,6 +3,28 @@
 # Amiga Retroplay Archive Organizer & Sorter - Ultimate Edition
 # Compatible: macOS, Linux, Debian 12/13, Amiga A314
 # Version: 3.0.0-ultimate
+#
+# WHAT THIS SCRIPT DOES:
+#   The last step of the pipeline. Once files are extracted (extract.sh)
+#   and artwork is merged in (merge.sh), this script:
+#     1. Optionally pre-cleans filenames with `detox` (external tool).
+#     2. Sorts games into variant subfolders (CD32/AGA/NTSC/MT32/CDTV) and
+#        language subfolders (French/German/etc.), based on suffixes in
+#        each game's directory name - e.g. "SomeGame_AGA" moves under
+#        WHDLoad/AGA/..., "SomeGame_De" moves under WHDLoad/Languages/German/.
+#     3. Runs an Amiga filesystem compliance check over every file (illegal
+#        characters, length limits for FFS/PFS), auto-fixing what it safely
+#        can and logging what it can't.
+#     4. Deletes directories left empty by all the moving above.
+#   quick.sh and start.sh --auto both call this script as their final step.
+#
+# WHY PARALLEL JOBS: variant/language sorting and the compliance check can
+# touch tens of thousands of files on a real collection, so both sorting
+# passes run several directories at once via _start_job/wait_all_jobs
+# rather than one at a time. See that section further down for how job
+# failures (e.g. a job killed by the OS for using too much memory) are
+# detected and reported, since a plain `wait` can't tell that apart from a
+# clean finish.
 
 set -euo pipefail
 
@@ -37,6 +59,7 @@ PFS_LIMIT=107
 MAX_FILENAME_LEN=$PFS_LIMIT
 RUN_COMPLIANCE_CHECK=true
 SKIP_DETOX=false
+RUN_VARIANT_LANG_SORT=true
 
 print_sort_help() {
     echo "Amiga Retroplay Archive Organizer & Sorter - Ultimate Edition"
@@ -50,6 +73,11 @@ print_sort_help() {
     echo "  --pfs              Use PFS filesystem limits ($PFS_LIMIT character filenames) [default]"
     echo "  --skipchk          Skip the Amiga filesystem compliance check entirely"
     echo "  --no-detox         Do not run detox, even if it's installed"
+    echo "  --skip-variant-sort  Skip moving games into CD32/AGA/NTSC/MT32/CDTV and"
+    echo "                     language subfolders. Useful when this reorganization"
+    echo "                     has already been done on a shared base tree (e.g. by"
+    echo "                     an earlier sort.sh pass before per-variant artwork"
+    echo "                     was merged in) and only detox/compliance is wanted."
     echo "  --custom           Reserved for dispatcher integration (no-op here)"
     echo "  -h, --help         Show this help message"
     echo ""
@@ -72,7 +100,8 @@ print_sort_help() {
 # argument (as start.sh passes when no --ffs/--pfs was chosen) is tolerated.
 # ----------------------------------------------------------------------------
 while [ $# -gt 0 ]; do
-    case "$1" in
+    opt_lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    case "$opt_lc" in
         "")
             shift
             ;;
@@ -102,6 +131,10 @@ while [ $# -gt 0 ]; do
             SKIP_DETOX=true
             shift
             ;;
+        --skip-variant-sort)
+            RUN_VARIANT_LANG_SORT=false
+            shift
+            ;;
         -h|--help)
             print_sort_help
             exit 0
@@ -116,6 +149,7 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+unset opt_lc
 
 # Use either CLI override, or default
 DEST="${DEST_OVERRIDE:-$DEFAULT_DEST}"
@@ -306,10 +340,20 @@ check_path_compliance() {
             newfilename=$(truncate_filename_preserve_ext "$newfilename" "$MAX_FILENAME_LEN")
         fi
 
-        if [ "$newfilename" != "$filename" ] && [ ! -e "$dirpath/$newfilename" ]; then
-            mv "$filepath" "$dirpath/$newfilename" 2>/dev/null
-            printf 'FIXED: %s -> %s\n' "$filename" "$newfilename"
-            return 0
+        if [ "$newfilename" != "$filename" ]; then
+            # `mv -n` (no-clobber) is atomic: it refuses to overwrite an
+            # existing target itself, rather than this code checking
+            # existence first and moving second. That check-then-act gap
+            # was previously fine only because compliance checking runs
+            # sequentially - not something to depend on staying true.
+            if mv -n "$filepath" "$dirpath/$newfilename" 2>/dev/null; then
+                printf 'FIXED: %s -> %s\n' "$filename" "$newfilename"
+                # Distinct status from "clean" (0) and "issues remain" (1)
+                # so callers can tell a fix actually happened - both used
+                # to return 0, so callers using `if ! ...; then` could
+                # never actually reach this branch to count/report it.
+                return 2
+            fi
         fi
     fi
 
@@ -406,23 +450,81 @@ NUM_JOBS=$(( $(get_cpu_cores) * 3 / 4 ))
 [ "$NUM_JOBS" -lt 2 ] && NUM_JOBS=2
 [ "$NUM_JOBS" -gt 16 ] && NUM_JOBS=16
 
+# Lightly cap on very low-memory devices too. These jobs just mv/cp files
+# (much cheaper than extract.sh's decompression), so this is a smaller
+# safety margin than extract.sh's - just enough to avoid piling on dozens
+# of simultaneous file-move jobs on something like a Pi Zero 2W's 512MB.
+_mem_kb=""
+if [ -r /proc/meminfo ]; then
+    _mem_kb=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null)
+elif command -v sysctl >/dev/null 2>&1; then
+    _mem_bytes=$(sysctl -n hw.memsize 2>/dev/null)
+    [ -n "$_mem_bytes" ] && _mem_kb=$((_mem_bytes / 1024))
+fi
+if [ -n "$_mem_kb" ] && [ "$_mem_kb" -gt 0 ] && [ "$_mem_kb" -lt 786432 ] && [ "$NUM_JOBS" -gt 4 ]; then
+    NUM_JOBS=4
+fi
+unset _mem_kb _mem_bytes
+
 # ============================================================================
 # PARALLEL JOB MANAGEMENT
 # ============================================================================
 declare -a running_pids=()
+declare -a running_descs=()
+killed_job_descs=()
 
 _start_job() {
+    local desc="$*"
     "$@" &
     local pid=$!
     running_pids+=("$pid")
+    running_descs+=("$desc")
 
     # Wait if job limit reached
     while [ "${#running_pids[@]}" -ge "$NUM_JOBS" ]; do
         for i in "${!running_pids[@]}"; do
             if ! kill -0 "${running_pids[$i]}" 2>/dev/null; then
-                wait "${running_pids[$i]}" 2>/dev/null || true
+                # Job has already exited - reap it and check HOW it exited.
+                # The previous version of this loop discarded the exit
+                # status entirely (`|| true`), so a job killed outright
+                # (e.g. by the OOM killer on a memory-constrained device)
+                # was silently indistinguishable from one that finished
+                # cleanly - the files it hadn't gotten to yet just stayed
+                # unsorted with no warning anywhere.
+                #
+                # On macOS in particular, bash can lose track of a job's
+                # PID between the `kill -0` check above and this `wait` -
+                # showing up as "wait: pid N is not a child of this shell"
+                # (exit status 127). That's not a real failure, just bash's
+                # job table having already let go of a job that (almost
+                # always) finished normally, so it's treated as such.
+                #
+                # This whole script runs under `set -e`, so `wait` must be
+                # used as an `if` condition, never as a bare statement: a
+                # bare `wait` for a job that exited non-zero for ANY
+                # reason (killed, or just a normal error status) would
+                # trigger errexit right here and silently kill this
+                # entire script mid-sort, with everything not yet
+                # processed just left where it was and no explanation
+                # printed anywhere.
+                local status
+                if wait "${running_pids[$i]}" 2>/dev/null; then
+                    status=0
+                else
+                    status=$?
+                fi
+                if [ "$status" -eq 127 ]; then
+                    status=0
+                fi
+                if [ "$status" -ge 128 ]; then
+                    local sig=$((status - 128))
+                    echo "WARNING: background job killed (signal $sig): ${running_descs[$i]}" >&2
+                    killed_job_descs+=("${running_descs[$i]}")
+                fi
                 unset 'running_pids[$i]'
+                unset 'running_descs[$i]'
                 running_pids=( "${running_pids[@]}" )
+                running_descs=( "${running_descs[@]}" )
                 break
             fi
         done
@@ -431,10 +533,28 @@ _start_job() {
 }
 
 wait_all_jobs() {
-    for pid in "${running_pids[@]:-}"; do
-        wait "$pid" 2>/dev/null || true
+    local i status sig
+    for i in "${!running_pids[@]}"; do
+        # See the matching comment in _start_job above re: macOS sometimes
+        # already having reaped a finished job by the time we wait for it,
+        # and re: why `wait` must be `if`-guarded rather than bare under
+        # this script's `set -e`.
+        if wait "${running_pids[$i]}" 2>/dev/null; then
+            status=0
+        else
+            status=$?
+        fi
+        if [ "$status" -eq 127 ]; then
+            status=0
+        fi
+        if [ "$status" -ge 128 ]; then
+            sig=$((status - 128))
+            echo "WARNING: background job killed (signal $sig): ${running_descs[$i]:-unknown}" >&2
+            killed_job_descs+=("${running_descs[$i]:-unknown}")
+        fi
     done
     running_pids=()
+    running_descs=()
 }
 
 # (Argument parsing already happened in the single unified loop above.)
@@ -687,12 +807,50 @@ lang_sort() {
 # ============================================================================
 # MAIN SORTING OPERATIONS
 # ============================================================================
-variant_sort_strict "CD32"
-variant_sort_strict "AGA"
-variant_sort_strict "NTSC"
-variant_sort_strict "MT32"
-variant_sort_strict "CDTV"
-lang_sort
+if [ "$RUN_VARIANT_LANG_SORT" = true ]; then
+    variant_sort_strict "CD32"
+    variant_sort_strict "AGA"
+    variant_sort_strict "NTSC"
+    variant_sort_strict "MT32"
+    variant_sort_strict "CDTV"
+    lang_sort
+fi
+
+# The langs[] table has more than one code for some display names (e.g.
+# "Czech:Cz" and "Czech:Cs"), so lang_sort's loop above appends a separate
+# summary line per CODE, not per display name - without this merge step,
+# "Czech" would show up twice with two different partial counts, which
+# looks like a bug even though each line was individually correct. Merge
+# any lines sharing the same name (first word before " | ") by summing
+# their counts into one line, keeping first-seen order. Variant lines
+# (CD32/AGA/NTSC/MT32/CDTV) pass through unchanged since their names never
+# repeat.
+merge_duplicate_summary_lines() {
+    local -a names=() totals=()
+    local line name count i found
+    for line in "${sort_summary[@]}"; do
+        name="${line%% | *}"
+        count="${line##* | }"
+        count="${count% found}"
+        found=0
+        for i in "${!names[@]}"; do
+            if [ "${names[$i]}" = "$name" ]; then
+                totals[$i]=$((totals[$i] + count))
+                found=1
+                break
+            fi
+        done
+        if [ "$found" -eq 0 ]; then
+            names+=("$name")
+            totals+=("$count")
+        fi
+    done
+    sort_summary=()
+    for i in "${!names[@]}"; do
+        sort_summary+=("${names[$i]} | ${totals[$i]} found")
+    done
+}
+merge_duplicate_summary_lines
 
 echo
 echo "======== SORTING SUMMARY ========"
@@ -701,6 +859,15 @@ for summary_line in "${sort_summary[@]}"; do
 done
 echo "================================="
 echo
+
+if [ "${#killed_job_descs[@]}" -gt 0 ]; then
+    echo "WARNING: ${#killed_job_descs[@]} background sorting job(s) were killed mid-run"
+    echo "(most likely out-of-memory on this device). Some files may not have been"
+    echo "moved/sorted. Affected jobs:"
+    printf '  %s\n' "${killed_job_descs[@]}"
+    echo "Re-running sort.sh is safe - already-sorted files are left alone."
+    echo
+fi
 
 # ============================================================================
 # AMIGA FILESYSTEM COMPLIANCE CHECK
@@ -719,45 +886,157 @@ if [ "$RUN_COMPLIANCE_CHECK" = true ]; then
     echo "Performing Amiga filesystem compliance check ($FS_TYPE: max $MAX_FILENAME_LEN chars) in: $CHECK_ROOT"
     echo
 
-    issues_found=0
-    total_scanned=0
-    files_fixed=0
-    total_files=$(find "$CHECK_ROOT" -type f ! -name '*:a314' 2>/dev/null | wc -l)
-
-    while IFS= read -r -d '' file; do
-        case "$file" in
+    # Collect the full file list once (NUL-delimited, so filenames with
+    # spaces or unusual characters survive intact), then split it into
+    # NUM_JOBS contiguous chunks so multiple worker processes can run
+    # check_path_compliance concurrently - real-world collections have
+    # been seen with 200k+ files, where a single-threaded scan is slow.
+    # Safe to parallelize because check_path_compliance's rename uses
+    # atomic `mv -n`: if two workers ever raced to truncate two different
+    # long names down to the same result, the loser's rename simply fails
+    # cleanly rather than clobbering the winner - that file is just left
+    # for a later pass, not silently lost.
+    all_files=()
+    while IFS= read -r -d '' f; do
+        case "$f" in
             *:a314) continue ;;  # A314 bridge metadata sidecar file, not a real file
         esac
-        total_scanned=$((total_scanned + 1))
-
-        # Progress update every 1000 files
-        if (( total_scanned % 1000 == 0 )); then
-            printf "\rScanned: %d/%d files" "$total_scanned" "$total_files"
-        fi
-
-        if ! issues=$(check_path_compliance "$file" 2>&1); then
-            if echo "$issues" | grep -q "^FIXED:"; then
-                files_fixed=$((files_fixed + 1))
-                echo ""
-                echo "$issues"
-            else
-                issues_found=$((issues_found + 1))
-                echo ""
-                echo "$file"
-                while IFS= read -r issue; do
-                    echo " → $issue"
-                done <<< "$issues"
-
-                # Log to file
-                echo "$file" >> "$AMIGA_ISSUES_LOG"
-                while IFS= read -r issue; do
-                    echo " → $issue" >> "$AMIGA_ISSUES_LOG"
-                done <<< "$issues"
-            fi
-        fi
+        all_files+=("$f")
     done < <(find "$CHECK_ROOT" -type f ! -name '*:a314' -print0 2>/dev/null)
 
-    printf "\r%-60s\n" " "
+    total_files=${#all_files[@]}
+    total_scanned=0
+    files_fixed=0
+    issues_found=0
+
+    if [ "$total_files" -eq 0 ]; then
+        echo "✓ No files to check."
+    else
+        compliance_tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/sort_compliance.XXXXXX")"
+
+        chunk_size=$(( (total_files + NUM_JOBS - 1) / NUM_JOBS ))
+        [ "$chunk_size" -lt 1 ] && chunk_size=1
+
+        compliance_result_files=()
+        compliance_issue_files=()
+        compliance_progress_files=()
+        compliance_pids=()
+
+        idx=0
+        chunk_num=0
+        while [ "$idx" -lt "$total_files" ]; do
+            chunk_num=$((chunk_num + 1))
+            chunk_file="$compliance_tmpdir/chunk_$chunk_num"
+            : > "$chunk_file"
+            end=$((idx + chunk_size))
+            [ "$end" -gt "$total_files" ] && end="$total_files"
+            for (( j=idx; j<end; j++ )); do
+                printf '%s\0' "${all_files[$j]}" >> "$chunk_file"
+            done
+            idx="$end"
+
+            result_file="$compliance_tmpdir/result_$chunk_num"
+            issue_file="$compliance_tmpdir/issues_$chunk_num"
+            progress_file="$compliance_tmpdir/progress_$chunk_num"
+            : > "$issue_file"
+            echo 0 > "$progress_file"
+            compliance_result_files+=("$result_file")
+            compliance_issue_files+=("$issue_file")
+            compliance_progress_files+=("$progress_file")
+
+            (
+                set +e   # see the note above the main check inside this
+                         # loop: this worker has its own explicit status
+                         # handling throughout, so errexit (inherited from
+                         # the parent script's `set -e`) only creates risk
+                         # here, with no benefit - disable it for the
+                         # whole worker rather than auditing every single
+                         # command in it for exemption from that risk.
+                local_scanned=0
+                local_fixed=0
+                local_issues=0
+                while IFS= read -r -d '' file; do
+                    local_scanned=$((local_scanned + 1))
+                    # Using the assignment as the `if` condition (rather
+                    # than a bare `issues=$(...); status=$?`) matters here
+                    # because this script runs under `set -e`: a bare
+                    # assignment statement that fails would trigger
+                    # errexit immediately, silently killing this whole
+                    # background worker mid-chunk (with everything after
+                    # that point in its chunk left completely unscanned).
+                    # A command tested by `if` is exempt from errexit
+                    # regardless of its exit status, so this form is safe.
+                    if issues=$(check_path_compliance "$file" 2>&1); then
+                        :
+                    else
+                        status=$?
+                        if [ "$status" -eq 2 ]; then
+                            local_fixed=$((local_fixed + 1))
+                        elif [ "$status" -eq 1 ]; then
+                            local_issues=$((local_issues + 1))
+                            {
+                                echo "$file"
+                                while IFS= read -r issue; do
+                                    echo " → $issue"
+                                done <<< "$issues"
+                            } >> "$issue_file"
+                        fi
+                    fi
+                    if (( local_scanned % 200 == 0 )); then
+                        echo "$local_scanned" > "$progress_file"
+                    fi
+                done < "$chunk_file"
+                echo "$local_scanned" > "$progress_file"
+                echo "$local_scanned $local_fixed $local_issues" > "$result_file"
+            ) &
+            compliance_pids+=("$!")
+        done
+
+        # Poll aggregate progress across all workers while they run.
+        while :; do
+            still_running=0
+            for pid in "${compliance_pids[@]}"; do
+                kill -0 "$pid" 2>/dev/null && still_running=1
+            done
+            sum=0
+            for pf in "${compliance_progress_files[@]}"; do
+                n=$(cat "$pf" 2>/dev/null) || n=0
+                [ -n "$n" ] && sum=$((sum + n))
+            done
+            printf "\rScanned: %d/%d files" "$sum" "$total_files"
+            [ "$still_running" -eq 0 ] && break
+            sleep 0.5
+        done
+        printf "\r%-60s\n" " "
+
+        for pid in "${compliance_pids[@]}"; do
+            # `wait` must be `if`-guarded, not bare, under this script's
+            # `set -e` - see _start_job's comment for why - and the 127
+            # case (macOS job-table quirk) is treated as fine, not an
+            # error, same as the other job-wait spots in this script.
+            if wait "$pid" 2>/dev/null; then
+                :
+            else
+                wstatus=$?
+                [ "$wstatus" -eq 127 ] || true
+            fi
+        done
+
+        for rf in "${compliance_result_files[@]}"; do
+            [ -f "$rf" ] || continue
+            read -r rs rfx ri < "$rf" || true
+            total_scanned=$((total_scanned + ${rs:-0}))
+            files_fixed=$((files_fixed + ${rfx:-0}))
+            issues_found=$((issues_found + ${ri:-0}))
+        done
+
+        : > "$AMIGA_ISSUES_LOG"
+        for f in "${compliance_issue_files[@]}"; do
+            [ -s "$f" ] && cat "$f" >> "$AMIGA_ISSUES_LOG"
+        done
+
+        rm -rf "$compliance_tmpdir"
+    fi
 
     if [ $files_fixed -gt 0 ]; then
         echo "✓ Fixed $files_fixed file(s) by truncating long filenames to ${MAX_FILENAME_LEN} chars."
