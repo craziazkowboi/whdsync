@@ -54,10 +54,11 @@ EOF
 for t in 7z unar unlzx; do cp "$MOCK/lha" "$MOCK/$t"; done
 # wget: "mirrors" the matching mock-server folder into the current folder
 # (copies anything not present locally) and logs that it was called.
+ROOT_P="$(cd "$ROOT" && pwd -P)"   # physical path (e.g. macOS /var -> /private/var)
 cat > "$MOCK/wget" << EOF
 #!/usr/bin/env bash
 echo called >> "$MOCK/wget_calls"
-rel="\$(pwd)"; rel="\${rel#$ROOT/}"
+rel="\$(pwd -P)"; rel="\${rel#$ROOT_P/}"
 [ -d "$SERVER/\$rel" ] || exit 0
 ( cd "$SERVER/\$rel" && find . -type f ) | while IFS= read -r f; do
     [ -e "\$f" ] || { mkdir -p "\$(dirname "\$f")"; cp "$SERVER/\$rel/\$f" "\$f"; }
@@ -299,6 +300,64 @@ check "leftovers from killed runs are swept up on the next run" \
   '[ ! -e "$ROOT/extract_tmp.dead" ] && [ ! -e "$ROOT/extract_tmp.legacy" ]'
 check "a temp folder whose run is still going is left alone" '[ -d "$ROOT/extract_tmp.live" ]'
 rm -rf "$ROOT/extract_tmp.live"
+
+
+section "14. Folder layout stays retro_x/WHDLoad/... when paths are spelled differently"
+# Reaching the folder through a symlink makes the working directory and the
+# resolved paths differ - the same situation as macOS's ~/downloads vs
+# ~/Downloads, which used to recreate Users/<you>/Downloads/Amiga/... inside
+# retro_* and new_*.
+ln -s "$ROOT" "$T/linkedroot"
+layout_ok() {   # only WHDLoad / HD_Loaders / JST at the top of $1
+    local e; for e in "$1"/*; do case "${e##*/}" in WHDLoad|HD_Loaders|JST) ;; *) return 1 ;; esac; done; return 0
+}
+( cd "$T/linkedroot" && ./all.sh --rebuild --variants aga ) < /dev/null > "$T/linked_full.log" 2>&1; st=$?
+check "full build via a differently-spelled path succeeds" '[ "$st" -eq 0 ]'
+check "retro_aga holds only WHDLoad/HD_Loaders/JST at the top" 'layout_ok "$ROOT/retro_aga"'
+check "games are in retro_aga/WHDLoad/..., not under a copied absolute path" \
+  '[ -d "$ROOT/retro_aga/WHDLoad/Games/A/Alpha" ] && ! (cd "$ROOT/retro_aga" && find . | grep -qF "${T#/}")'
+server_add WHDLoad/Games/E/Epsilon_v1.0.lha
+( cd "$T/linkedroot" && ./all.sh --variants aga ) < /dev/null > "$T/linked_inc.log" 2>&1; st=$?
+latest="$(ls -1d "$ROOT"/new_aga/*/ 2>/dev/null | sort | tail -1)"
+check "update via that path: new_aga batch has the right layout too" \
+  '[ "$st" -eq 0 ] && layout_ok "${latest%/}" && [ -d "${latest}WHDLoad/Games/E/Epsilon" ]'
+mkdir -p "$T/ext/WHDLoad/Games/A" "$T/proj2"; echo x > "$T/ext/WHDLoad/Games/A/Alpha_v1.0.lha"
+cp "$ROOT/extract.sh" "$ROOT/lib.sh" "$T/proj2/"; ln -s "$T/ext/WHDLoad" "$T/proj2/WHDLoad"
+( cd "$T/proj2" && bash ./extract.sh -u -d "$T/ext_out" ) < /dev/null > "$T/ext.log" 2>&1
+check "WHDLoad symlinked to another drive extracts into dest/WHDLoad/..." \
+  'layout_ok "$T/ext_out" && [ -d "$T/ext_out/WHDLoad/Games/A/Alpha" ]'
+mkdir -p "$ROOT/retro_ecs/Users/someone"
+run doctor_layout ./doctor.sh; st=$?
+check "doctor.sh spots a folder in the wrong place and explains the fix" \
+  '[ "$st" -eq 1 ] && grep -q "retro_ecs/Users" "$T/doctor_layout.log" && grep -q -- "--rebuild" "$T/doctor_layout.log"'
+rm -rf "$ROOT/retro_ecs/Users"
+
+
+section "15. iGame_art and other packs match a game folder anywhere inside them"
+M="$T/anyart"; mkdir -p "$M"; cp "$ROOT/merge.sh" "$ROOT/lib.sh" "$M/"
+mkart() { mkdir -p "$M/$1"; echo "$2" > "$M/$1/iGame.iff"; }
+mkart "iGame_art/Misc/Some/Deep/Omega" "art-Omega"                 # no section in its path
+mkart "iGame_art/Odd/Titles/X/Lambda" "art-Lambda-title"           # section revealed by the path
+mkart "iGame_art/Covers/Games/M/Mu" "art-Mu-standard"              # standard location...
+mkart "iGame_art/Misc/Mu" "art-Mu-stray"                           # ...beats a stray duplicate
+mkart "iGame_AGA/Extras/Zeta" "aga-Zeta-nonstandard"               # AGA must NOT be searched this way
+mkart "iGame_CD32/foo/bar/Kappa" "cd32-Kappa"                      # custom pack, any depth
+mkdir -p "$M/iGame_AGA/Covers/Games/A/Anchor"; echo "aga-Anchor" > "$M/iGame_AGA/Covers/Games/A/Anchor/iGame.iff"
+for g in Omega Lambda Mu Zeta Kappa Anchor; do
+    mkdir -p "$M/retro/WHDLoad/Games/${g:0:1}/$g"; touch "$M/retro/WHDLoad/Games/${g:0:1}/$g.info"; done
+( cd "$M" && bash merge.sh --aga --art Covers,Screens,Titles -d retro ) > "$T/anyart.log" 2>&1
+g() { cat "$M/retro/WHDLoad/Games/${1:0:1}/$1/$2" 2>/dev/null; }
+check "a game found only deep inside iGame_art gets that artwork" '[ "$(g Omega iGame.iff)" = art-Omega ]'
+check "a Titles folder anywhere in the path keeps Titles priority (igame2.iff)" '[ "$(g Lambda igame2.iff)" = art-Lambda-title ]'
+check "a custom pack (iGame_CD32) is searched at any depth too" '[ "$(g Kappa iGame.iff)" = cd32-Kappa ]'
+check "the standard layout still wins over a stray copy elsewhere in the pack" '[ "$(g Mu iGame.iff)" = art-Mu-standard ]'
+check "iGame_AGA is NOT searched outside its standard layout (unchanged)" '[ -z "$(ls "$M/retro/WHDLoad/Games/Z/Zeta/" 2>/dev/null)" ]'
+check "iGame_AGA's standard layout works as before" '[ "$(g Anchor iGame.iff)" = aga-Anchor ]'
+rm -f "$M"/retro/WHDLoad/Games/*/*/igame*.iff "$M"/retro/WHDLoad/Games/*/*/iGame.iff
+echo 'STRUCTURED_ART_SETS="AGA ECS RTG ART"' > "$M/retroplay.conf"
+( cd "$M" && bash merge.sh --aga -d retro ) > "$T/anyart2.log" 2>&1
+check "STRUCTURED_ART_SETS in retroplay.conf can switch this off per pack" \
+  '[ -z "$(g Omega iGame.iff)" ] && [ "$(g Kappa iGame.iff)" = cd32-Kappa ]'
 
 # ================================================================ summary ===
 echo

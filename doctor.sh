@@ -99,7 +99,16 @@ for d in "$SCRIPT_DIR"/[iI][gG][aA][mM][eE]_*; do
     n="${d##*/}"; secs=""
     for s in Covers Screens Titles; do [ -d "$d/$s" ] || [ -d "$d/${s%s}" ] && secs="$secs $s"; done
     found_sets="$found_sets ${n#*_}"
-    if [ -n "$secs" ]; then good "$n:$secs"; else warn "$n has no Covers/Screens/Titles folders - it won't be used"; fi
+    setkey="$(printf '%s' "${n#*_}" | tr '[:lower:]' '[:upper:]')"
+    case " $(printf '%s' "$RP_STRUCTURED_ART_SETS" | tr '[:lower:]' '[:upper:]') " in
+        *" $setkey "*)
+            if [ -n "$secs" ]; then good "$n:$secs"
+            else warn "$n has no Covers/Screens/Titles folders - it won't be used" "This pack is only matched by the standard layout (STRUCTURED_ART_SETS)"; fi ;;
+        *)
+            cnt="$(find "$d" -type f -iname 'igame.iff' 2>/dev/null | grep -c . || true)"
+            if [ "$cnt" -gt 0 ]; then good "$n: $cnt artwork folder(s), matched at any depth"
+            else warn "$n contains no iGame.iff files - it won't provide any artwork"; fi ;;
+    esac
 done
 [ -z "$found_sets" ] && prob "no iGame_* artwork folders found next to the scripts" "See 'Artwork directory layout' in README.md"
 for v in $RP_VARIANTS; do
@@ -134,6 +143,24 @@ for v in $RP_VARIANTS; do
                     else good "$key: built and up to date"; fi ;;
     esac
 done
+
+# Collections or batches with anything but WHDLoad/HD_Loaders/JST at the top
+# (e.g. a Users/... folder from the path bug fixed in this version).
+bad_layout=""
+for d in "$RP_OUTPUT_ROOT"/retro_* "$RP_OUTPUT_ROOT"/new_*/*; do
+    [ -d "$d" ] || continue
+    for e in "$d"/*; do
+        [ -e "$e" ] || continue
+        case "${e##*/}" in WHDLoad|HD_Loaders|JST) ;; *) bad_layout="$bad_layout
+      ${d#"$RP_OUTPUT_ROOT"/}/${e##*/}"; break ;; esac
+    done
+done
+if [ -n "$bad_layout" ]; then
+    prob "folders in the wrong place (should only hold WHDLoad, HD_Loaders, JST):$bad_layout" \
+         "Fix: ./all.sh --rebuild  (rebuilds retro_* correctly), then delete the new_* batch folders listed"
+else
+    good "all retro_* and new_* folders have the correct layout"
+fi
 
 head_ "Nightly run"
 # Would the nightly run find the tools? cron starts with a bare PATH; lib.sh

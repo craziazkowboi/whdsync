@@ -22,7 +22,7 @@ chmod +x *.sh
 ## Notes
 
 - Scripts move and rename files as part of normal operation. Keep a backup of your WHDLoad tree before first use.
-- Every script can be run from any directory — each one switches to its own folder first.
+- Every script can be run from any directory — each one switches to its own folder first. The archive folders (`WHDLoad`, `HD_Loaders`, `JST`) may be symlinks to another drive.
 - Temporary folders (`extract_tmp.*` and friends) are removed whenever a script finishes, fails or is stopped. Leftovers from a crash or power cut are swept up at the start of the next run (a folder whose run is still going is never touched).
 - Bash 3.2+ everywhere, except `merge.sh`, which needs Bash 4+. On macOS it relaunches itself under Homebrew's bash automatically (`brew install bash`).
 - This README only describes the scripts; it contains no third-party content.
@@ -49,6 +49,7 @@ Copy `retroplay.conf.example` to `retroplay.conf` and edit it. Every setting is 
 | `OUTPUT_ROOT` | `.` | Where `retro_*`, `new_*` and working files go — e.g. a USB SSD, which is far faster than an SD card. |
 | `ART_ORDER`, `ART_ORDER_<VARIANT>` | `Covers,Screens,Titles` | Artwork priority (per variant if needed). |
 | `DEMO_ART_ORDER` | `Titles,Screens,Covers` | Artwork priority for demos. |
+| `STRUCTURED_ART_SETS` | `AGA ECS RTG` | Artwork packs matched only by the standard layout; all others are also searched at any depth. |
 | `EXCLUDE_TAGS_<VARIANT>` | ECS variants: `AGA,CD32` | Releases a variant leaves out (see below). |
 | `FILESYSTEM` | `pfs` | Filename limits: `pfs` (107 characters) or `ffs` (30). |
 | `USE_DETOX` | `no` | Clean filenames with detox before sorting. |
@@ -74,6 +75,8 @@ iGame_AGA/
 
 `<GameName>` must match the extracted game folder's name. Singular folder names (`Game`, `Cover`) also work. Any `iGame_<NAME>` folder is picked up automatically and usable as `--set NAME`. A generic `iGame_art` is a catch-all fallback, and `TinyLauncher/<Game|Demo|Magazine|Beta>/<GameName>_SCR<n>.iff` a last resort.
 
+**`iGame_AGA`, `iGame_ECS` and `iGame_RTG` must use the layout above. Every other pack — `iGame_art`, the `_Laced` packs, your own — can be organised however you like:** a folder named after the game, holding an `iGame.iff`, is found at any depth. The layout above is still checked first, so a pack that follows it works exactly as before. A match somewhere under a `Covers`, `Screens` or `Titles` folder keeps that section's priority; one with no section in its path is tried after that pack's sections. Which packs are standard-layout-only is set by `STRUCTURED_ART_SETS` in `retroplay.conf`.
+
 ## What gets built
 
 | Folder | Contents |
@@ -95,7 +98,7 @@ iGame_AGA/
 4. **Updates** stage just the queued archives, extract and sort them once, add each variant's artwork, then install them. A game in the batch **replaces** its old folder, so files from older versions don't linger. A dated copy goes into `new_<variant>/`, and a quick artwork gap-fill runs over the whole collection.
 5. **Report** in `reports/`, and a notification if something failed.
 
-Free disk space is checked before extracting and before each copy, and an existing collection is only removed once its replacement is ready to install.
+Free disk space is checked before extracting and before each copy, and an existing collection is only removed once its replacement is ready to install. Every extraction is also checked to contain only `WHDLoad`, `HD_Loaders` and `JST` at the top; anything else stops the run before it reaches a collection.
 
 ## Script reference
 

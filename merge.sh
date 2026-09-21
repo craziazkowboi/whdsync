@@ -146,6 +146,17 @@ debug_log() {
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Settings from retroplay.conf (via the shared lib.sh), if present.
+RP_STRUCTURED_ART_SETS="AGA ECS RTG"
+if [ -f "$SCRIPT_DIR/lib.sh" ]; then
+    . "$SCRIPT_DIR/lib.sh"
+    rp_load_config
+fi
+# Artwork sets matched ONLY by the standard Covers|Screens|Titles/<Games|
+# Demos|Magazines>/<letter>/<game> layout. Every other set (iGame_art,
+# custom packs, ...) ALSO matches a game folder anywhere inside it.
+STRUCTURED_SETS=" $(printf '%s' "$RP_STRUCTURED_ART_SETS" | tr '[:lower:]' '[:upper:]') "
+
 TINYLAUNCHER_SRC="$SCRIPT_DIR/TinyLauncher"
 DEFAULT_DEST="$SCRIPT_DIR/retro"
 ART_SRC=""
@@ -485,6 +496,34 @@ index_source() {
     done
 }
 
+# For sets NOT in STRUCTURED_ART_SETS: additionally index every folder, at
+# any depth, that holds an iGame.iff - matched by that folder's name. This
+# only ADDS entries the standard index above didn't find, so a set laid out
+# the standard way behaves exactly as before. If the match sits somewhere
+# under a Covers/Screens/Titles folder it keeps that section's priority;
+# otherwise it's filed as "Any", tried after every section for that set.
+index_source_any() {
+    local src_key="$1" src_root="${2%/}" f dir parent rel sec key added=0
+    while IFS= read -r f; do
+        dir="${f%/*}"
+        [ "$dir" = "$src_root" ] && continue
+        parent="${dir%/*}"
+        rel="/${parent#"$src_root"}/"
+        case "$rel" in
+            */[Cc]overs/*|*/[Cc]over/*)   sec=Covers ;;
+            */[Ss]creens/*|*/[Ss]creen/*) sec=Screens ;;
+            */[Tt]itles/*|*/[Tt]itle/*)   sec=Titles ;;
+            *) sec=Any ;;
+        esac
+        key="$src_key|$sec|${dir##*/}"
+        if [ -z "${IGAME_INDEX[$key]+_}" ]; then
+            IGAME_INDEX["$key"]="$dir"
+            added=$((added + 1))
+        fi
+    done < <(find "$src_root" -type f -iname 'igame.iff' 2>/dev/null | sort)
+    debug_log "  + $added extra match(es) found anywhere inside $src_root"
+}
+
 debug_log "Script directory: $SCRIPT_DIR"
 debug_log "Primary artwork source: ${ART_SRC:-<none - relying on fallback chain>}"
 debug_log "Destination: $DEST"
@@ -495,6 +534,10 @@ for _fbc in "${FALLBACK_CHAIN[@]}"; do
     [ "$_fbc" = "TINYLAUNCHER" ] && continue
     if [ -n "${IGAME_SET_DIR[$_fbc]+_}" ]; then
         index_source "$_fbc" "${IGAME_SET_DIR[$_fbc]}"
+        case "$STRUCTURED_SETS" in
+            *" $_fbc "*) ;;
+            *) index_source_any "$_fbc" "${IGAME_SET_DIR[$_fbc]}" ;;
+        esac
         indexed_any_source=1
         debug_log "Indexed artwork source: $_fbc -> ${IGAME_SET_DIR[$_fbc]}"
     fi
@@ -832,7 +875,7 @@ for dest_sub in "${merge_targets[@]}"; do
     # anything else).
     for _fbc in "${FALLBACK_CHAIN[@]}"; do
         [ "$_fbc" = "TINYLAUNCHER" ] && break
-        for section in "${ART_ORDER[@]}"; do
+        for section in "${ART_ORDER[@]}" Any; do
             key="$_fbc|$section|$dest_name"
             if [ -n "${IGAME_INDEX[$key]+_}" ]; then
                 best_section="$section"
@@ -902,7 +945,7 @@ for dest_sub in "${merge_targets[@]}"; do
                 [ "$_fbc" = "TINYLAUNCHER" ] && _past_tl=1
                 continue
             fi
-            for section in "${ART_ORDER[@]}"; do
+            for section in "${ART_ORDER[@]}" Any; do
                 key="$_fbc|$section|$dest_name"
                 if [ -n "${IGAME_INDEX[$key]+_}" ]; then
                     best_section="$section"

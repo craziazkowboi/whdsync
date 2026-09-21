@@ -47,6 +47,7 @@ rp_load_config() {
     RP_NTFY_SERVER="https://ntfy.sh"
     RP_NOTIFY_EMAIL=""
     RP_NOTIFY_ON_SUCCESS="no"
+    RP_STRUCTURED_ART_SETS="AGA ECS RTG"
     RP_CONFIG_WARNINGS=""
 
     [ -f "$RP_CONF_FILE" ] || { rp_finish_config; return 0; }
@@ -71,7 +72,7 @@ rp_load_config() {
         case "$key" in
             VARIANTS|OUTPUT_ROOT|ART_ORDER|DEMO_ART_ORDER|FILESYSTEM|USE_DETOX|\
             MIN_FREE_MB|SPACE_FACTOR|KEEP_NEW_BATCHES|OLD_ARCHIVE_DAYS|LOG_MAX_MB|\
-            LOG_KEEP|NTFY_TOPIC|NTFY_SERVER|NOTIFY_EMAIL|NOTIFY_ON_SUCCESS)
+            LOG_KEEP|NTFY_TOPIC|NTFY_SERVER|NOTIFY_EMAIL|NOTIFY_ON_SUCCESS|STRUCTURED_ART_SETS)
                 printf -v "RP_$key" '%s' "$val" ;;
             ART_ORDER_[A-Z0-9_]*|EXCLUDE_TAGS_[A-Z0-9_]*)
                 printf -v "RP_$key" '%s' "$val" ;;
@@ -269,7 +270,7 @@ rp_du_kb() {     # total KB used by the given paths (missing ones count as 0)
     local total=0 p k
     for p in "$@"; do
         [ -e "$p" ] || continue
-        k="$(du -sk "$p" 2>/dev/null | awk '{print $1}')"
+        k="$(du -skH "$p" 2>/dev/null | awk '{print $1}')"
         total=$((total + ${k:-0}))
     done
     echo "$total"
