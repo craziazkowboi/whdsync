@@ -46,6 +46,7 @@ DEBUG_MODE=0
 NO_DETOX=0
 SKIPCHK_OPT=0
 SKIP_VARIANT_SORT_OPT=0
+ONLY_MISSING_OPT=0
 SKIP_UPDATE=0
 FORCE_REBUILD=0   # set only by menu option 7: rebuild unconditionally,
                   # without even checking update.log's content first (the
@@ -377,6 +378,10 @@ while [ $# -gt 0 ]; do
       SKIP_VARIANT_SORT_OPT=1
       shift
       ;;
+    --only-missing)
+      ONLY_MISSING_OPT=1
+      shift
+      ;;
     --debug)
       DEBUG_MODE=1
       shift
@@ -573,6 +578,7 @@ build_merge_args() {
   [ -n "$ART_ORDER_OPT" ] && merge_args+=(--art "$ART_ORDER_OPT")
   [ -n "$DEMO_ART_OPT" ] && merge_args+=(--demo-art "$DEMO_ART_OPT")
   [ -n "$DEST_OPT" ] && merge_args+=(-d "$DEST_OPT")
+  [ "$ONLY_MISSING_OPT" -eq 1 ] && merge_args+=(--only-missing)
   [ "$DEBUG_MODE" -eq 1 ] && merge_args+=(--debug)
   return 0
 }

@@ -53,35 +53,38 @@ else
     echo "util-linux and should already be present; check your PATH." >&2
 fi
 
-# ----- Decide: single-extract full rebuild, or the original per-variant
-# path (needed for incremental updates into existing output) -----
+# ----- Decide which path to take -----
 #
 # Extracting the same archives three times (once per variant) into
-# retro_aga/retro_ecs/retro_rtg is pure waste when all three start from
-# nothing: decompression (lha/unlzx/7z) is the most expensive step in the
-# whole pipeline, while a plain filesystem copy of already-extracted files
-# is comparatively cheap. So when ALL THREE output directories are absent
-# (a genuinely fresh build) - or --clean was given, forcing one - this
-# extracts ONCE into retro_aga, copies that extracted-but-not-yet-merged
-# tree into retro_ecs and retro_rtg, then runs merge+sort separately for
-# each variant against its own copy.
+# retro_aga/retro_ecs/retro_rtg is pure waste: decompression (lha/unlzx/
+# 7z) is the most expensive step in the whole pipeline, while a plain
+# filesystem copy of already-extracted files is comparatively cheap. This
+# applies whether it's a fresh build (all archives) or an incremental
+# update (just the newly downloaded batch) - so both cases below extract
+# once and copy, rather than only the fresh-build case as before.
 #
-# The copy happens BEFORE merge, not after: copying the FULLY MERGED aga
-# tree and just re-running merge.sh for ecs/rtg would risk stale leftover
-# artwork - if AGA found a "Covers" image for some game but ECS only has
-# a "Titles" image for that same game, the two variants would name the
-# result differently (iGame.iff vs igame1.iff, by art-category priority),
-# so re-merging onto an already-merged tree could leave BOTH files sitting
-# side by side instead of only the correct one. Copying the clean,
-# unmerged extracted tree and letting each variant run its own full merge
-# avoids that entirely.
+# The copy always happens BEFORE merge, never after: copying an already
+# MERGED tree and just re-running merge.sh for ecs/rtg would risk stale
+# leftover artwork - if AGA found a "Covers" image for some game but ECS
+# only has a "Titles" image for that same game, the two variants would
+# name the result differently (iGame.iff vs igame1.iff, by art-category
+# priority), so re-merging onto an already-merged tree could leave BOTH
+# files sitting side by side instead of only the correct one. Copying the
+# clean, unmerged extracted tree and letting each variant run its own
+# full merge avoids that entirely.
 #
-# If any of the three already exist, this is an incremental update (or a
-# partial prior run) - the original aga.sh/ecs.sh/rtg.sh path already
-# handles that correctly (staging just the new files, merging into the
-# existing output) and isn't worth the risk of retrofitting here, since an
-# incremental run only extracts the small new-files batch anyway - the
-# saving this optimization targets barely applies there regardless.
+# Three states are distinguished:
+#   - none of the three outputs exist yet (or --clean was given): a
+#     genuinely fresh build - extract everything once, below.
+#   - all three already exist: an incremental update - stage and extract
+#     just the newly downloaded batch once, below.
+#   - a MIXED state (some exist, some don't, e.g. a partial prior run) -
+#     falls back to the original aga.sh/ecs.sh/rtg.sh path, which treats
+#     each variant according to its own actual state correctly. This is
+#     deliberately not optimized: it's a rare, edge-case state, and
+#     handling it wrong (e.g. giving a genuinely-missing variant only the
+#     latest incremental batch instead of a full history) would be worse
+#     than just accepting three extractions here.
 want_full_rebuild=0
 if [ ! -d retro_aga ] && [ ! -d retro_ecs ] && [ ! -d retro_rtg ]; then
     want_full_rebuild=1
@@ -93,10 +96,15 @@ for arg in "$@"; do
     fi
 done
 
-if [ "$want_full_rebuild" -ne 1 ]; then
-    echo "Existing output found for at least one variant - using the normal"
-    echo "per-variant incremental path (aga.sh/ecs.sh/rtg.sh) rather than the"
-    echo "single-extract optimization, which only applies to a fresh full build."
+all_exist=0
+if [ -d retro_aga ] && [ -d retro_ecs ] && [ -d retro_rtg ]; then
+    all_exist=1
+fi
+
+if [ "$want_full_rebuild" -ne 1 ] && [ "$all_exist" -ne 1 ]; then
+    echo "Mixed state (some but not all variant outputs exist) - using the"
+    echo "normal per-variant path (aga.sh/ecs.sh/rtg.sh) so each variant is"
+    echo "correctly treated as fresh or incremental on its own terms."
     echo
 
     echo "===== Variant 1 of 3: aga.sh ====="
@@ -125,6 +133,8 @@ if [ "$want_full_rebuild" -ne 1 ]; then
     echo "All 3 variants complete: retro_aga, retro_ecs, retro_rtg"
     exit 0
 fi
+
+if [ "$want_full_rebuild" -eq 1 ]; then
 
 echo "Fresh build for all three variants - extracting once and reusing the"
 echo "result for all three instead of extracting the same archives three times."
@@ -199,18 +209,113 @@ cp -a retro_aga retro_rtg
 
 echo
 echo "===== Variant 1 of 3: AGA artwork + sort ====="
-./start.sh --merge --aga --art Covers,Screens,Titles --no-detox "$@" --dest retro_aga
+./start.sh --merge --art Covers,Screens,Titles --no-detox "$@" --aga --dest retro_aga
 ./start.sh --sort --skipchk --no-detox "$@" --dest retro_aga
 
 echo
 echo "===== Variant 2 of 3: ECS artwork + sort ====="
-./start.sh --merge --ecs --art Covers,Screens,Titles --no-detox "$@" --dest retro_ecs
+./start.sh --merge --art Covers,Screens,Titles --no-detox "$@" --ecs --dest retro_ecs
 ./start.sh --sort --skipchk --no-detox "$@" --dest retro_ecs
 
 echo
 echo "===== Variant 3 of 3: RTG artwork + sort ====="
-./start.sh --merge --rtg --art Covers,Screens,Titles --no-detox "$@" --dest retro_rtg
+./start.sh --merge --art Covers,Screens,Titles --no-detox "$@" --rtg --dest retro_rtg
 ./start.sh --sort --skipchk --no-detox "$@" --dest retro_rtg
 
 echo
 echo "All 3 variants complete: retro_aga, retro_ecs, retro_rtg"
+
+else
+
+echo "Existing output found for all three variants - staging and extracting"
+echo "just the newly downloaded batch once, instead of once per variant."
+echo
+
+echo "===== Update check ====="
+if ./start.sh --update "$@"; then
+    update_status=0
+else
+    update_status=$?
+fi
+
+if [ "$update_status" -eq 3 ]; then
+    echo
+    echo "Stopping: update.sh reported a wget error (see above)." >&2
+    exit 1
+elif [ "$update_status" -eq 2 ]; then
+    echo
+    echo "Nothing new to download - nothing to build. Stopping."
+    exit 2
+elif [ "$update_status" -ne 0 ]; then
+    echo
+    echo "Stopping: update.sh failed unexpectedly (exit $update_status)." >&2
+    exit "$update_status"
+fi
+
+# Stage exactly the files update.log named this run, preserving their
+# relative layout (the same technique start.sh's own incremental --auto
+# path and quick.sh use), then extract that small batch ONCE - this is
+# the same waste as the fresh-build case, just on a smaller scale: a
+# handful of new archives extracted three times instead of once.
+TEMP_SRC_DIR="$SCRIPT_DIR/.staging_src_all_$$"
+STAGING_BASE="$SCRIPT_DIR/.staging_out_all_$$"
+rm -rf -- "$TEMP_SRC_DIR" "$STAGING_BASE"
+mkdir -p "$TEMP_SRC_DIR" "$STAGING_BASE"
+
+staged_any=0
+if [ -f update.log ]; then
+    while IFS= read -r logline; do
+        filepath=$(printf '%s\n' "$logline" | sed 's/^[0-9-]* [0-9:]* //')
+        [ -f "$filepath" ] || continue
+        relpath="${filepath#./}"
+        destpath="$TEMP_SRC_DIR/$relpath"
+        mkdir -p "$(dirname "$destpath")"
+        cp -f "$filepath" "$destpath" 2>/dev/null && staged_any=1
+    done < update.log
+fi
+
+if [ "$staged_any" -eq 0 ]; then
+    echo "Nothing to stage - update.log had no readable entries. Stopping."
+    rm -rf -- "$TEMP_SRC_DIR" "$STAGING_BASE"
+    exit 2
+fi
+
+echo
+echo "===== Extracting the new batch once (shared across all variants) ====="
+(cd "$TEMP_SRC_DIR" && bash "$SCRIPT_DIR/extract.sh" -d "$STAGING_BASE")
+rm -rf -- "$TEMP_SRC_DIR"
+
+echo
+echo "===== Compliance check (once, shared across all variants) ====="
+./start.sh --sort --skip-variant-sort --no-detox "$@" --dest "$STAGING_BASE"
+
+for variant in aga ecs rtg; do
+    dest="retro_$variant"
+    staging_copy="$SCRIPT_DIR/.staging_${variant}_batch_$$"
+    rm -rf -- "$staging_copy"
+    cp -a "$STAGING_BASE" "$staging_copy"
+
+    echo
+    echo "===== Variant: $variant (incremental) ====="
+    ./start.sh --merge --art Covers,Screens,Titles --no-detox "$@" --"$variant" --dest "$staging_copy"
+    ./start.sh --sort --skipchk --no-detox "$@" --dest "$staging_copy"
+
+    echo "Merging new batch into $dest..."
+    mkdir -p "$dest"
+    cp -a "$staging_copy/." "$dest/"
+
+    new_dir_name="new_${variant}"
+    rm -rf -- "$new_dir_name"
+    mv "$staging_copy" "$new_dir_name"
+    echo "New-files duplicate: $new_dir_name"
+
+    echo "Gap-fill artwork pass on $dest..."
+    ./start.sh --merge --art Covers,Screens,Titles --no-detox "$@" --"$variant" --dest "$dest" --only-missing
+done
+
+rm -rf -- "$STAGING_BASE"
+
+echo
+echo "All 3 variants updated: retro_aga, retro_ecs, retro_rtg"
+
+fi

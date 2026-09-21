@@ -72,7 +72,7 @@ Override with `--dest <path>` on any script/action.
 | `quick.sh` | Processes only newly downloaded files into a separate `new` directory, without touching the main collection. |
 | `all.sh` | Runs all three artwork variants (AGA, ECS, RTG) in one pass, extracting archives only once. |
 | `aga.sh` / `ecs.sh` / `rtg.sh` | One-liner wrappers around `start.sh --auto` for a single variant. |
-| `install_cron.sh` | Installs a weekly (Wednesday midnight) cron job that runs `all.sh`. |
+| `install_cron.sh` | Installs a daily (2am) cron job that runs `all.sh`. |
 
 ## start.sh (dispatcher)
 
@@ -192,7 +192,9 @@ Options: `--ecs` / `--aga` / `--rtg` / `--ecs-laced` / `--aga-laced` / `--set NA
 
 ## all.sh (all three variants in one pass)
 
-Runs AGA, ECS, and RTG end to end. For a **fresh build** (none of `retro_aga`/`retro_ecs`/`retro_rtg` exist yet, or `--clean` is given), it optimizes the pipeline instead of running each variant's full sequence independently:
+Runs AGA, ECS, and RTG end to end, always extracting archives once and reusing the result for all three variants rather than extracting the same archives three times — whether this is a fresh build or a routine incremental update, since that's the far more common case in practice (e.g. weekly cron runs).
+
+**Fresh build** (none of `retro_aga`/`retro_ecs`/`retro_rtg` exist yet, or `--clean` is given):
 
 1. Runs `update.sh` once.
 2. **Extracts archives once**, into `retro_aga` — not once per variant. Decompression is by far the most expensive step, so this alone roughly triples build speed for a fresh archive.
@@ -200,12 +202,14 @@ Runs AGA, ECS, and RTG end to end. For a **fresh build** (none of `retro_aga`/`r
 4. Copies that extracted-and-checked tree into `retro_ecs` and `retro_rtg` (a plain filesystem copy, much cheaper than re-extracting).
 5. Runs artwork merge + variant/language sorting **separately for each variant** against its own copy — this part genuinely differs per variant (different artwork, and each variant needs its own reorganization pass since the newly-merged artwork moves along with its game folder).
 
-If any of the three destinations already exist, this optimization is skipped in favour of the original, well-tested per-variant path (`aga.sh` → `ecs.sh --skip-update` → `rtg.sh --skip-update`), which handles incremental updates into existing collections — an incremental run only extracts the small newly-downloaded batch anyway, so the single-extraction optimization wouldn't meaningfully help there.
+**Incremental update** (all three destinations already exist): the same idea, applied to just the newly downloaded batch instead of the whole archive collection — stages and extracts only the files named in this run's `update.log` once, runs the compliance check on that small batch once, copies it into a per-variant working copy, merges and sorts each copy separately, then folds each into its real destination (plus a `--only-missing` gap-fill pass, same as the original per-variant path did).
+
+**Mixed state** (some but not all of the three destinations exist — a rare edge case, typically from an interrupted prior run): falls back to the original per-variant path (`aga.sh` → `ecs.sh --skip-update` → `rtg.sh --skip-update`), so each variant is correctly treated as fresh or incremental on its own terms rather than risking a genuinely-missing variant getting only the latest batch instead of its full history.
 
 Other behaviour:
 
 - Uses `flock` to refuse a second overlapping run (e.g. if cron fires while a previous run is still going).
-- Errors from all three variants (or all pipeline steps, in the optimized path) are accumulated into one `retroerror.log` for the whole run, and the end-of-run "view error log?" prompt is skipped even if a terminal is attached — answering it after variant one would otherwise stall the whole unattended pipeline waiting on input.
+- Errors from all three variants (or all pipeline steps, in the optimized paths) are accumulated into one `retroerror.log` for the whole run, and the end-of-run "view error log?" prompt is skipped even if a terminal is attached — answering it after variant one would otherwise stall the whole unattended pipeline waiting on input.
 
 ## aga.sh / ecs.sh / rtg.sh
 
@@ -219,10 +223,10 @@ One-liner wrappers for a single variant, forwarding any extra arguments through:
 
 ## install_cron.sh
 
-Installs a cron entry that runs `all.sh` every Wednesday at midnight, with output appended to `all_cron.log`:
+Installs a cron entry that runs `all.sh` every day at 2am, with output appended to `all_cron.log`:
 
 ```
-0 0 * * 3 cd "<script dir>" && ./all.sh >> "<script dir>/all_cron.log" 2>&1
+0 2 * * * cd "<script dir>" && ./all.sh >> "<script dir>/all_cron.log" 2>&1
 ```
 
 Idempotent — re-running it replaces the previous entry rather than adding a duplicate.
