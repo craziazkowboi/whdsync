@@ -31,6 +31,36 @@ set -euo pipefail
 version="3.0.0-ultimate"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Dependency tracking (for uninstall_deps.sh): records exactly what this
+# suite of scripts installs, so the uninstaller can later remove only
+# those specific things and leave anything already present on the system
+# - installed by the user, or by something else entirely - untouched.
+DEP_TRACK_FILE="$SCRIPT_DIR/.retroplay_installed_deps.log"
+record_installed_dep() {
+    local dep_line="$1:$2"
+    if ! grep -qxF "$dep_line" "$DEP_TRACK_FILE" 2>/dev/null; then
+        echo "$dep_line" >> "$DEP_TRACK_FILE"
+    fi
+}
+
+# True only if the package manager itself already has this package fully
+# installed. Checked BEFORE offering an install, so a package that was
+# already on the system (e.g. installed but its command isn't on PATH, as
+# with Homebrew's keg-only util-linux) is never recorded as installed by
+# these scripts - `apt-get install` / `brew install` both succeed as a
+# no-op in that case, which would otherwise make the uninstaller remove
+# something the user already had. dpkg-query's "install ok installed" is
+# used instead of plain `dpkg -s`, which also succeeds for packages that
+# were removed but left their config files behind.
+pkg_already_installed() {
+    case "$1" in
+        apt)  dpkg-query -W -f='${Status}' "$2" 2>/dev/null | grep -q "install ok installed" ;;
+        brew) command -v brew >/dev/null 2>&1 && brew list --versions "$2" >/dev/null 2>&1 ;;
+        *)    return 1 ;;
+    esac
+}
+
 DEFAULT_DEST="${DEST:-$SCRIPT_DIR/retro}"
 DEST_OVERRIDE=""
 DEST="$DEFAULT_DEST"
@@ -386,7 +416,8 @@ elif [ -t 0 ]; then
         read -r reply
         case "$reply" in
             [Yy]*)
-                brew install detox
+                _had=0; pkg_already_installed brew detox && _had=1
+                brew install detox && [ "$_had" -eq 0 ] && record_installed_dep "brew" "detox"
                 if command -v detox >/dev/null 2>&1; then
                     echo "Pre-cleaning filenames with detox in: $DEST"
                     detox -r -s utf_8 "$DEST" >/dev/null 2>&1

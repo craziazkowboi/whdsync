@@ -15,6 +15,7 @@ A collection of Bash scripts to automate downloading, extracting, merging artwor
 - After downloading the scripts into a directory, run `chmod +x *.sh` to make them executable.
 - All scripts move and rename files as part of normal operation. Keep backups of your WHDLoad tree before first use.
 - This README intentionally avoids including any copyrighted third-party content and only describes the behaviour of the provided scripts.
+- Every script can be run from any directory (e.g. `~/retroplay/aga.sh` from your home directory) — each one switches to its own directory first.
 - Bash 3.2+ is supported everywhere **except** `merge.sh`, which needs Bash 4+ (associative arrays). On macOS, `merge.sh` automatically re-launches itself under a Homebrew Bash if one is available; if not, it exits with an install hint (`brew install bash`).
 
 ## Prerequisites
@@ -22,12 +23,16 @@ A collection of Bash scripts to automate downloading, extracting, merging artwor
 - **wget** – for `update.sh`.
 - **lha**, **unlzx**, **7z** (p7zip-full), **unar** – for `extract.sh`.
 - **detox** (optional) – for filename pre-cleaning in `sort.sh`; skip with `--no-detox` if not installed or not wanted.
-- **flock** (optional but recommended) – lets `all.sh` refuse to run a second overlapping instance (e.g. if cron fires while a previous run is still going).
+- **flock** (recommended) – lets `all.sh` refuse to run a second overlapping instance (e.g. if cron fires while a previous run is still going). Provided by `util-linux`; `all.sh` offers to install it if missing. On macOS, Homebrew installs it keg-only (not on `PATH`) — `all.sh` finds it via `brew --prefix util-linux` automatically, no `PATH` changes needed.
 - On Linux, make sure at least these locales are generated for extract.sh's encoding fallback chain:
   - `C.UTF-8`
   - `en_US.ISO-8859-1`
 
 Each script offers to auto-install missing tools via `apt` (Linux) or `brew` (macOS) when run interactively; under cron or any other non-interactive context, it prints what's missing and continues without prompting.
+
+Every install these scripts perform is recorded in `.retroplay_installed_deps.log`, so `uninstall_deps.sh` can later remove exactly those — and nothing else. A package is only recorded if the package manager confirms it was **not** already installed beforehand, so anything you already had (including a package that was installed but not on your `PATH`) is never touched by the uninstaller.
+
+`unlzx` has no apt/brew package and must be built from source ([Aminet](https://aminet.net/package/util/arc/unlzx)); the scripts print build instructions if it's missing.
 
 ## Artwork directory layout
 
@@ -73,6 +78,7 @@ Override with `--dest <path>` on any script/action.
 | `all.sh` | Runs all three artwork variants (AGA, ECS, RTG) in one pass, extracting archives only once. |
 | `aga.sh` / `ecs.sh` / `rtg.sh` | One-liner wrappers around `start.sh --auto` for a single variant. |
 | `install_cron.sh` | Installs a daily (2am) cron job that runs `all.sh`. |
+| `uninstall_deps.sh` | Removes only the dependencies these scripts themselves installed. |
 
 ## start.sh (dispatcher)
 
@@ -186,13 +192,13 @@ Options:
 
 ## quick.sh (incremental processing)
 
-Runs `extract.sh → merge.sh → sort.sh` on only the files named in the most recent `update.log`, into a separate `new` directory (override with `-d`/`--dest`) rather than touching your main collection — useful for previewing what a batch of new downloads looks like before folding it into the real archive.
+Runs `extract.sh → merge.sh → sort.sh` on only the files named in the most recent `update.log`, into a separate `new` directory (override with `-d`/`--dest`; a relative path is resolved against the scripts' directory) rather than touching your main collection — useful for previewing what a batch of new downloads looks like before folding it into the real archive.
 
 Options: `--ecs` / `--aga` / `--rtg` / `--ecs-laced` / `--aga-laced` / `--set NAME` (mutually exclusive, last one wins), `--art`, `--demo-art`, `--no-detox`, `-d`/`--dest`, `--skip-update`, `-h`/`--help`.
 
 ## all.sh (all three variants in one pass)
 
-Runs AGA, ECS, and RTG end to end, always extracting archives once and reusing the result for all three variants rather than extracting the same archives three times — whether this is a fresh build or a routine incremental update, since that's the far more common case in practice (e.g. weekly cron runs).
+Runs AGA, ECS, and RTG end to end, always extracting archives once and reusing the result for all three variants rather than extracting the same archives three times — whether this is a fresh build or a routine incremental update, since that's the far more common case in practice (e.g. the nightly cron run).
 
 **Fresh build** (none of `retro_aga`/`retro_ecs`/`retro_rtg` exist yet, or `--clean` is given):
 
@@ -231,6 +237,20 @@ Installs a cron entry that runs `all.sh` every day at 2am, with output appended 
 
 Idempotent — re-running it replaces the previous entry rather than adding a duplicate.
 
+## uninstall_deps.sh
+
+Removes **only** the tools these scripts auto-installed for you (when you answered `y` to an install prompt), working entirely from `.retroplay_installed_deps.log`. It never guesses: if a package isn't in that file, it isn't touched — so anything that was on your system before these scripts ran is left alone.
+
+- `apt` packages are removed with `sudo apt-get remove`, `brew` packages with `brew uninstall`, and a from-source detox build by deleting the exact binary it installed.
+- Each removal is confirmed individually unless `--yes` is given.
+- Successfully removed items are deleted from the tracking file; anything skipped or failed stays there, so re-running retries just those.
+
+Options:
+
+- `--yes`, `-y` — Remove everything tracked without per-item prompts (required for non-interactive use).
+- `--dry-run` — Show what would be removed, without changing anything.
+- `-h`, `--help` — Show help.
+
 ## Typical usage
 
 ```bash
@@ -243,6 +263,10 @@ Idempotent — re-running it replaces the previous entry rather than adding a du
 # Preview what a batch of new downloads contains before committing to it
 ./quick.sh --aga
 
-# Set up unattended weekly updates
+# Set up unattended daily (2am) updates
 ./install_cron.sh
+
+# Later: remove only the dependencies these scripts installed
+./uninstall_deps.sh --dry-run
+./uninstall_deps.sh
 ```

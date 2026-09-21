@@ -31,6 +31,60 @@ cd "$SCRIPT_DIR" || { echo "ERROR: cannot cd to script directory: $SCRIPT_DIR" >
 rm -f -- "$SCRIPT_DIR/retroerror.log"
 export RETROPLAY_ALL_SH=1
 
+# ----- Dependency tracking (for the uninstaller) -----
+# Records exactly what THIS suite of scripts installs, so uninstall_deps.sh
+# can later remove only those specific things and leave anything that was
+# already present on the system - installed by the user, or by something
+# else entirely - untouched. Format: one "<method>:<name>" per line, where
+# method is apt, brew, or source-build (name is the installed file's full
+# path for source-build, since there's no package manager entry to remove).
+DEP_TRACK_FILE="$SCRIPT_DIR/.retroplay_installed_deps.log"
+record_installed_dep() {
+    local dep_line="$1:$2"
+    if ! grep -qxF "$dep_line" "$DEP_TRACK_FILE" 2>/dev/null; then
+        echo "$dep_line" >> "$DEP_TRACK_FILE"
+    fi
+}
+
+# True only if the package manager itself already has this package fully
+# installed. Checked BEFORE offering an install, so a package that was
+# already on the system (e.g. installed but its command isn't on PATH, as
+# with Homebrew's keg-only util-linux) is never recorded as installed by
+# these scripts - `apt-get install` / `brew install` both succeed as a
+# no-op in that case, which would otherwise make the uninstaller remove
+# something the user already had. dpkg-query's "install ok installed" is
+# used instead of plain `dpkg -s`, which also succeeds for packages that
+# were removed but left their config files behind.
+pkg_already_installed() {
+    case "$1" in
+        apt)  dpkg-query -W -f='${Status}' "$2" 2>/dev/null | grep -q "install ok installed" ;;
+        brew) command -v brew >/dev/null 2>&1 && brew list --versions "$2" >/dev/null 2>&1 ;;
+        *)    return 1 ;;
+    esac
+}
+
+OS_TYPE="$(uname -s | tr '[:upper:]' '[:lower:]')"
+
+# Resolves a usable flock binary, including macOS's keg-only Homebrew
+# util-linux install (Homebrew doesn't symlink flock into PATH there,
+# since it would shadow other things) - checked before concluding flock
+# is genuinely missing and needs installing.
+resolve_flock() {
+    if command -v flock >/dev/null 2>&1; then
+        printf 'flock'
+        return 0
+    fi
+    if [[ "$OS_TYPE" == "darwin" ]] && command -v brew >/dev/null 2>&1; then
+        local prefix
+        prefix="$(brew --prefix util-linux 2>/dev/null)"
+        if [ -n "$prefix" ] && [ -x "$prefix/bin/flock" ]; then
+            printf '%s/bin/flock' "$prefix"
+            return 0
+        fi
+    fi
+    return 1
+}
+
 # ----- Prevent overlapping runs -----
 # If a previous cron-triggered run is somehow still going (e.g. an
 # unusually slow week, or someone manually starts one while cron's is
@@ -40,17 +94,55 @@ export RETROPLAY_ALL_SH=1
 # device. flock makes a second concurrent instance exit immediately
 # instead of piling up.
 LOCK_FILE="$SCRIPT_DIR/.all.lock"
-if command -v flock >/dev/null 2>&1; then
+FLOCK_BIN="$(resolve_flock || true)"
+
+if [ -z "$FLOCK_BIN" ] && [ -t 0 ]; then
+    echo "'flock' was not found - it's needed to guarantee only one all.sh"
+    echo "instance runs at a time (e.g. so cron can't overlap a still-running pass)."
+    if [[ "$OS_TYPE" == "darwin" ]]; then
+        printf 'Install it now via Homebrew (brew install util-linux)? [y/N] '
+    else
+        printf 'Install it now via apt (sudo apt install util-linux)? [y/N] '
+    fi
+    read -r _flock_reply
+    case "$_flock_reply" in
+        [Yy]*)
+            if [[ "$OS_TYPE" == "darwin" ]]; then
+                _had=0; pkg_already_installed brew util-linux && _had=1
+                if brew install util-linux && [ "$_had" -eq 0 ]; then
+                    record_installed_dep "brew" "util-linux"
+                fi
+            else
+                _had=0; pkg_already_installed apt util-linux && _had=1
+                if sudo apt-get update && sudo apt-get install -y util-linux && [ "$_had" -eq 0 ]; then
+                    record_installed_dep "apt" "util-linux"
+                fi
+            fi
+            FLOCK_BIN="$(resolve_flock || true)"
+            ;;
+    esac
+    unset _flock_reply
+fi
+
+if [ -n "$FLOCK_BIN" ]; then
     exec 9>"$LOCK_FILE"
-    if ! flock -n 9; then
+    if ! "$FLOCK_BIN" -n 9; then
         echo "Another all.sh is already running (lock file: $LOCK_FILE)." >&2
         echo "Exiting rather than run a second instance at the same time." >&2
         exit 1
     fi
 else
     echo "Warning: 'flock' not found - cannot guarantee only one instance of" >&2
-    echo "all.sh runs at a time. On Debian/Raspberry Pi OS this ships in" >&2
-    echo "util-linux and should already be present; check your PATH." >&2
+    echo "all.sh runs at a time." >&2
+    if [[ "$OS_TYPE" == "darwin" ]]; then
+        echo "Install it with: brew install util-linux" >&2
+        echo "(Homebrew installs flock keg-only there - this script finds it via" >&2
+        echo "'brew --prefix util-linux' automatically once installed, no PATH" >&2
+        echo "changes needed.)" >&2
+    else
+        echo "On Debian/Raspberry Pi OS this ships in util-linux and should" >&2
+        echo "already be present: sudo apt install util-linux" >&2
+    fi
 fi
 
 # ----- Decide which path to take -----

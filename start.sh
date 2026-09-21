@@ -24,6 +24,35 @@ script_start_time=$(date +%s)
 # where the caller's shell happened to be (previously this used bare "./x.sh"
 # calls that only worked if you'd already cd'ed into the scripts' folder).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Dependency tracking (for uninstall_deps.sh): records exactly what this
+# suite of scripts installs, so the uninstaller can later remove only
+# those specific things and leave anything already present on the system
+# - installed by the user, or by something else entirely - untouched.
+DEP_TRACK_FILE="$SCRIPT_DIR/.retroplay_installed_deps.log"
+record_installed_dep() {
+    local dep_line="$1:$2"
+    if ! grep -qxF "$dep_line" "$DEP_TRACK_FILE" 2>/dev/null; then
+        echo "$dep_line" >> "$DEP_TRACK_FILE"
+    fi
+}
+
+# True only if the package manager itself already has this package fully
+# installed. Checked BEFORE offering an install, so a package that was
+# already on the system (e.g. installed but its command isn't on PATH, as
+# with Homebrew's keg-only util-linux) is never recorded as installed by
+# these scripts - `apt-get install` / `brew install` both succeed as a
+# no-op in that case, which would otherwise make the uninstaller remove
+# something the user already had. dpkg-query's "install ok installed" is
+# used instead of plain `dpkg -s`, which also succeeds for packages that
+# were removed but left their config files behind.
+pkg_already_installed() {
+    case "$1" in
+        apt)  dpkg-query -W -f='${Status}' "$2" 2>/dev/null | grep -q "install ok installed" ;;
+        brew) command -v brew >/dev/null 2>&1 && brew list --versions "$2" >/dev/null 2>&1 ;;
+        *)    return 1 ;;
+    esac
+}
 cd "$SCRIPT_DIR" || { echo "ERROR: cannot cd to script directory: $SCRIPT_DIR" >&2; exit 1; }
 NEW_DIR="${SCRIPT_DIR}/new"
 
@@ -80,9 +109,11 @@ offer_install_pkg() {
   case "$reply" in
     [Yy]*)
       if [[ "$OS_TYPE" == "darwin" ]]; then
-        brew install "$brew_pkg"
+        local _had=0; pkg_already_installed brew "$brew_pkg" && _had=1
+        brew install "$brew_pkg" && [ "$_had" -eq 0 ] && record_installed_dep "brew" "$brew_pkg"
       else
-        sudo apt-get update && sudo apt-get install -y "$apt_pkg"
+        local _had=0; pkg_already_installed apt "$apt_pkg" && _had=1
+        sudo apt-get update && sudo apt-get install -y "$apt_pkg" && [ "$_had" -eq 0 ] && record_installed_dep "apt" "$apt_pkg"
       fi
       ;;
     *)
@@ -108,10 +139,32 @@ offer_build_detox() {
   esac
   local build_dir
   build_dir="$(mktemp -d)" || return 1
+
+  # If a detox binary already exists where `make install` will put it (e.g.
+  # an older pre-3.0 version the user installed themselves), it gets
+  # upgraded in place - but it was NOT originally installed by these
+  # scripts, so it must not be tracked for the uninstaller to delete later.
+  local detox_preexisted=0
+  [ -e /usr/local/bin/detox ] && detox_preexisted=1
+
+  # Only install build-dependency packages that are genuinely missing -
+  # checked individually via dpkg, since blindly apt-installing the whole
+  # list would make it look like THIS script installed something (e.g.
+  # gcc, make) that was actually already on the system beforehand, which
+  # the uninstaller would then wrongly remove later.
+  local build_deps=(git autoconf automake bison flex gcc make pkg-config)
+  local deps_to_install=()
+  local dep
+  for dep in "${build_deps[@]}"; do
+    pkg_already_installed apt "$dep" || deps_to_install+=("$dep")
+  done
+
   (
     set -e
-    sudo apt-get update
-    sudo apt-get install -y git autoconf automake bison flex gcc make pkg-config
+    if [ ${#deps_to_install[@]} -gt 0 ]; then
+        sudo apt-get update
+        sudo apt-get install -y "${deps_to_install[@]}"
+    fi
     cd "$build_dir"
     wget -q https://github.com/dharple/detox/releases/download/v3.0.1/detox-3.0.1.tar.gz
     tar xzf detox-3.0.1.tar.gz
@@ -122,6 +175,18 @@ offer_build_detox() {
   )
   local build_status=$?
   rm -rf "$build_dir"
+  if [ "$build_status" -eq 0 ]; then
+    for dep in "${deps_to_install[@]+"${deps_to_install[@]}"}"; do
+        record_installed_dep "apt" "$dep"
+    done
+    # `make install` for this package's Makefile puts the binary at
+    # /usr/local/bin/detox - tracked as source-build (a plain file path)
+    # since there's no package manager entry for uninstall_deps.sh to
+    # remove it through.
+    if [ "$detox_preexisted" -eq 0 ] && [ -x /usr/local/bin/detox ]; then
+        record_installed_dep "source-build" "/usr/local/bin/detox"
+    fi
+  fi
   [ "$build_status" -eq 0 ] && command -v detox >/dev/null 2>&1
 }
 

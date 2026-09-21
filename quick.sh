@@ -32,6 +32,7 @@ else
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR" || { echo "ERROR: cannot cd to script directory: $SCRIPT_DIR" >&2; exit 1; }
 NEWDIR="$SCRIPT_DIR/new"
 UPDATE_LOG="$SCRIPT_DIR/update.log"
 DEST_OPT=""      # holds just the path, if the user gave one
@@ -159,6 +160,27 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 unset opt_lc
+
+# If the caller gave --dest/-d, that's where extract/merge/sort should all
+# actually work - NEWDIR previously stayed hardcoded to "$SCRIPT_DIR/new"
+# regardless of --dest, so extract.sh and merge.sh silently ignored a
+# custom destination entirely (only the final sort step tried to honor
+# it, by which point extract/merge had already put everything in the
+# default "new" directory instead, leaving sort with nothing to do there).
+#
+# A relative --dest is resolved against SCRIPT_DIR, not just used as-is:
+# this script later does `cd "$temp_extract_dir"` before calling
+# extract.sh, so a bare relative path passed through unchanged would
+# resolve against THAT temporary directory instead of where the user
+# meant it, and everything extracted would vanish when the temp
+# directory is cleaned up afterward - a real data-loss trap, not just a
+# cosmetic path issue.
+if [ -n "$DEST_OPT" ]; then
+    case "$DEST_OPT" in
+        /*) NEWDIR="$DEST_OPT" ;;
+        *)  NEWDIR="$SCRIPT_DIR/$DEST_OPT" ;;
+    esac
+fi
 
 echo -e "${BOLD}========================================${NC}"
 echo -e "${BOLD}Amiga Retroplay Quick Processor v${version}${NC}"
@@ -306,7 +328,7 @@ echo
 # the patch silently never applied and this step operated on the *main*
 # collection instead of the staging directory. Passing -d directly is both
 # correct and simpler.)
-sort_target="${DEST_OPT:-$NEWDIR}"
+sort_target="$NEWDIR"
 sort_args=(-d "$sort_target")
 if [ "$NO_DETOX" -eq 1 ]; then
   sort_args+=(--no-detox)
