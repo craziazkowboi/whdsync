@@ -33,6 +33,9 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || { echo "ERROR: cannot cd to script directory: $SCRIPT_DIR" >&2; exit 1; }
+[ -f "$SCRIPT_DIR/lib.sh" ] || { echo "ERROR: lib.sh is missing from $SCRIPT_DIR" >&2; exit 1; }
+. "$SCRIPT_DIR/lib.sh"
+rp_load_config
 NEWDIR="$SCRIPT_DIR/new"
 UPDATE_LOG="$SCRIPT_DIR/update.log"
 DEST_OPT=""      # holds just the path, if the user gave one
@@ -252,6 +255,9 @@ echo
 temp_extract_dir="$SCRIPT_DIR/.temp_new_archives"
 rm -rf "$temp_extract_dir"
 mkdir -p "$temp_extract_dir"
+# Removed however the script ends - normally, on an error, or interrupted.
+trap 'rm -rf "$temp_extract_dir"' EXIT
+trap 'exit 130' INT TERM
 
 # Parse update.log and copy new archives while preserving directory structure
 while IFS= read -r line; do
@@ -268,7 +274,9 @@ done < "$UPDATE_LOG"
 
 # Run extract.sh on the temporary directory
 cd "$temp_extract_dir" || exit 1
-bash "$SCRIPT_DIR/extract.sh" -d "$NEWDIR"
+# ECS builds leave out AGA/CD32 releases (EXCLUDE_TAGS_ECS in retroplay.conf).
+quick_excl="$(rp_exclude_tags_for "${MODE_OPT#--}")"
+bash "$SCRIPT_DIR/extract.sh" -d "$NEWDIR" ${quick_excl:+--exclude-tags "$quick_excl"}
 extract_exit=$?
 cd "$SCRIPT_DIR" || exit 1
 rm -rf "$temp_extract_dir"

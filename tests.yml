@@ -1,0 +1,31 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            shell: bash
+          # macOS runs the scripts with the stock /bin/bash 3.2 on purpose -
+          # that's what most Macs have. Homebrew bash is installed only
+          # because merge.sh needs bash 4+ (it relaunches itself under it).
+          - os: macos-latest
+            shell: /bin/bash
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bash 4+ and flock (macOS)
+        if: runner.os == 'macOS'
+        run: brew install bash util-linux
+      - name: Show bash version used
+        run: ${{ matrix.shell }} --version | head -1
+      - name: Syntax check every script
+        run: for f in *.sh tests/*.sh; do ${{ matrix.shell }} -n "$f" || exit 1; done
+      - name: Run the test suite
+        run: ${{ matrix.shell }} tests/run_tests.sh -v

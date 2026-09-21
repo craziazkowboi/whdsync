@@ -32,34 +32,14 @@ version="3.0.0-ultimate"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Dependency tracking (for uninstall_deps.sh): records exactly what this
-# suite of scripts installs, so the uninstaller can later remove only
-# those specific things and leave anything already present on the system
-# - installed by the user, or by something else entirely - untouched.
-DEP_TRACK_FILE="$SCRIPT_DIR/.retroplay_installed_deps.log"
-record_installed_dep() {
-    local dep_line="$1:$2"
-    if ! grep -qxF "$dep_line" "$DEP_TRACK_FILE" 2>/dev/null; then
-        echo "$dep_line" >> "$DEP_TRACK_FILE"
-    fi
-}
-
-# True only if the package manager itself already has this package fully
-# installed. Checked BEFORE offering an install, so a package that was
-# already on the system (e.g. installed but its command isn't on PATH, as
-# with Homebrew's keg-only util-linux) is never recorded as installed by
-# these scripts - `apt-get install` / `brew install` both succeed as a
-# no-op in that case, which would otherwise make the uninstaller remove
-# something the user already had. dpkg-query's "install ok installed" is
-# used instead of plain `dpkg -s`, which also succeeds for packages that
-# were removed but left their config files behind.
-pkg_already_installed() {
-    case "$1" in
-        apt)  dpkg-query -W -f='${Status}' "$2" 2>/dev/null | grep -q "install ok installed" ;;
-        brew) command -v brew >/dev/null 2>&1 && brew list --versions "$2" >/dev/null 2>&1 ;;
-        *)    return 1 ;;
-    esac
-}
+# Shared helpers (retroplay.conf settings, dependency tracking, pending
+# queues, disk-space checks...) live in lib.sh, next to this script.
+if [ ! -f "$SCRIPT_DIR/lib.sh" ]; then
+    echo "ERROR: lib.sh is missing from $SCRIPT_DIR - it ships with these scripts." >&2
+    exit 1
+fi
+. "$SCRIPT_DIR/lib.sh"
+rp_load_config
 
 DEFAULT_DEST="${DEST:-$SCRIPT_DIR/retro}"
 DEST_OVERRIDE=""
@@ -79,6 +59,18 @@ fi
 
 declare -a sort_summary=()
 trap 'exit 130' INT TERM
+# Remove this run's temporary folder however the script ends (normal finish,
+# error, or interrupted), after stopping any compliance-check workers.
+compliance_tmpdir=""
+cleanup_sort() {
+    local st=$?
+    trap - EXIT
+    pkill -P $$ 2>/dev/null || true
+    wait 2>/dev/null || true
+    [ -n "${compliance_tmpdir:-}" ] && rm -rf -- "$compliance_tmpdir"
+    exit "$st"
+}
+trap cleanup_sort EXIT
 
 BAR_WIDTH=50
 processed=0
@@ -950,7 +942,9 @@ if [ "$RUN_COMPLIANCE_CHECK" = true ]; then
     if [ "$total_files" -eq 0 ]; then
         echo "✓ No files to check."
     else
+        rp_sweep_stale_temp "${TMPDIR:-/tmp}"/sort_compliance.*
         compliance_tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/sort_compliance.XXXXXX")"
+        rp_mark_temp_owner "$compliance_tmpdir"
 
         chunk_size=$(( (total_files + NUM_JOBS - 1) / NUM_JOBS ))
         [ "$chunk_size" -lt 1 ] && chunk_size=1

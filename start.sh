@@ -25,34 +25,14 @@ script_start_time=$(date +%s)
 # calls that only worked if you'd already cd'ed into the scripts' folder).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Dependency tracking (for uninstall_deps.sh): records exactly what this
-# suite of scripts installs, so the uninstaller can later remove only
-# those specific things and leave anything already present on the system
-# - installed by the user, or by something else entirely - untouched.
-DEP_TRACK_FILE="$SCRIPT_DIR/.retroplay_installed_deps.log"
-record_installed_dep() {
-    local dep_line="$1:$2"
-    if ! grep -qxF "$dep_line" "$DEP_TRACK_FILE" 2>/dev/null; then
-        echo "$dep_line" >> "$DEP_TRACK_FILE"
-    fi
-}
-
-# True only if the package manager itself already has this package fully
-# installed. Checked BEFORE offering an install, so a package that was
-# already on the system (e.g. installed but its command isn't on PATH, as
-# with Homebrew's keg-only util-linux) is never recorded as installed by
-# these scripts - `apt-get install` / `brew install` both succeed as a
-# no-op in that case, which would otherwise make the uninstaller remove
-# something the user already had. dpkg-query's "install ok installed" is
-# used instead of plain `dpkg -s`, which also succeeds for packages that
-# were removed but left their config files behind.
-pkg_already_installed() {
-    case "$1" in
-        apt)  dpkg-query -W -f='${Status}' "$2" 2>/dev/null | grep -q "install ok installed" ;;
-        brew) command -v brew >/dev/null 2>&1 && brew list --versions "$2" >/dev/null 2>&1 ;;
-        *)    return 1 ;;
-    esac
-}
+# Shared helpers (retroplay.conf settings, dependency tracking, pending
+# queues, disk-space checks...) live in lib.sh, next to this script.
+if [ ! -f "$SCRIPT_DIR/lib.sh" ]; then
+    echo "ERROR: lib.sh is missing from $SCRIPT_DIR - it ships with these scripts." >&2
+    exit 1
+fi
+. "$SCRIPT_DIR/lib.sh"
+rp_load_config
 cd "$SCRIPT_DIR" || { echo "ERROR: cannot cd to script directory: $SCRIPT_DIR" >&2; exit 1; }
 NEW_DIR="${SCRIPT_DIR}/new"
 
@@ -77,13 +57,13 @@ SKIPCHK_OPT=0
 SKIP_VARIANT_SORT_OPT=0
 ONLY_MISSING_OPT=0
 SKIP_UPDATE=0
-FORCE_REBUILD=0   # set only by menu option 7: rebuild unconditionally,
-                  # without even checking update.log's content first (the
-                  # whole point of that option is "just rebuild from
-                  # whatever's on disk now" - unlike --skip-update on its
-                  # own, which still checks update.log so all.sh's
-                  # variant-chaining can tell whether anything was new).
 CLEAN_OPT=0
+REBUILD_OPT=0        # --rebuild: rebuild from downloaded archives, no update check
+FORCE_OPT=0          # --force: also run the artwork gap-fill on up-to-date variants
+REPORT_MISSING_OPT=""  # --report-missing FILE (passed to merge.sh)
+DETOX_EXPLICIT=""    # "yes"/"no" when --detox/--no-detox was given
+DELEGATED_AUTO=0
+AUTO_EXIT=0
 NOTHING_NEW_FALLBACK=0
 
 # Basic environment / colors (no color for now)
@@ -216,6 +196,12 @@ if [ ${#missing[@]} -ne 0 ]; then
     if [ ${#still_missing[@]} -ne 0 ]; then
         echo
         echo "Still missing: ${still_missing[*]}"
+        if [ ! -t 0 ]; then
+            echo "Note: this is an unattended run (e.g. cron), which starts with a minimal PATH."
+            echo "If the tool works in your terminal, run ./install_cron.sh again from that"
+            echo "terminal (or any script once, interactively) so its folder is remembered."
+        fi
+
         if [[ "$OS_TYPE" == "darwin" ]]; then
             echo "Install via Homebrew (macOS): brew install ${still_missing[*]}"
             echo "Also: brew install coreutils (for greadlink)"
@@ -269,12 +255,16 @@ fi
 # pre-scan of the raw arguments for --no-detox here rather than moving the
 # whole dependency-check block after parsing.
 _no_detox_requested=0
+[ "$RP_USE_DETOX" = "no" ] && _no_detox_requested=1      # retroplay.conf default
 for _a in "$@"; do
-    [ "$_a" = "--no-detox" ] && _no_detox_requested=1 && break
+    case "$(printf '%s' "$_a" | tr '[:upper:]' '[:lower:]')" in
+        --no-detox) _no_detox_requested=1 ;;
+        --detox)    _no_detox_requested=0 ;;
+    esac
 done
 
 if [ "$_no_detox_requested" -eq 1 ]; then
-    echo "Skipping detox dependency check (--no-detox given)."
+    :   # detox not wanted (--no-detox, or USE_DETOX=no in retroplay.conf)
 elif [[ "$OS_TYPE" != "darwin" ]]; then
   detox_ok=0
   if command -v detox >/dev/null 2>&1; then
@@ -358,6 +348,14 @@ while [ $# -gt 0 ]; do
       echo "                        into CD32/AGA/NTSC/MT32/CDTV and language subfolders -"
       echo "                        for when that reorganization was already done earlier"
       echo "                        on a shared base tree)."
+      echo "  --rebuild             Rebuild from the archives already downloaded, without"
+      echo "                        checking for updates (with --auto's variant options)."
+      echo "  --clean               With --auto: check for updates, then rebuild from scratch."
+      echo "  --skip-update         With --auto: don't download; process what's already queued."
+      echo "  --force               With --auto: also fill in missing artwork when up to date."
+      echo "  --detox               Use detox even if retroplay.conf says USE_DETOX=no."
+      echo "  --report-missing FILE With --merge: list games that got no artwork in FILE."
+      echo "  --doctor              Check the setup and explain how to fix any problems."
       echo "  --debug               Enable debug output (also passed to extract.sh/merge.sh)."
       echo "  --exit                Exit immediately."
       echo
@@ -433,7 +431,29 @@ while [ $# -gt 0 ]; do
       ;;
     --no-detox)
       NO_DETOX=1
+      DETOX_EXPLICIT=no
       shift
+      ;;
+    --detox)
+      NO_DETOX=0
+      DETOX_EXPLICIT=yes
+      shift
+      ;;
+    --rebuild)
+      ACTION="auto"
+      REBUILD_OPT=1
+      shift
+      ;;
+    --force)
+      FORCE_OPT=1
+      shift
+      ;;
+    --report-missing)
+      REPORT_MISSING_OPT="$2"
+      shift 2
+      ;;
+    --doctor)
+      exec "$SCRIPT_DIR/doctor.sh"
       ;;
     --skipchk)
       SKIPCHK_OPT=1
@@ -492,11 +512,12 @@ if [ -z "$ACTION" ]; then
   echo "  4) Merge artwork"
   echo "  5) Sort languages"
   echo "  6) Quick (process new files)"
-  echo "  7) Full rebuild, skip update (update already ran, or use option 1 instead)"
+  echo "  7) Rebuild from downloaded archives (no update check)"
+  echo "  8) Check setup (doctor)"
   echo "  0) Exit"
   echo
 
-  printf "Enter choice [0-7]: "
+  printf "Enter choice [0-8]: "
   # 3-minute timeout: if this menu is here because --auto's own update.sh
   # found nothing new (NOTHING_NEW_FALLBACK), don't wait forever for a
   # human who isn't there - and propagate that "nothing happened" outcome
@@ -534,8 +555,10 @@ if [ -z "$ACTION" ]; then
       ;;
     7)
       ACTION="auto"
-      SKIP_UPDATE=1
-      FORCE_REBUILD=1
+      REBUILD_OPT=1
+      ;;
+    8)
+      exec "$SCRIPT_DIR/doctor.sh"
       ;;
     0|"")
       echo "Exiting."
@@ -644,6 +667,7 @@ build_merge_args() {
   [ -n "$DEMO_ART_OPT" ] && merge_args+=(--demo-art "$DEMO_ART_OPT")
   [ -n "$DEST_OPT" ] && merge_args+=(-d "$DEST_OPT")
   [ "$ONLY_MISSING_OPT" -eq 1 ] && merge_args+=(--only-missing)
+  [ -n "$REPORT_MISSING_OPT" ] && merge_args+=(--report-missing "$REPORT_MISSING_OPT")
   [ "$DEBUG_MODE" -eq 1 ] && merge_args+=(--debug)
   return 0
 }
@@ -686,6 +710,15 @@ build_quick_args() {
 # --auto's update -> extract -> merge -> sort) things are. TOTAL_STEPS
 # depends on which ACTION was chosen - --auto runs 4 sub-scripts, every
 # other single action runs exactly 1.
+# Standalone --sort / --merge use the retroplay.conf defaults when no option
+# was given (--auto passes only what was given explicitly - all.sh applies
+# the config itself).
+if [ "$ACTION" != "auto" ]; then
+  [ -z "$SORT_OPT" ] && SORT_OPT="--$RP_FILESYSTEM"
+  [ -z "$ART_ORDER_OPT" ] && ART_ORDER_OPT="$RP_ART_ORDER"
+  [ -z "$DEMO_ART_OPT" ] && DEMO_ART_OPT="$RP_DEMO_ART_ORDER"
+fi
+
 case "$ACTION" in
   auto) TOTAL_STEPS=4 ;;
   *)    TOTAL_STEPS=1 ;;
@@ -702,186 +735,47 @@ run_step() {
 }
 
 if [ "$ACTION" = "auto" ]; then
-  # Derive the per-variant output directory (retro_aga/retro_ecs/retro_rtg/
-  # etc.) from whichever artwork option was chosen, unless the user gave an
-  # explicit --dest. This is what makes each variant build directly into
-  # its own named directory instead of always writing to a plain "retro"
-  # that something else has to rename afterward.
+  # --auto (and --rebuild) run through all.sh - the pipeline engine - for
+  # this one variant, so single-variant runs get exactly the same
+  # protections as the full nightly run: queued downloads, resumable full
+  # builds, disk-space checks, version-folder replacement, dated new_ batch
+  # folders, the run report and the overlapping-run lock.
+  engine_args=()
   case "$MERGE_OPT" in
-    --aga)    VARIANT_SUFFIX="aga" ;;
-    --ecs)    VARIANT_SUFFIX="ecs" ;;
-    --rtg)    VARIANT_SUFFIX="rtg" ;;
-    --aga-laced) VARIANT_SUFFIX="aga_laced" ;;
-    --ecs-laced) VARIANT_SUFFIX="ecs_laced" ;;
+    --aga|--ecs|--rtg|--aga-laced|--ecs-laced) engine_args+=("$MERGE_OPT") ;;
     *)
-      if [ -n "$SET_OPT" ]; then
-        VARIANT_SUFFIX="$(printf '%s' "$SET_OPT" | tr '[:upper:]' '[:lower:]')"
-      else
-        VARIANT_SUFFIX=""
-      fi
-      ;;
+      if [ -n "$SET_OPT" ]; then engine_args+=(--set "$SET_OPT")
+      else engine_args+=(--variants default); fi ;;
   esac
-  if [ -z "$DEST_OPT" ]; then
-    if [ -n "$VARIANT_SUFFIX" ]; then
-      DEST_OPT="retro_$VARIANT_SUFFIX"
-    else
-      DEST_OPT="retro"
-    fi
-  fi
+  [ -n "$DEST_OPT" ] && engine_args+=(--dest "$DEST_OPT")
+  [ -n "$ART_ORDER_OPT" ] && engine_args+=(--art "$ART_ORDER_OPT")
+  [ -n "$DEMO_ART_OPT" ] && engine_args+=(--demo-art "$DEMO_ART_OPT")
+  [ -n "$SORT_OPT" ] && engine_args+=("$SORT_OPT")
+  [ "$DETOX_EXPLICIT" = "no" ] && engine_args+=(--no-detox)
+  [ "$DETOX_EXPLICIT" = "yes" ] && engine_args+=(--detox)
+  [ "$DEBUG_MODE" -eq 1 ] && engine_args+=(--debug)
+  [ "$CLEAN_OPT" -eq 1 ] && engine_args+=(--clean)
+  [ "$SKIP_UPDATE" -eq 1 ] && engine_args+=(--skip-update)
+  [ "$REBUILD_OPT" -eq 1 ] && engine_args+=(--rebuild)
+  [ "$FORCE_OPT" -eq 1 ] && engine_args+=(--force)
 
-  # --clean removes any existing output for this variant and forces a full
-  # rebuild, exactly like every --auto run used to behave. Without --clean,
-  # an existing output directory is updated incrementally (new downloads
-  # only, plus a gap-fill artwork pass) instead of being fully rebuilt.
-  if [ "$CLEAN_OPT" -eq 1 ] && [ -e "$DEST_OPT" ]; then
-    echo "Removing existing '$DEST_OPT' (--clean given)..."
-    rm -rf "$DEST_OPT"
-  fi
-  INCREMENTAL=0
-  [ "$CLEAN_OPT" -ne 1 ] && [ -d "$DEST_OPT" ] && INCREMENTAL=1
+  DELEGATED_AUTO=1
+  if ./all.sh "${engine_args[@]}"; then AUTO_EXIT=0; else AUTO_EXIT=$?; fi
 
-  if [ "$INCREMENTAL" -eq 1 ]; then
-    TOTAL_STEPS=5
-  else
-    TOTAL_STEPS=3
-  fi
-  [ "$SKIP_UPDATE" -eq 0 ] && TOTAL_STEPS=$((TOTAL_STEPS + 1))
-
-  # update.sh signals its outcome via exit code (see update.sh itself for
-  # the full rationale): 0 = new files found, continue as normal; 2 =
-  # nothing new anywhere, nothing to process; 3 = a wget error occurred and
-  # "0 new" can't be trusted. Capturing the status this way (as the
-  # condition of an `if`) is what keeps `set -e` from treating a non-zero
-  # exit as a crash before we get a chance to look at which case it is.
-  # --skip-update (used when a caller like all.sh has already run
-  # update.sh itself this pass) reads the existing update.log instead of
-  # running update.sh again.
-  if [ "$FORCE_REBUILD" -eq 1 ]; then
-    update_status=0
-  elif [ "$SKIP_UPDATE" -eq 1 ]; then
-    if [ ! -s "$SCRIPT_DIR/update.log" ] || [ "$(grep -c '^' "$SCRIPT_DIR/update.log" 2>/dev/null || echo 0)" -eq 0 ]; then
-      update_status=2
-    else
-      update_status=0
-    fi
-  elif run_step "update.sh" ./update.sh; then
-    update_status=0
-  else
-    update_status=$?
-  fi
-
-  if [ "$update_status" -eq 3 ]; then
+  # Nothing new: offer the menu instead (interactive runs only).
+  if [ "$AUTO_EXIT" -eq 2 ] && [ "$NOTHING_NEW_FALLBACK" -eq 0 ] && [ -t 0 ] \
+     && [ "${RETROPLAY_ALL_SH:-}" != "1" ]; then
     echo
-    echo "Stopping: update.sh reported a wget error (see above). Not continuing" >&2
-    echo "with extract/merge/sort." >&2
-    exit 1
-  elif [ "$update_status" -eq 2 ]; then
-    echo
-    echo "Nothing new to process - handing off to start.sh's menu instead of a full rebuild."
-    # Carry the current variant selection through the re-exec, so the
-    # fallback menu (and anything chosen from it, e.g. "full rebuild") acts
-    # on the SAME variant this run was building - exec starts a genuinely
-    # fresh process, so without this, --aga/--set/--dest/etc. would all be
-    # silently lost and the menu would fall back to whatever the defaults
-    # happen to be.
+    echo "Nothing new to process - showing the menu instead."
     fallback_args=(--nothing-new-fallback)
     [ -n "$MERGE_OPT" ] && fallback_args+=("$MERGE_OPT")
     [ -n "$SET_OPT" ] && fallback_args+=(--set "$SET_OPT")
     [ -n "$DEST_OPT" ] && fallback_args+=(--dest "$DEST_OPT")
     [ -n "$ART_ORDER_OPT" ] && fallback_args+=(--art "$ART_ORDER_OPT")
     [ -n "$DEMO_ART_OPT" ] && fallback_args+=(--demo-art "$DEMO_ART_OPT")
-    [ "$NO_DETOX" -eq 1 ] && fallback_args+=(--no-detox)
+    [ "$DETOX_EXPLICIT" = "no" ] && fallback_args+=(--no-detox)
     [ "$DEBUG_MODE" -eq 1 ] && fallback_args+=(--debug)
     exec ./start.sh "${fallback_args[@]}"
-  elif [ "$update_status" -ne 0 ]; then
-    echo
-    echo "Stopping: update.sh failed unexpectedly (exit $update_status)." >&2
-    exit "$update_status"
-  fi
-
-  if [ "$INCREMENTAL" -eq 0 ]; then
-    # ----- Full / clean rebuild: exactly the original --auto behaviour -----
-    build_extract_args
-    run_step "extract.sh" ./extract.sh "${extract_args[@]+"${extract_args[@]}"}"
-
-    build_merge_args
-    run_step "merge.sh" ./merge.sh "${merge_args[@]+"${merge_args[@]}"}"
-
-    build_sort_args
-    run_step "sort.sh" ./sort.sh "${sort_args[@]+"${sort_args[@]}"}"
-  else
-    # ----- Incremental update into an existing $DEST_OPT -----
-    # Stage just the newly downloaded files (the same technique quick.sh
-    # uses: copy exactly the paths named in update.log, preserving their
-    # relative layout, into a SOURCE-only temp dir), extract THAT into a
-    # SEPARATE output staging dir, then merge/sort just that small batch,
-    # merge its result into the existing output, then a light
-    # "--only-missing" artwork pass over the whole thing catches anything
-    # pre-existing that's still missing artwork (e.g. from an earlier
-    # interrupted run) without re-touching everything that's already merged.
-    #
-    # The source and output staging dirs MUST be different directories:
-    # extract.sh scans its current directory for archives and writes
-    # results to wherever -d points - if those were the same directory,
-    # the original .lha files would end up sitting alongside (and get
-    # merged/duplicated together with) the extracted output.
-    TEMP_SRC_DIR="$SCRIPT_DIR/.staging_src_$$"
-    STAGING_DIR="$SCRIPT_DIR/.staging_out_$$"
-    rm -rf "$TEMP_SRC_DIR" "$STAGING_DIR"
-    mkdir -p "$TEMP_SRC_DIR" "$STAGING_DIR"
-
-    STEP_NUM=$((STEP_NUM + 1))
-    echo
-    echo "===== Step $STEP_NUM of $TOTAL_STEPS: staging new downloads ====="
-    staged_any=0
-    if [ -f "$SCRIPT_DIR/update.log" ]; then
-      while IFS= read -r logline; do
-        filepath=$(printf '%s\n' "$logline" | sed 's/^[0-9-]* [0-9:]* //')
-        [ -f "$filepath" ] || continue
-        relpath="${filepath#./}"
-        destpath="$TEMP_SRC_DIR/$relpath"
-        mkdir -p "$(dirname "$destpath")"
-        cp -f "$filepath" "$destpath" 2>/dev/null && staged_any=1
-      done < "$SCRIPT_DIR/update.log"
-    fi
-
-    if [ "$staged_any" -eq 0 ]; then
-      echo "Nothing to stage - update.log had no readable entries."
-      rm -rf "$TEMP_SRC_DIR" "$STAGING_DIR"
-    else
-      _real_dest="$DEST_OPT"
-      DEST_OPT="$STAGING_DIR"
-
-      build_extract_args
-      STEP_NUM=$((STEP_NUM + 1))
-      echo
-      echo "===== Step $STEP_NUM of $TOTAL_STEPS: extract.sh (new files) ====="
-      (cd "$TEMP_SRC_DIR" && bash "$SCRIPT_DIR/extract.sh" "${extract_args[@]+"${extract_args[@]}"}")
-      rm -rf "$TEMP_SRC_DIR"
-
-      build_merge_args
-      run_step "merge.sh (new files)" ./merge.sh "${merge_args[@]+"${merge_args[@]}"}"
-
-      build_sort_args
-      run_step "sort.sh (new files)" ./sort.sh "${sort_args[@]+"${sort_args[@]}"}"
-
-      DEST_OPT="$_real_dest"
-
-      echo
-      echo "Merging newly processed files into $DEST_OPT..."
-      mkdir -p "$DEST_OPT"
-      cp -a "$STAGING_DIR/." "$DEST_OPT/"
-    fi
-
-    build_merge_args
-    run_step "merge.sh (fill missing artwork)" ./merge.sh "${merge_args[@]+"${merge_args[@]}"}" --only-missing
-
-    if [ -d "$STAGING_DIR" ]; then
-      new_dir_name="new_${VARIANT_SUFFIX:-all}"
-      rm -rf "$new_dir_name"
-      mv "$STAGING_DIR" "$new_dir_name"
-      echo "New-files duplicate: $new_dir_name"
-    fi
   fi
 
 elif [ "$ACTION" = "merge" ]; then
@@ -957,7 +851,7 @@ done
 # rtg) then appends its own section here in turn, so the whole all.sh run
 # ends with ONE combined log covering all three variants, rather than
 # each variant's start.sh wiping out what the previous variant just wrote.
-if [ "${RETROPLAY_ALL_SH:-}" != "1" ]; then
+if [ "${RETROPLAY_ALL_SH:-}" != "1" ] && [ "$DELEGATED_AUTO" -ne 1 ]; then
     : > "$retro_log"
 fi
 for f in "${non_empty_logs[@]+"${non_empty_logs[@]}"}"; do
@@ -1021,4 +915,4 @@ if [ -s "$retro_log" ]; then
     fi
 fi
 
-exit 0
+exit "$AUTO_EXIT"

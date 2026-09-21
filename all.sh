@@ -1,68 +1,120 @@
 #!/usr/bin/env bash
-set -e
+# Amiga Retroplay - pipeline engine
+#
+# Builds and updates one or more artwork variants (by default AGA, ECS and
+# RTG - see VARIANTS in retroplay.conf) end to end. start.sh --auto, and so
+# aga.sh / ecs.sh / rtg.sh, also run through here for a single variant, so
+# every run gets the same protections:
+#
+#   * Archives are extracted and sorted ONCE, then copied per variant; only
+#     the artwork merge differs between variants.
+#   * New downloads are QUEUED per output folder and only removed from the
+#     queue once that folder has actually absorbed them - a failed or
+#     interrupted run is simply picked up again by the next one.
+#   * A full build is marked "building" until it finishes, so an interrupted
+#     one is redone instead of being mistaken for a finished collection.
+#   * Free disk space is checked before extracting or copying.
+#   * An updated game REPLACES its old folder, so files from older versions
+#     don't linger; each batch is also kept in a dated new_<variant> folder.
+#   * One summary report per run (reports/), optional notifications.
+#
+# Exit codes: 0 = work done, 2 = nothing to do, 1 = failure.
 
-# Amiga Retroplay - runs all three artwork variants (AGA, ECS, RTG) in turn.
-#
-# Since start.sh now builds directly into retro_aga/retro_ecs/retro_rtg
-# (derived automatically from which artwork option was chosen), this no
-# longer needs to run each variant into a shared "retro" and rename it
-# afterward - each variant's own output already lands in its own correctly
-# named directory.
-#
-# Only ONE real update.sh check happens per run, regardless of which path
-# below is taken.
+set -u -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || { echo "ERROR: cannot cd to script directory: $SCRIPT_DIR" >&2; exit 1; }
 
-# Tell start.sh (via every invocation below, and any --nothing-new-fallback
-# re-exec inside it) that it's running as part of an all.sh pass. start.sh
-# uses this to (a) skip its end-of-run "view error log?" prompt even when a
-# terminal IS attached, since answering that prompt after variant 1 would
-# otherwise stall the whole pipeline waiting on input before variant 2 even
-# starts - defeating the point of all.sh being able to run straight through
-# unattended (e.g. from cron) - and (b) append each variant's errors to ONE
-# shared retroerror.log instead of each variant's start.sh overwriting what
-# the previous variant just wrote, so there's a single combined log to check
-# after all three variants finish. Reset that log once here, at the start of
-# this run, so it doesn't grow across separate all.sh runs (e.g. every past
-# week's cron run) - each run starts this file fresh and fills in its own
-# section(s) of it as it goes.
-rm -f -- "$SCRIPT_DIR/retroerror.log"
+# Shared helpers (retroplay.conf settings, dependency tracking, pending
+# queues, disk-space checks...) live in lib.sh, next to this script.
+if [ ! -f "$SCRIPT_DIR/lib.sh" ]; then
+    echo "ERROR: lib.sh is missing from $SCRIPT_DIR - it ships with these scripts." >&2
+    exit 1
+fi
+. "$SCRIPT_DIR/lib.sh"
+rp_load_config
+
+usage() {
+    cat << 'USAGE'
+Usage: all.sh [options]
+
+Builds or updates every variant listed in VARIANTS (retroplay.conf; default
+"aga ecs rtg") - or just the ones you name - extracting archives only once.
+
+Choosing variants (default: VARIANTS from retroplay.conf):
+  --aga --ecs --rtg --aga-laced --ecs-laced   Pick variants (repeatable)
+  --set NAME            Use the iGame_NAME artwork set as a variant
+  --variants "a b c"    Give the whole list at once
+  --dest PATH           Custom output folder (only with a single variant)
+
+What to do:
+  --rebuild             Rebuild from the archives already downloaded, without
+                        checking for updates (same as --clean --skip-update)
+  --clean               Check for updates, then rebuild from scratch
+  --skip-update         Don't download; process whatever is already queued
+  --force               Also run the artwork gap-fill on up-to-date variants
+  --dry-run             Show what would happen, change nothing
+  --cron                Unattended mode for cron: sets a full PATH, rotates
+                        and writes to all_cron.log
+
+Overrides for retroplay.conf settings:
+  --art ORDER  --demo-art ORDER  --ffs | --pfs  --no-detox | --detox  --debug
+
+Exit codes: 0 = work done, 2 = nothing to do, 1 = failure.
+USAGE
+}
+
+VARIANT_ARGS=""; DEST_OVERRIDE=""
+CLEAN=0; SKIP_UPDATE=0; FORCE=0; DRY_RUN=0; CRON=0; DEBUG=0
+ART_OVERRIDE=""; DEMO_ART_OVERRIDE=""; FS_OVERRIDE=""; DETOX_OVERRIDE=""
+
+while [ $# -gt 0 ]; do
+    opt="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    case "$opt" in
+        --aga|--ecs|--rtg|--aga-laced|--ecs-laced) VARIANT_ARGS="$VARIANT_ARGS ${opt#--}"; shift ;;
+        --set)       [ $# -ge 2 ] || { echo "--set needs a name" >&2; exit 1; }
+                     VARIANT_ARGS="$VARIANT_ARGS $2"; shift 2 ;;
+        --variants)  [ $# -ge 2 ] || { echo "--variants needs a list" >&2; exit 1; }
+                     VARIANT_ARGS="$VARIANT_ARGS $2"; shift 2 ;;
+        --variant)   VARIANT_ARGS="$VARIANT_ARGS ${2:-}"; shift 2 ;;
+        -d|--dest)   DEST_OVERRIDE="${2:-}"; shift 2 ;;
+        --clean)     CLEAN=1; shift ;;
+        --rebuild)   CLEAN=1; SKIP_UPDATE=1; shift ;;
+        --skip-update) SKIP_UPDATE=1; shift ;;
+        --force)     FORCE=1; shift ;;
+        --dry-run)   DRY_RUN=1; shift ;;
+        --cron)      CRON=1; shift ;;
+        --art)       ART_OVERRIDE="${2:-}"; shift 2 ;;
+        --demo-art)  DEMO_ART_OVERRIDE="${2:-}"; shift 2 ;;
+        --ffs)       FS_OVERRIDE=ffs; shift ;;
+        --pfs)       FS_OVERRIDE=pfs; shift ;;
+        --no-detox)  DETOX_OVERRIDE=no; shift ;;
+        --detox)     DETOX_OVERRIDE=yes; shift ;;
+        --debug)     DEBUG=1; shift ;;
+        -h|--help)   usage; exit 0 ;;
+        *) echo "Unknown option: $1 (try --help)" >&2; exit 1 ;;
+    esac
+done
+
+# ----- Cron mode -----
+# (cron's bare PATH is already taken care of by lib.sh, for every script:
+# it adds back the PATH remembered from your last interactive run.) cron
+# can't rotate its own >> log, so --cron does that and writes the log itself.
+if [ "$CRON" -eq 1 ]; then
+    CRON_LOG="$SCRIPT_DIR/all_cron.log"
+    rp_rotate_log "$CRON_LOG" "$RP_LOG_MAX_MB" "$RP_LOG_KEEP"
+    exec >> "$CRON_LOG" 2>&1 < /dev/null
+    echo
+    echo "==================== all.sh --cron: $(date '+%Y-%m-%d %H:%M:%S') ===================="
+fi
+
+rp_print_config_warnings
+
+# Every start.sh step run from here skips its interactive "view error log?"
+# prompt and appends to one shared retroerror.log for the whole run.
 export RETROPLAY_ALL_SH=1
 
-# ----- Dependency tracking (for the uninstaller) -----
-# Records exactly what THIS suite of scripts installs, so uninstall_deps.sh
-# can later remove only those specific things and leave anything that was
-# already present on the system - installed by the user, or by something
-# else entirely - untouched. Format: one "<method>:<name>" per line, where
-# method is apt, brew, or source-build (name is the installed file's full
-# path for source-build, since there's no package manager entry to remove).
-DEP_TRACK_FILE="$SCRIPT_DIR/.retroplay_installed_deps.log"
-record_installed_dep() {
-    local dep_line="$1:$2"
-    if ! grep -qxF "$dep_line" "$DEP_TRACK_FILE" 2>/dev/null; then
-        echo "$dep_line" >> "$DEP_TRACK_FILE"
-    fi
-}
-
-# True only if the package manager itself already has this package fully
-# installed. Checked BEFORE offering an install, so a package that was
-# already on the system (e.g. installed but its command isn't on PATH, as
-# with Homebrew's keg-only util-linux) is never recorded as installed by
-# these scripts - `apt-get install` / `brew install` both succeed as a
-# no-op in that case, which would otherwise make the uninstaller remove
-# something the user already had. dpkg-query's "install ok installed" is
-# used instead of plain `dpkg -s`, which also succeeds for packages that
-# were removed but left their config files behind.
-pkg_already_installed() {
-    case "$1" in
-        apt)  dpkg-query -W -f='${Status}' "$2" 2>/dev/null | grep -q "install ok installed" ;;
-        brew) command -v brew >/dev/null 2>&1 && brew list --versions "$2" >/dev/null 2>&1 ;;
-        *)    return 1 ;;
-    esac
-}
-
+if [ "$DRY_RUN" -eq 0 ]; then
 OS_TYPE="$(uname -s | tr '[:upper:]' '[:lower:]')"
 
 # Resolves a usable flock binary, including macOS's keg-only Homebrew
@@ -145,269 +197,428 @@ else
     fi
 fi
 
-# ----- Decide which path to take -----
-#
-# Extracting the same archives three times (once per variant) into
-# retro_aga/retro_ecs/retro_rtg is pure waste: decompression (lha/unlzx/
-# 7z) is the most expensive step in the whole pipeline, while a plain
-# filesystem copy of already-extracted files is comparatively cheap. This
-# applies whether it's a fresh build (all archives) or an incremental
-# update (just the newly downloaded batch) - so both cases below extract
-# once and copy, rather than only the fresh-build case as before.
-#
-# The copy always happens BEFORE merge, never after: copying an already
-# MERGED tree and just re-running merge.sh for ecs/rtg would risk stale
-# leftover artwork - if AGA found a "Covers" image for some game but ECS
-# only has a "Titles" image for that same game, the two variants would
-# name the result differently (iGame.iff vs igame1.iff, by art-category
-# priority), so re-merging onto an already-merged tree could leave BOTH
-# files sitting side by side instead of only the correct one. Copying the
-# clean, unmerged extracted tree and letting each variant run its own
-# full merge avoids that entirely.
-#
-# Three states are distinguished:
-#   - none of the three outputs exist yet (or --clean was given): a
-#     genuinely fresh build - extract everything once, below.
-#   - all three already exist: an incremental update - stage and extract
-#     just the newly downloaded batch once, below.
-#   - a MIXED state (some exist, some don't, e.g. a partial prior run) -
-#     falls back to the original aga.sh/ecs.sh/rtg.sh path, which treats
-#     each variant according to its own actual state correctly. This is
-#     deliberately not optimized: it's a rare, edge-case state, and
-#     handling it wrong (e.g. giving a genuinely-missing variant only the
-#     latest incremental batch instead of a full history) would be worse
-#     than just accepting three extractions here.
-want_full_rebuild=0
-if [ ! -d retro_aga ] && [ ! -d retro_ecs ] && [ ! -d retro_rtg ]; then
-    want_full_rebuild=1
 fi
-for arg in "$@"; do
-    if [ "$arg" = "--clean" ]; then
-        want_full_rebuild=1
-        break
+
+# ============================================================================
+# Settings for this run
+# ============================================================================
+FS_FLAG="--${FS_OVERRIDE:-$RP_FILESYSTEM}"
+USE_DETOX="${DETOX_OVERRIDE:-$RP_USE_DETOX}"
+DETOX_FLAG=""; [ "$USE_DETOX" = "yes" ] || DETOX_FLAG="--no-detox"
+DEBUG_FLAG=""; [ "$DEBUG" -eq 1 ] && DEBUG_FLAG="--debug"
+DEMO_ART="${DEMO_ART_OVERRIDE:-$RP_DEMO_ART_ORDER}"
+RUN_TS="$(rp_timestamp)"
+WORK_ROOT="$RP_OUTPUT_ROOT/.retroplay_work"     # same drive as the output, so moves are instant
+STAGE_ROOT="$RP_STATE_DIR/stage"                # same drive as the archives, so staging can hardlink
+REPORT_DIR="$SCRIPT_DIR/reports"
+REPORT_TMP="$(mktemp "${TMPDIR:-/tmp}/retroplay_report.XXXXXX")"
+FAIL_REASON=""
+
+report() { printf '%s\n' "$*" >> "$REPORT_TMP"; }
+fail()   { FAIL_REASON="$*"; echo; echo "ERROR: $*" >&2; exit 1; }
+
+# ----- Resolve the variants -----
+V_TOK=(); V_DEST=(); V_KEY=(); V_EXCL=(); V_ART=(); V_NEW=(); V_MFLAGS=(); V_ACT=(); V_WHY=()
+for tok in ${VARIANT_ARGS:-$RP_VARIANTS}; do
+    tok="$(printf '%s' "$tok" | tr '[:upper:]' '[:lower:]')"
+    dup=0
+    for t in "${V_TOK[@]+"${V_TOK[@]}"}"; do [ "$t" = "$tok" ] && dup=1; done
+    [ "$dup" -eq 1 ] && continue
+    V_TOK+=("$tok")
+done
+[ "${#V_TOK[@]}" -gt 0 ] || { echo "ERROR: no variants to build (check VARIANTS in retroplay.conf)." >&2; exit 1; }
+if [ -n "$DEST_OVERRIDE" ] && [ "${#V_TOK[@]}" -gt 1 ]; then
+    echo "ERROR: --dest can only be used when building a single variant." >&2; exit 1
+fi
+
+for i in "${!V_TOK[@]}"; do
+    tok="${V_TOK[$i]}"
+    if [ -n "$DEST_OVERRIDE" ]; then
+        case "$DEST_OVERRIDE" in /*) d="$DEST_OVERRIDE" ;; *) d="$SCRIPT_DIR/$DEST_OVERRIDE" ;; esac
+    elif [ "$tok" = "default" ]; then
+        d="$RP_OUTPUT_ROOT/retro"
+    else
+        d="$RP_OUTPUT_ROOT/retro_$(rp_variant_suffix "$tok")"
+    fi
+    d="${d%/}"
+    V_DEST[$i]="$d"
+    V_KEY[$i]="${d##*/}"
+    V_EXCL[$i]="$(rp_exclude_tags_for "$tok")"
+    V_ART[$i]="${ART_OVERRIDE:-$(rp_art_order_for "$tok")}"
+    V_NEW[$i]="$RP_OUTPUT_ROOT/new_${V_KEY[$i]#retro_}"
+    V_MFLAGS[$i]="$(rp_variant_merge_args "$tok" | tr '\n' ' ')"
+done
+
+# Leftovers from an interrupted run are only temporary copies - clear them.
+if [ "$DRY_RUN" -eq 0 ]; then
+    rm -rf -- "$WORK_ROOT" "$STAGE_ROOT"
+    rm -f "$SCRIPT_DIR/retroerror.log"
+fi
+
+finish() {
+    local st=$? errs=0 result body
+    rm -f "$REPORT_TMP.missing" 2>/dev/null
+    if [ "$DRY_RUN" -eq 1 ]; then rm -f "$REPORT_TMP"; return; fi
+    rm -rf -- "$WORK_ROOT" "$STAGE_ROOT"
+    [ -s "$SCRIPT_DIR/retroerror.log" ] && errs="$(grep -c . "$SCRIPT_DIR/retroerror.log")"
+    case "$st" in
+        0) result="Finished successfully" ;;
+        2) result="Nothing to do - everything is up to date" ;;
+        *) result="FAILED${FAIL_REASON:+ - $FAIL_REASON}" ;;
+    esac
+    if [ "$st" -ne 2 ] || [ -s "$REPORT_TMP" ]; then
+        mkdir -p "$REPORT_DIR"
+        {
+            echo "Amiga Retroplay run report - $(date '+%Y-%m-%d %H:%M:%S')"
+            echo "Result:   $result"
+            printf 'Duration: %d:%02d:%02d\n' $((SECONDS / 3600)) $(((SECONDS % 3600) / 60)) $((SECONDS % 60))
+            echo
+            [ -s "$REPORT_TMP" ] && cat "$REPORT_TMP" && echo
+            if [ "$errs" -gt 0 ]; then
+                echo "Errors/warnings logged: $errs line(s) - see retroerror.log"
+            else
+                echo "No errors logged."
+            fi
+            [ -n "$(rp_free_kb "$RP_OUTPUT_ROOT")" ] && \
+                echo "Free space left: $(( $(rp_free_kb "$RP_OUTPUT_ROOT") / 1024 )) MB"
+        } > "$REPORT_DIR/$RUN_TS.txt"
+        echo
+        echo "======================== Summary ========================"
+        cat "$REPORT_DIR/$RUN_TS.txt"
+        echo "(saved as reports/$RUN_TS.txt)"
+        # keep the newest 60 reports
+        ls -1 "$REPORT_DIR"/*.txt 2>/dev/null | sort | awk -v n="$(ls -1 "$REPORT_DIR"/*.txt 2>/dev/null | grep -c .)" 'NR <= n - 60' | \
+            while IFS= read -r old; do rm -f "$old" "${old%.txt}"_*; done
+    fi
+    body="$(cat "$REPORT_DIR/$RUN_TS.txt" 2>/dev/null)"
+    if [ "$st" -ne 0 ] && [ "$st" -ne 2 ]; then
+        rp_notify "Amiga Retroplay: run FAILED" "${body:-$result}"
+    elif [ "$st" -eq 0 ] && [ "$RP_NOTIFY_ON_SUCCESS" = "yes" ]; then
+        rp_notify "Amiga Retroplay: run finished" "$body"
+    fi
+    rm -f "$REPORT_TMP"
+}
+trap finish EXIT
+trap 'fail "interrupted"' INT TERM
+
+# ============================================================================
+# 1. Check for updates
+# ============================================================================
+# Folders from older versions of these scripts get markers first, so that
+# anything downloaded now is queued for them.
+if [ "$DRY_RUN" -eq 0 ]; then
+    for i in "${!V_TOK[@]}"; do rp_adopt_legacy "${V_KEY[$i]}" "${V_DEST[$i]}"; done
+fi
+
+if [ "$SKIP_UPDATE" -eq 0 ]; then
+    echo "===== Checking for updates ====="
+    if [ "$DRY_RUN" -eq 1 ]; then
+        ./update.sh --dry-run
+    else
+        ./update.sh; ust=$?
+        case "$ust" in
+            0|2) ;;
+            3) fail "could not update from the Retroplay server (network or server problem)" ;;
+            *) fail "update.sh failed (exit $ust)" ;;
+        esac
+    fi
+    echo
+fi
+
+# ============================================================================
+# 2. Decide what each variant needs
+# ============================================================================
+for i in "${!V_TOK[@]}"; do
+    state="$(rp_build_state "${V_KEY[$i]}" "${V_DEST[$i]}")"
+    q="$(rp_queue_count "${V_KEY[$i]}")"
+    if [ "$CLEAN" -eq 1 ]; then
+        V_ACT[$i]=full; V_WHY[$i]="rebuild requested"
+    elif [ "$state" = fresh ]; then
+        V_ACT[$i]=full; V_WHY[$i]="not built yet"
+    elif [ "$state" = incomplete ]; then
+        V_ACT[$i]=full; V_WHY[$i]="the last full build was interrupted - redoing it"
+    elif [ "$q" -gt 0 ]; then
+        V_ACT[$i]=update; V_WHY[$i]="$q new archive(s) queued"
+    elif [ "$FORCE" -eq 1 ]; then
+        V_ACT[$i]=gapfill; V_WHY[$i]="up to date - artwork gap-fill only"
+    else
+        V_ACT[$i]=none; V_WHY[$i]="up to date"
     fi
 done
 
-all_exist=0
-if [ -d retro_aga ] && [ -d retro_ecs ] && [ -d retro_rtg ]; then
-    all_exist=1
-fi
+echo "===== Plan ====="
+for i in "${!V_TOK[@]}"; do
+    printf '  %-16s %-8s %s%s\n' "${V_KEY[$i]}" "${V_ACT[$i]}" "${V_WHY[$i]}" \
+        "${V_EXCL[$i]:+  (leaving out: ${V_EXCL[$i]})}"
+done
+echo
 
-if [ "$want_full_rebuild" -ne 1 ] && [ "$all_exist" -ne 1 ]; then
-    echo "Mixed state (some but not all variant outputs exist) - using the"
-    echo "normal per-variant path (aga.sh/ecs.sh/rtg.sh) so each variant is"
-    echo "correctly treated as fresh or incremental on its own terms."
+any_work=0
+for i in "${!V_TOK[@]}"; do [ "${V_ACT[$i]}" != none ] && any_work=1; done
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    for i in "${!V_TOK[@]}"; do
+        [ "${V_ACT[$i]}" = update ] || continue
+        echo "Queued for ${V_KEY[$i]}:"
+        n=0
+        while IFS= read -r p; do
+            n=$((n + 1)); [ "$n" -le 10 ] || continue
+            note=""
+            [ -f "$SCRIPT_DIR/$p" ] || note="  (superseded - will be skipped)"
+            [ -n "${V_EXCL[$i]}" ] && rp_archive_has_tag "$p" "${V_EXCL[$i]}" && note="  (left out: ${V_EXCL[$i]})"
+            echo "    $p$note"
+        done < "$(rp_queue_file "${V_KEY[$i]}")"
+        [ "$n" -gt 10 ] && echo "    ...and $((n - 10)) more"
+    done
+    for i in "${!V_TOK[@]}"; do
+        if [ "${V_ACT[$i]}" = full ]; then
+            akb="$(rp_du_kb HD_Loaders JST WHDLoad)"
+            echo "A full build needs roughly $(( akb * RP_SPACE_FACTOR * 2 / 1024 )) MB free; $(( $(rp_free_kb "$RP_OUTPUT_ROOT") / 1024 )) MB available."
+            break
+        fi
+    done
     echo
-
-    echo "===== Variant 1 of 3: aga.sh ====="
-    if ./aga.sh "$@"; then
-        aga_status=0
-    else
-        aga_status=$?
-    fi
-
-    if [ "$aga_status" -ne 0 ]; then
-        echo
-        echo "aga.sh found nothing new or hit an error (exit $aga_status) - stopping" >&2
-        echo "here. ecs.sh and rtg.sh were NOT run this time." >&2
-        exit "$aga_status"
-    fi
-
-    echo
-    echo "===== Variant 2 of 3: ecs.sh (reusing aga.sh's update check) ====="
-    ./ecs.sh --skip-update "$@"
-
-    echo
-    echo "===== Variant 3 of 3: rtg.sh (reusing aga.sh's update check) ====="
-    ./rtg.sh --skip-update "$@"
-
-    echo
-    echo "All 3 variants complete: retro_aga, retro_ecs, retro_rtg"
+    echo "Dry run only - nothing was changed."
     exit 0
 fi
 
-if [ "$want_full_rebuild" -eq 1 ]; then
+if [ "$any_work" -eq 0 ]; then
+    echo "Nothing new to process - every variant is up to date."
+    exit 2
+fi
+mkdir -p "$WORK_ROOT" "$STAGE_ROOT"
 
-echo "Fresh build for all three variants - extracting once and reusing the"
-echo "result for all three instead of extracting the same archives three times."
-echo
+# extract.sh writes extract_errors.log into the folder it runs from; when
+# that's a temporary staging folder, move the log out before it's deleted.
+rescue_extract_log() {
+    if [ -s "$1/extract_errors.log" ]; then
+        cat "$1/extract_errors.log" >> "$SCRIPT_DIR/extract_errors.log"
+    fi
+}
 
-# --clean (or the fresh-build state itself) means starting completely
-# clean - remove any partial/stale output for all three variants before
-# extracting, matching what --auto's own --clean handling would do for a
-# single variant.
-for d in retro_aga retro_ecs retro_rtg; do
-    [ -e "$d" ] && rm -rf -- "$d"
+# merge_variant <index> <folder> [extra merge.sh options...]
+merge_variant() {
+    local i="$1" dir="$2"; shift 2
+    # shellcheck disable=SC2086
+    ./start.sh --merge ${V_MFLAGS[$i]} --art "${V_ART[$i]}" --demo-art "$DEMO_ART" \
+        --dest "$dir" $DETOX_FLAG $DEBUG_FLAG "$@"
+}
+
+sort_folder() { ./start.sh --sort $FS_FLAG $DETOX_FLAG --dest "$1"; }
+
+save_missing_list() {   # <index> <missing-list-file> ; prints the count
+    local n=0
+    if [ -s "$2" ]; then
+        n="$(grep -c . "$2")"
+        mkdir -p "$REPORT_DIR"
+        sort -u "$2" > "$REPORT_DIR/${RUN_TS}_${V_KEY[$1]}_no_artwork.txt"
+    fi
+    echo "$n"
+}
+
+# ============================================================================
+# 3. Full builds - every archive extracted and sorted ONCE for all of them
+# ============================================================================
+FULL=()
+for i in "${!V_TOK[@]}"; do [ "${V_ACT[$i]}" = full ] && FULL+=("$i"); done
+
+if [ "${#FULL[@]}" -gt 0 ]; then
+    names=""; for i in "${FULL[@]}"; do names="$names ${V_KEY[$i]}"; done
+    echo "===== Full build:$names ====="
+    arch_kb="$(rp_du_kb HD_Loaders JST WHDLoad)"
+    [ "$arch_kb" -gt 0 ] || fail "no downloaded archives found yet (HD_Loaders/, JST/, WHDLoad/) - run once without --rebuild/--skip-update first"
+    est_kb=$((arch_kb * RP_SPACE_FACTOR))
+    rp_require_space "$RP_OUTPUT_ROOT" "$est_kb" "extracting the archives" || fail "not enough disk space to extract the archives"
+    for i in "${FULL[@]}"; do rp_mark_building "${V_KEY[$i]}" "${V_DEST[$i]}"; done
+
+    # Tags some of these variants must leave out (e.g. AGA,CD32 for ECS).
+    # Archives WITHOUT any of them go into "common" (used by every variant);
+    # archives WITH them are extracted separately, so a variant that must
+    # leave them out simply doesn't receive that part. Still one extraction
+    # per archive in the usual setup.
+    ALL_EXCL=""
+    for i in "${FULL[@]}"; do
+        IFS=, read -r -a _tags <<< "${V_EXCL[$i]}"
+        for t in "${_tags[@]+"${_tags[@]}"}"; do
+            [ -n "$t" ] || continue
+            case ",$ALL_EXCL," in *",$t,"*) ;; *) ALL_EXCL="${ALL_EXCL:+$ALL_EXCL,}$t" ;; esac
+        done
+    done
+
+    COMMON="$WORK_ROOT/common"
+    if [ -n "$ALL_EXCL" ]; then
+        echo "--- Extracting archives without $ALL_EXCL (shared by all variants) ---"
+        bash ./extract.sh -u -d "$COMMON" --exclude-tags "$ALL_EXCL" $DEBUG_FLAG || fail "extraction failed"
+    else
+        echo "--- Extracting all archives ---"
+        bash ./extract.sh -u -d "$COMMON" $DEBUG_FLAG || fail "extraction failed"
+    fi
+    mkdir -p "$COMMON"
+    echo "--- Sorting and checking filenames ---"
+    sort_folder "$COMMON" || fail "sorting failed"
+
+    # One "extra" part per distinct set of left-out tags that isn't "all of
+    # them" (normally just one: the AGA/CD32 releases for AGA and RTG).
+    EXTRA_SET=(); EXTRA_DIR=()
+    for i in "${FULL[@]}"; do
+        ex="${V_EXCL[$i]}"
+        [ -n "$ALL_EXCL" ] || continue
+        [ "$ex" = "$ALL_EXCL" ] && continue
+        seen=0; for s in "${EXTRA_SET[@]+"${EXTRA_SET[@]}"}"; do [ "$s" = "$ex" ] && seen=1; done
+        [ "$seen" -eq 1 ] && continue
+        n="${#EXTRA_SET[@]}"
+        EXTRA_SET+=("$ex"); EXTRA_DIR+=("$WORK_ROOT/extra_$n")
+        echo "--- Extracting the $ALL_EXCL archives${ex:+ (without $ex)} ---"
+        if [ -n "$ex" ]; then
+            bash ./extract.sh -u -d "$WORK_ROOT/extra_$n" --only-tags "$ALL_EXCL" --exclude-tags "$ex" $DEBUG_FLAG || fail "extraction failed"
+        else
+            bash ./extract.sh -u -d "$WORK_ROOT/extra_$n" --only-tags "$ALL_EXCL" $DEBUG_FLAG || fail "extraction failed"
+        fi
+        mkdir -p "$WORK_ROOT/extra_$n"
+        sort_folder "$WORK_ROOT/extra_$n" || fail "sorting failed"
+    done
+
+    remaining="${#FULL[@]}"
+    for i in "${FULL[@]}"; do
+        remaining=$((remaining - 1))
+        dest="${V_DEST[$i]}"; key="${V_KEY[$i]}"
+        extra=""
+        for n in ${EXTRA_SET[@]+"${!EXTRA_SET[@]}"}; do [ "${EXTRA_SET[$n]}" = "${V_EXCL[$i]}" ] && extra="${EXTRA_DIR[$n]}"; done
+        echo
+        echo "===== $key: installing and adding artwork ====="
+        need_kb="$(rp_du_kb "$COMMON" ${extra:+"$extra"})"
+        [ "$remaining" -eq 0 ] && need_kb="$(rp_du_kb ${extra:+"$extra"})"   # last one moves instead of copying
+        free_kb="$(rp_free_kb "$RP_OUTPUT_ROOT")"; old_kb="$(rp_du_kb "$dest")"
+        if [ -n "$free_kb" ] && [ $((need_kb + RP_MIN_FREE_MB * 1024)) -gt $((free_kb + old_kb)) ]; then
+            fail "not enough disk space to install $key (needs about $((need_kb / 1024)) MB)"
+        fi
+        rm -rf -- "$dest"
+        mkdir -p "$(dirname "$dest")"
+        if [ "$remaining" -eq 0 ]; then
+            mv "$COMMON" "$dest" || fail "could not move the build into $dest"
+        else
+            cp -a "$COMMON" "$dest" || fail "could not copy the build into $dest"
+        fi
+        [ -n "$extra" ] && { cp -a "$extra/." "$dest/" || fail "could not copy the $ALL_EXCL releases into $dest"; }
+        miss="$REPORT_TMP.missing"; : > "$miss"
+        merge_variant "$i" "$dest" --report-missing "$miss" || fail "adding artwork to $key failed"
+        rp_mark_complete "$key" "$dest"
+        rp_queue_clear "$key"
+        games="$(rp_count_games "$dest")"; nomiss="$(save_missing_list "$i" "$miss")"
+        line="$key: full build - $games games${V_EXCL[$i]:+ (without ${V_EXCL[$i]} releases)}, $nomiss without artwork"
+        [ "$nomiss" -gt 0 ] && line="$line (list: reports/${RUN_TS}_${key}_no_artwork.txt)"
+        report "$line"
+    done
+    rm -rf -- "$WORK_ROOT/common" "$WORK_ROOT"/extra_*
+fi
+
+# ============================================================================
+# 4. Updates - queued archives staged, extracted and sorted once per group
+# ============================================================================
+INC=()
+for i in "${!V_TOK[@]}"; do [ "${V_ACT[$i]}" = update ] && INC+=("$i"); done
+
+G_SIG=(); G_MEMBERS=()
+for i in "${INC[@]+"${INC[@]}"}"; do
+    key="${V_KEY[$i]}"
+    cp "$(rp_queue_file "$key")" "$STAGE_ROOT/processed_$key.list"
+    : > "$STAGE_ROOT/applicable_$key.list"
+    while IFS= read -r p; do
+        [ -n "$p" ] && [ -f "$SCRIPT_DIR/$p" ] || continue             # superseded meanwhile
+        [ -n "${V_EXCL[$i]}" ] && rp_archive_has_tag "$p" "${V_EXCL[$i]}" && continue
+        printf '%s\n' "$p" >> "$STAGE_ROOT/applicable_$key.list"
+    done < "$STAGE_ROOT/processed_$key.list"
+    sig="$(sort "$STAGE_ROOT/applicable_$key.list" | cksum | tr ' ' _)"
+    found=""
+    for g in ${G_SIG[@]+"${!G_SIG[@]}"}; do [ "${G_SIG[$g]}" = "$sig" ] && found="$g"; done
+    if [ -n "$found" ]; then
+        G_MEMBERS[$found]="${G_MEMBERS[$found]} $i"
+    else
+        G_SIG+=("$sig"); G_MEMBERS+=("$i")
+    fi
 done
 
-echo "===== Update check ====="
-if ./start.sh --update "$@"; then
-    update_status=0
-else
-    update_status=$?
-fi
-
-if [ "$update_status" -eq 3 ]; then
+for g in ${G_SIG[@]+"${!G_SIG[@]}"}; do
+    set -- ${G_MEMBERS[$g]}
+    lead="$1"; members="$*"; nmembers=$#
+    list="$STAGE_ROOT/applicable_${V_KEY[$lead]}.list"
+    names=""; for i in $members; do names="$names ${V_KEY[$i]}"; done
     echo
-    echo "Stopping: update.sh reported a wget error (see above)." >&2
-    exit 1
-elif [ "$update_status" -eq 2 ]; then
-    echo
-    echo "Nothing new to download - nothing to build. Stopping."
-    exit 2
-elif [ "$update_status" -ne 0 ]; then
-    echo
-    echo "Stopping: update.sh failed unexpectedly (exit $update_status)." >&2
-    exit "$update_status"
-fi
+    echo "===== Update:$names ====="
 
-# --dest is placed AFTER "$@" in every call below (rather than before, as
-# aga.sh/ecs.sh/rtg.sh place their own hardcoded flags) so that whichever
-# directory this optimization depends on can never be silently overridden
-# by something in "$@" - correctness here specifically depends on each
-# step landing in the right one of retro_aga/retro_ecs/retro_rtg.
-echo
-echo "===== Extracting once into retro_aga ====="
-./start.sh --extract "$@" --dest retro_aga
+    if [ ! -s "$list" ]; then
+        for i in $members; do
+            rp_queue_remove_processed "${V_KEY[$i]}" "$STAGE_ROOT/processed_${V_KEY[$i]}.list"
+            report "${V_KEY[$i]}: nothing to add (queued archives were superseded${V_EXCL[$i]:+ or ${V_EXCL[$i]} releases})"
+        done
+        continue
+    fi
 
-# Amiga filesystem compliance checking (illegal characters, FFS/PFS length
-# limits) only cares about each file/path component's own name - it's
-# unaffected by which variant's artwork ends up sitting next to it later,
-# or by the CD32/AGA/NTSC/MT32/CDTV/language reorganization sort.sh does
-# afterward (that only adds new parent directories with short, fixed
-# names - it doesn't lengthen or rename any existing component). So it's
-# safe to run this ONCE here, on the shared extracted tree, and skip it in
-# each variant's own sort.sh pass below (--skipchk) - matching what the
-# extract-once optimization above already does for extraction itself.
-#
-# The CD32/AGA/NTSC/MT32/CDTV/language reorganization itself is NOT
-# shared this same way: it moves each game's whole directory under a new
-# parent (e.g. WHDLoad/Languages/German/Games/S/SomeGame), and merge.sh's
-# own game-directory search only looks a few levels deep - doing that
-# reorganization before merge would risk merge.sh silently failing to
-# find (and so failing to add artwork to) any game already moved into one
-# of those subfolders. So --skip-variant-sort is used ONLY for this
-# shared pass, and each variant still does its own reorganization after
-# its own merge step, same as before.
-echo
-echo "===== Compliance check (once, shared across all variants) ====="
-./start.sh --sort --skip-variant-sort --no-detox "$@" --dest retro_aga
+    src="$STAGE_ROOT/src_$g"; batch="$WORK_ROOT/batch_$g"
+    narch=0
+    while IFS= read -r p; do
+        mkdir -p "$src/$(dirname "$p")"
+        ln "$SCRIPT_DIR/$p" "$src/$p" 2>/dev/null || cp -p "$SCRIPT_DIR/$p" "$src/$p" || fail "could not stage $p"
+        narch=$((narch + 1))
+    done < "$list"
 
-echo
-echo "Copying extracted+checked files into retro_ecs and retro_rtg (no re-extraction or re-checking needed)..."
-rm -rf -- retro_ecs retro_rtg
-cp -a retro_aga retro_ecs
-cp -a retro_aga retro_rtg
+    est_kb=$(( $(rp_du_kb "$src") * RP_SPACE_FACTOR ))
+    rp_require_space "$RP_OUTPUT_ROOT" $((est_kb * (1 + 2 * nmembers))) "processing $narch new archive(s)" \
+        || fail "not enough disk space to process the new downloads"
 
-echo
-echo "===== Variant 1 of 3: AGA artwork + sort ====="
-./start.sh --merge --art Covers,Screens,Titles --no-detox "$@" --aga --dest retro_aga
-./start.sh --sort --skipchk --no-detox "$@" --dest retro_aga
+    echo "--- Extracting $narch new archive(s) ---"
+    (cd "$src" && bash "$SCRIPT_DIR/extract.sh" -u -d "$batch" $DEBUG_FLAG)
+    xst=$?
+    rescue_extract_log "$src"
+    [ "$xst" -eq 0 ] || fail "extracting the new archives failed"
+    mkdir -p "$batch"
+    echo "--- Sorting and checking filenames ---"
+    sort_folder "$batch" || fail "sorting the new archives failed"
+    bgames="$(rp_count_games "$batch")"
 
-echo
-echo "===== Variant 2 of 3: ECS artwork + sort ====="
-./start.sh --merge --art Covers,Screens,Titles --no-detox "$@" --ecs --dest retro_ecs
-./start.sh --sort --skipchk --no-detox "$@" --dest retro_ecs
+    remaining="$nmembers"
+    for i in $members; do
+        remaining=$((remaining - 1))
+        key="${V_KEY[$i]}"; dest="${V_DEST[$i]}"; vcopy="$WORK_ROOT/v_$key"
+        echo
+        echo "===== $key: adding artwork and installing the new batch ====="
+        if [ "$remaining" -eq 0 ]; then
+            mv "$batch" "$vcopy" || fail "could not prepare the batch for $key"
+        else
+            cp -a "$batch" "$vcopy" || fail "could not prepare the batch for $key"
+        fi
+        miss="$REPORT_TMP.missing"; : > "$miss"
+        merge_variant "$i" "$vcopy" --report-missing "$miss" || fail "adding artwork to the new batch for $key failed"
+        rp_replace_and_copy "$vcopy" "$dest" || fail "copying the new batch into $dest failed"
 
-echo
-echo "===== Variant 3 of 3: RTG artwork + sort ====="
-./start.sh --merge --art Covers,Screens,Titles --no-detox "$@" --rtg --dest retro_rtg
-./start.sh --sort --skipchk --no-detox "$@" --dest retro_rtg
+        # Keep a dated copy of just this batch (e.g. for copying to the Amiga).
+        rp_migrate_new_dir "${V_NEW[$i]}"
+        mkdir -p "${V_NEW[$i]}"
+        mv "$vcopy" "${V_NEW[$i]}/$RUN_TS" || fail "could not save the batch to ${V_NEW[$i]}"
+        rp_prune_batches "${V_NEW[$i]}" "$RP_KEEP_NEW_BATCHES"
 
-echo
-echo "All 3 variants complete: retro_aga, retro_ecs, retro_rtg"
+        # Fill in artwork for anything in the collection still missing it.
+        gapnote=""
+        merge_variant "$i" "$dest" --only-missing || gapnote=" (artwork gap-fill reported errors - see retroerror.log)"
 
-else
-
-echo "Existing output found for all three variants - staging and extracting"
-echo "just the newly downloaded batch once, instead of once per variant."
-echo
-
-echo "===== Update check ====="
-if ./start.sh --update "$@"; then
-    update_status=0
-else
-    update_status=$?
-fi
-
-if [ "$update_status" -eq 3 ]; then
-    echo
-    echo "Stopping: update.sh reported a wget error (see above)." >&2
-    exit 1
-elif [ "$update_status" -eq 2 ]; then
-    echo
-    echo "Nothing new to download - nothing to build. Stopping."
-    exit 2
-elif [ "$update_status" -ne 0 ]; then
-    echo
-    echo "Stopping: update.sh failed unexpectedly (exit $update_status)." >&2
-    exit "$update_status"
-fi
-
-# Stage exactly the files update.log named this run, preserving their
-# relative layout (the same technique start.sh's own incremental --auto
-# path and quick.sh use), then extract that small batch ONCE - this is
-# the same waste as the fresh-build case, just on a smaller scale: a
-# handful of new archives extracted three times instead of once.
-TEMP_SRC_DIR="$SCRIPT_DIR/.staging_src_all_$$"
-STAGING_BASE="$SCRIPT_DIR/.staging_out_all_$$"
-rm -rf -- "$TEMP_SRC_DIR" "$STAGING_BASE"
-mkdir -p "$TEMP_SRC_DIR" "$STAGING_BASE"
-
-staged_any=0
-if [ -f update.log ]; then
-    while IFS= read -r logline; do
-        filepath=$(printf '%s\n' "$logline" | sed 's/^[0-9-]* [0-9:]* //')
-        [ -f "$filepath" ] || continue
-        relpath="${filepath#./}"
-        destpath="$TEMP_SRC_DIR/$relpath"
-        mkdir -p "$(dirname "$destpath")"
-        cp -f "$filepath" "$destpath" 2>/dev/null && staged_any=1
-    done < update.log
-fi
-
-if [ "$staged_any" -eq 0 ]; then
-    echo "Nothing to stage - update.log had no readable entries. Stopping."
-    rm -rf -- "$TEMP_SRC_DIR" "$STAGING_BASE"
-    exit 2
-fi
-
-echo
-echo "===== Extracting the new batch once (shared across all variants) ====="
-(cd "$TEMP_SRC_DIR" && bash "$SCRIPT_DIR/extract.sh" -d "$STAGING_BASE")
-rm -rf -- "$TEMP_SRC_DIR"
-
-echo
-echo "===== Compliance check (once, shared across all variants) ====="
-./start.sh --sort --skip-variant-sort --no-detox "$@" --dest "$STAGING_BASE"
-
-for variant in aga ecs rtg; do
-    dest="retro_$variant"
-    staging_copy="$SCRIPT_DIR/.staging_${variant}_batch_$$"
-    rm -rf -- "$staging_copy"
-    cp -a "$STAGING_BASE" "$staging_copy"
-
-    echo
-    echo "===== Variant: $variant (incremental) ====="
-    ./start.sh --merge --art Covers,Screens,Titles --no-detox "$@" --"$variant" --dest "$staging_copy"
-    ./start.sh --sort --skipchk --no-detox "$@" --dest "$staging_copy"
-
-    echo "Merging new batch into $dest..."
-    mkdir -p "$dest"
-    cp -a "$staging_copy/." "$dest/"
-
-    new_dir_name="new_${variant}"
-    rm -rf -- "$new_dir_name"
-    mv "$staging_copy" "$new_dir_name"
-    echo "New-files duplicate: $new_dir_name"
-
-    echo "Gap-fill artwork pass on $dest..."
-    ./start.sh --merge --art Covers,Screens,Titles --no-detox "$@" --"$variant" --dest "$dest" --only-missing
+        rp_queue_remove_processed "$key" "$STAGE_ROOT/processed_$key.list"
+        nomiss="$(save_missing_list "$i" "$miss")"
+        line="$key: $bgames game(s) added/updated from $narch archive(s) - batch saved in ${V_NEW[$i]##*/}/$RUN_TS, $nomiss without artwork"
+        [ "$nomiss" -gt 0 ] && line="$line (list: reports/${RUN_TS}_${key}_no_artwork.txt)"
+        report "$line$gapnote"
+    done
+    rm -rf -- "$src"
 done
 
-rm -rf -- "$STAGING_BASE"
+# ============================================================================
+# 5. Up-to-date variants with --force: artwork gap-fill only
+# ============================================================================
+for i in "${!V_TOK[@]}"; do
+    [ "${V_ACT[$i]}" = gapfill ] || continue
+    echo
+    echo "===== ${V_KEY[$i]}: artwork gap-fill ====="
+    merge_variant "$i" "${V_DEST[$i]}" --only-missing || fail "artwork gap-fill for ${V_KEY[$i]} failed"
+    report "${V_KEY[$i]}: up to date - artwork gap-fill done"
+done
 
-echo
-echo "All 3 variants updated: retro_aga, retro_ecs, retro_rtg"
-
-fi
+exit 0

@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
+# Builds or updates the ECS variant (retro_ecs). Extra options are passed
+# through to start.sh, for example:
+#   ./ecs.sh --rebuild   rebuild from the downloaded archives, no update check
+#   ./ecs.sh --clean     check for updates, then rebuild from scratch
+#   ./all.sh --ecs --dry-run   preview what would happen
+# Art order, detox and filesystem defaults come from retroplay.conf.
 set -e
-# cd to this script's own directory first, so it works no matter where
-# it's run from (e.g. ~/retroplay/ecs.sh from your home directory) -
-# start.sh is called with a relative path below.
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
-./start.sh --auto --ecs --no-detox "$@"
+exec ./start.sh --auto --ecs "$@"

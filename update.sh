@@ -28,34 +28,32 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # the other scripts would ever see.
 cd "$SCRIPT_DIR" || { echo "ERROR: cannot cd to script directory: $SCRIPT_DIR" >&2; exit 1; }
 
-# Dependency tracking (for uninstall_deps.sh): records exactly what this
-# suite of scripts installs, so the uninstaller can later remove only
-# those specific things and leave anything already present on the system
-# - installed by the user, or by something else entirely - untouched.
-DEP_TRACK_FILE="$SCRIPT_DIR/.retroplay_installed_deps.log"
-record_installed_dep() {
-    local dep_line="$1:$2"
-    if ! grep -qxF "$dep_line" "$DEP_TRACK_FILE" 2>/dev/null; then
-        echo "$dep_line" >> "$DEP_TRACK_FILE"
-    fi
-}
+# Shared helpers (retroplay.conf settings, dependency tracking, pending
+# queues, disk-space checks...) live in lib.sh, next to this script.
+if [ ! -f "$SCRIPT_DIR/lib.sh" ]; then
+    echo "ERROR: lib.sh is missing from $SCRIPT_DIR - it ships with these scripts." >&2
+    exit 1
+fi
+. "$SCRIPT_DIR/lib.sh"
+rp_load_config
 
-# True only if the package manager itself already has this package fully
-# installed. Checked BEFORE offering an install, so a package that was
-# already on the system (e.g. installed but its command isn't on PATH, as
-# with Homebrew's keg-only util-linux) is never recorded as installed by
-# these scripts - `apt-get install` / `brew install` both succeed as a
-# no-op in that case, which would otherwise make the uninstaller remove
-# something the user already had. dpkg-query's "install ok installed" is
-# used instead of plain `dpkg -s`, which also succeeds for packages that
-# were removed but left their config files behind.
-pkg_already_installed() {
-    case "$1" in
-        apt)  dpkg-query -W -f='${Status}' "$2" 2>/dev/null | grep -q "install ok installed" ;;
-        brew) command -v brew >/dev/null 2>&1 && brew list --versions "$2" >/dev/null 2>&1 ;;
-        *)    return 1 ;;
+DRY_RUN=0
+for _arg in "$@"; do
+    case "$_arg" in
+        --dry-run) DRY_RUN=1 ;;
+        -h|--help)
+            echo "Usage: $(basename "$0") [--dry-run]"
+            echo "  Mirrors the Retroplay WHDLoad packs from the FTP server, logs new"
+            echo "  files to update.log and queues them for processing."
+            echo "  --dry-run  Ask the server what WOULD be downloaded, without downloading."
+            echo "Exit codes: 0 = new files, 2 = nothing new, 3 = server/network error."
+            exit 0 ;;
+        *) echo "Unknown option: $_arg (try --help)" >&2; exit 1 ;;
     esac
-}
+done
+unset _arg
+
+FTP_BASE="ftp://ftp:amiga@grandis.nu/Retroplay%20WHDLoad%20Packs"
 
 # ----- wget dependency check, with an offer to auto-install if missing -----
 if ! command -v wget >/dev/null 2>&1; then
@@ -124,6 +122,72 @@ dirs=(
     "WHDLoad/Demos"
     "WHDLoad/Games"
 )
+# Remote name for a local directory: "WHDLoad/Games" is published as
+# "Commodore_Amiga_-_WHDLoad_-_Games" (spaces to underscores, "/" to "_-_").
+remote_dir_for() {
+    local t="Commodore_Amiga_-_${1//\//_-_}"
+    printf '%s' "${t// /_}"
+}
+
+# Lists file names in one remote FTP directory (one per line). Uses curl's
+# plain name listing when available, otherwise parses the HTML index wget
+# builds for FTP directories.
+remote_list() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsS -l -m 120 "$1/" 2>/dev/null | tr -d '\r'
+    else
+        wget -q -T 120 -O - "$1/" 2>/dev/null | \
+            grep -o 'href="[^"]*"' | sed 's/^href="//; s/"$//; s|/$||; s|.*/||'
+    fi
+}
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "Dry run: asking the server what would be downloaded (nothing is changed)."
+    echo "This compares file NAMES only, so it's an estimate: a file that was"
+    echo "re-published under the same name wouldn't show up here."
+    echo
+    dry_total=0; dry_failed=0
+    for dir in "${dirs[@]}"; do
+        url="$FTP_BASE/$(remote_dir_for "$dir")"
+        top="$(remote_list "$url")"
+        if [ -z "$top" ]; then
+            printf '  %-20s could not read the server listing\n' "$dir"
+            dry_failed=1; continue
+        fi
+        missing=0; examples=""
+        while IFS= read -r entry; do
+            [ -n "$entry" ] || continue
+            case "$entry" in
+                .|..) continue ;;
+                *.lha|*.LHA|*.lzx|*.LZX|*.zip|*.ZIP) files="$entry"; sub="" ;;
+                *) sub="$entry"; files="$(remote_list "$url/$sub")" ;;
+            esac
+            while IFS= read -r fname; do
+                case "$fname" in *.lha|*.LHA|*.lzx|*.LZX|*.zip|*.ZIP) ;; *) continue ;; esac
+                if [ -n "$sub" ]; then rel="$dir/$sub/$fname"; else rel="$dir/$fname"; fi
+                if [ ! -e "$rel" ]; then
+                    missing=$((missing + 1))
+                    [ "$missing" -le 5 ] && examples="$examples      $rel
+"
+                fi
+            done <<< "$files"
+        done <<< "$top"
+        printf '  %-20s %d new file(s)\n' "$dir" "$missing"
+        [ -n "$examples" ] && printf '%s' "$examples"
+        [ "$missing" -gt 5 ] && echo "      ...and $((missing - 5)) more"
+        dry_total=$((dry_total + missing))
+    done
+    echo
+    echo "Would download about $dry_total file(s)."
+    [ "$dry_failed" -eq 1 ] && exit 3
+    [ "$dry_total" -eq 0 ] && exit 2
+    exit 0
+fi
+
+# Folders built by older versions of these scripts are adopted now, so
+# anything downloaded below gets queued for them too.
+rp_adopt_configured_variants
+
 SECONDS=0
 logfile="update.log"
 : > "$logfile"
@@ -157,14 +221,13 @@ do
     # The remote WHDLoad pack path mirrors our local directory name, just
     # with spaces turned to underscores and a "Commodore_Amiga_-_" prefix,
     # and "/" swapped for "_-_" (e.g. "WHDLoad/Games" -> ..._-_WHDLoad_-_Games).
-    dirtemp="Commodore_Amiga_-_${dir//\//_-_}"
-    dirpath="${dirtemp// /_}"
+    dirpath="$(remote_dir_for "$dir")"
 
     # --mirror recurses and only re-fetches files that changed on the
     # server (by size/date), so re-running this is safe and cheap when
     # nothing new has been published. -np/-nH/--cut-dirs=2 keep the local
     # layout flat instead of recreating the whole remote path structure.
-    wget -q --mirror -np -nH --cut-dirs=2 "ftp://ftp:amiga@grandis.nu/Retroplay%20WHDLoad%20Packs/$dirpath" > /dev/null
+    wget -q --mirror -np -nH --cut-dirs=2 "$FTP_BASE/$dirpath" > /dev/null
     wget_status=$?
 
     popd > /dev/null || exit 1
@@ -181,39 +244,45 @@ do
         if [ -n "$nf" ]; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') $nf" >> "$logfile"
             new_files=$((new_files + 1))
+            # Queue it for every finished output folder; it stays queued
+            # until that folder has actually absorbed it (see lib.sh).
+            rp_queue_new_archive "$nf"
 
-            # Prune superseded archives: if a NEW archive just landed here,
-            # any OTHER archive in the same directory for the SAME GAME is
-            # an older release the server has since replaced with this one.
-            #
-            # IMPORTANT: this must match on game name, not just "same
-            # directory" - Retroplay's actual layout buckets many different
-            # games together by first letter (e.g. everything in
-            # WHDLoad/Games/S/ is every S-game as flat files, not one
-            # per-game folder), so "same directory" alone is nowhere near
-            # enough - it would (and did) delete unrelated games that just
-            # happen to start with the same letter as whatever was new.
-            # The game name is taken as everything before the first
-            # "_v<digit>" version marker in the filename (e.g.
-            # "Superfrog_v1.9_0035.lha" -> "Superfrog"); a filename with no
-            # such marker is its own whole name, matched only against
-            # itself.
-            game_dir="$(dirname "$nf")"
-            new_base="$(basename "$nf")"
-            new_base="${new_base%.*}"
-            new_base="${new_base%%_[Vv][0-9]*}"
-            while IFS= read -r -d '' old_archive; do
-                if [ "$old_archive" != "$nf" ]; then
-                    old_base="$(basename "$old_archive")"
-                    old_base="${old_base%.*}"
-                    old_base="${old_base%%_[Vv][0-9]*}"
-                    if [ "$old_base" = "$new_base" ]; then
-                        rm -f "$old_archive"
-                        echo "$(date '+%Y-%m-%d %H:%M:%S') REMOVED (superseded by $nf): $old_archive" >> "$logfile"
+            # Prune superseded archives. An existing archive is only an
+            # older version of the new one when their names are IDENTICAL
+            # apart from the version field (see rp_archive_version_key in
+            # lib.sh) AND its version is strictly lower (1.10 > 1.9 > 1.1).
+            # So _AGA / _CD32 / _HD / _68040 releases of the same game are
+            # separate files and are never touched, and an equal or newer
+            # version is never removed. Pruned archives are quarantined in
+            # old/, not deleted.
+            new_kv="$(rp_archive_version_key "$nf")"
+            exempt_file="$(rp_prune_exempt_file)"
+            # Came back after being quarantined? Then the server still has
+            # it - exempt it from pruning so it isn't re-downloaded and
+            # removed again on every run.
+            if ls old/*/"$nf" >/dev/null 2>&1 && ! grep -qxF "$nf" "$exempt_file" 2>/dev/null; then
+                rp_state_init
+                printf '%s\n' "$nf" >> "$exempt_file"
+                echo "$(date '+%Y-%m-%d %H:%M:%S') KEPT (server still offers it, no longer pruned): $nf" >> "$logfile"
+            fi
+            if [ -n "$new_kv" ]; then
+                new_key="${new_kv%|*}"; new_ver="${new_kv##*|}"
+                game_dir="$(dirname "$nf")"
+                while IFS= read -r -d '' old_archive; do
+                    [ "$old_archive" != "$nf" ] || continue
+                    old_kv="$(rp_archive_version_key "$old_archive")"
+                    [ -n "$old_kv" ] && [ "${old_kv%|*}" = "$new_key" ] || continue
+                    [ "$(rp_version_cmp "${old_kv##*|}" "$new_ver")" = "-1" ] || continue
+                    grep -qxF "$old_archive" "$exempt_file" 2>/dev/null && continue
+                    q_dest="old/$(date '+%Y-%m-%d')/$old_archive"
+                    mkdir -p "$(dirname "$q_dest")"
+                    if mv "$old_archive" "$q_dest"; then
+                        echo "$(date '+%Y-%m-%d %H:%M:%S') QUARANTINED (v${old_kv##*|} superseded by v$new_ver $nf): $old_archive -> $q_dest" >> "$logfile"
                         pruned_count=$((pruned_count + 1))
                     fi
-                fi
-            done < <(find "$game_dir" -maxdepth 1 -type f \( -iname "*.lha" -o -iname "*.lzx" -o -iname "*.zip" \) -print0 2>/dev/null)
+                done < <(find "$game_dir" -maxdepth 1 -type f \( -iname "*.lha" -o -iname "*.lzx" -o -iname "*.zip" \) -print0 2>/dev/null)
+            fi
         fi
     done < <(comm -13 before.txt after.txt)
 
@@ -231,6 +300,12 @@ do
 
     rm -f before.txt after.txt
 done
+
+# Quarantine folders (one per day) are deleted after OLD_ARCHIVE_DAYS days.
+if [ -d old ]; then
+    find old -mindepth 1 -maxdepth 1 -type d -mtime +"$RP_OLD_ARCHIVE_DAYS" \
+        -exec rm -rf {} + 2>/dev/null
+fi
 
 # Format elapsed time: hours:minutes:seconds
 hh=$((SECONDS/3600))
@@ -271,7 +346,7 @@ fi
 echo
 echo "Total new files across all directories: $total_new_files"
 if [ "$pruned_count" -gt 0 ]; then
-    echo "Superseded archives removed: $pruned_count (see $logfile for which ones)"
+    echo "Superseded archives moved to old/: $pruned_count (see $logfile; kept for $RP_OLD_ARCHIVE_DAYS days)"
 fi
 printf "Elapsed time: %02d:%02d:%02d\n" "$hh" "$mm" "$ss"
 logpath="$(cd "$(dirname "$logfile")" && pwd)"

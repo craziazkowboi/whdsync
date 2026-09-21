@@ -1,0 +1,53 @@
+# Amiga Retroplay settings
+# Copy this file to retroplay.conf (next to the scripts) and edit it.
+# Every setting is optional - anything left out uses the default shown.
+# Command-line options always override these. Run ./doctor.sh to check it.
+
+# Which variants all.sh builds (aga ecs rtg aga-laced ecs-laced, or the name
+# of any other iGame_NAME artwork folder).
+VARIANTS="aga ecs rtg"
+
+# Where retro_*, new_* and working files go. Relative to this folder, or an
+# absolute path - e.g. a USB SSD, which is far faster than a Pi's SD card:
+# OUTPUT_ROOT="/mnt/ssd/retroplay"
+OUTPUT_ROOT="."
+
+# Artwork priority. ART_ORDER_<VARIANT> overrides it for one variant.
+ART_ORDER="Covers,Screens,Titles"
+DEMO_ART_ORDER="Titles,Screens,Covers"
+# ART_ORDER_RTG="Screens,Covers,Titles"
+
+# Release tags a variant leaves out. ECS machines can't run AGA or CD32
+# releases, so by default the ECS variants skip them. Set to "" to keep all.
+# EXCLUDE_TAGS_ECS="AGA,CD32"
+# EXCLUDE_TAGS_ECS_LACED="AGA,CD32"
+
+# Amiga filename limits: pfs (107 characters) or ffs (30 characters).
+# For PFS, run  setfnsize <drive:> 107  on the Amiga first.
+FILESYSTEM="pfs"
+
+# Run detox to clean up filenames before sorting (yes/no).
+USE_DETOX="no"
+
+# Disk space: always leave this much free (MB), and assume extracted
+# archives take this many times their compressed size.
+MIN_FREE_MB=1024
+SPACE_FACTOR=3
+
+# How many dated new_<variant>/ batch folders to keep.
+KEEP_NEW_BATCHES=14
+
+# Days to keep superseded archives in old/ before deleting them.
+OLD_ARCHIVE_DAYS=30
+
+# Nightly log (all_cron.log) rotation.
+LOG_MAX_MB=5
+LOG_KEEP=4
+
+# Notifications when a run fails (and optionally when it succeeds).
+# ntfy: install the ntfy app, subscribe to a hard-to-guess topic name.
+NTFY_TOPIC=""
+NTFY_SERVER="https://ntfy.sh"
+# Email needs a working 'mail' command on this machine.
+NOTIFY_EMAIL=""
+NOTIFY_ON_SUCCESS="no"

@@ -63,6 +63,7 @@ fi
 DEBUG=0
 processed=0
 CUSTOM=0
+REPORT_MISSING=""  # --report-missing FILE: append each game that got no artwork
 ONLY_MISSING=0   # --only-missing: skip any target that already has an
                  # iGame.iff-family file AND a .data file - used for a
                  # cheap "fill gaps" pass over an existing collection
@@ -268,6 +269,7 @@ while [ $# -gt 0 ]; do
         ;; 
         --a314) PLATFORM_HINT="a314"; shift ;;
         --only-missing) ONLY_MISSING=1; shift ;;
+        --report-missing) REPORT_MISSING="$2"; shift 2 ;;
         --debug) DEBUG=1; shift ;;
         -h|--help)
             echo
@@ -298,6 +300,8 @@ while [ $# -gt 0 ]; do
             echo " --art Set merge priority order for non-demos (default: Screens,Covers,Titles)"
             echo "       Example: --art \"Screens,Covers,Titles\""
             echo " --demo-art Set merge priority order for Demos (default: Titles,Screens,Covers)"
+            echo " --only-missing Skip games that already have artwork (gap-fill mode)"
+            echo " --report-missing FILE  Append each game that got no artwork to FILE"
             echo "       Example: --demo-art \"Titles,Screens,Covers\""
             echo "  --a314            Hint: running on A314 (lower parallelism, fewer updates)"
             echo "  --only-missing    Skip any target that already has an iGame.iff-family file"
@@ -467,7 +471,7 @@ index_source() {
 
                         # One non-recursive level: children are expected to be game dirs
                         while IFS= read -r -d '' game_dir; do
-                            game_name="$(basename "$game_dir")"
+                            game_name="${game_dir##*/}"
                             key="$src_key|$sec|$game_name"
                             # Only keep the first hit per source+section+game
                             if [ -z "${IGAME_INDEX[$key]+_}" ]; then
@@ -504,7 +508,14 @@ if [ "$indexed_any_source" -eq 0 ] && [ ! -d "$TINYLAUNCHER_SRC" ]; then
 fi
 
 if [ ! -d "$DEST/WHDLoad" ]; then
-    echo "ERROR: No WHDLoad directory found at: $DEST/WHDLoad"
+    # Not an error: artwork only applies to WHDLoad/, and a batch of new
+    # downloads can legitimately contain only HD_Loaders or JST releases
+    # (this used to stop the whole run with "No WHDLoad directory found").
+    if [ -d "$DEST" ]; then
+        echo "No WHDLoad folder in $DEST - nothing to add artwork to (only HD_Loaders/JST content)."
+        exit 0
+    fi
+    echo "ERROR: destination folder not found: $DEST"
     exit 1
 fi
 
@@ -607,11 +618,22 @@ TINYLAUNCHER_LOG="/tmp/artwork_merger_tinylauncher.$$"
 : > "$IGAMEECS_LOG"
 : > "$TINYLAUNCHER_LOG"
 
-trap 'echo -e "\nAborted by user. Cleaning up..."; pkill -P $$; rm -f "$ERROR_LOG" "$IGAMEECS_LOG" "$TINYLAUNCHER_LOG"; exit 130' INT
+# Temp files are removed however the script ends. Leftovers from earlier
+# runs that were killed outright (their process no longer exists) are
+# swept up here too.
+for _tf in /tmp/artwork_merger_*.*; do
+    [ -e "$_tf" ] || continue
+    _pid="${_tf##*.}"
+    case "$_pid" in *[!0-9]*|"") continue ;; esac
+    kill -0 "$_pid" 2>/dev/null || rm -f -- "$_tf"
+done
+unset _tf _pid
+trap 'rm -f "$ERROR_LOG" "$IGAMEECS_LOG" "$TINYLAUNCHER_LOG"' EXIT
+trap 'echo -e "\nAborted. Cleaning up..."; pkill -P $$ 2>/dev/null; exit 130' INT TERM
 
 merge_targets=()
 while IFS= read -r -d '' dir; do
-    base="$(basename "$dir")"
+    base="${dir##*/}"
 
     # Skip known non-game helper directories
     case "$base" in
@@ -623,6 +645,20 @@ while IFS= read -r -d '' dir; do
 
     merge_targets+=( "$dir" )
 done < <(find "$whdload_path" -mindepth 1 -maxdepth 4 -type d -print0 2>/dev/null)
+
+# Games that sort.sh has already moved into variant/language subfolders sit
+# deeper than the 4 levels scanned above (e.g. WHDLoad/Languages/German/AGA/
+# Games/S/SomeGame is 7 levels down) - this matters now that all.sh sorts
+# BEFORE merging. Those are found by the WHDLoad drawer-icon convention:
+# every extracted game directory "X" ships with an "X.info" icon beside it,
+# which also cleanly excludes structural folders (AGA/, Languages/, S/ ...)
+# and folders inside a game. The scan above is left exactly as it was, so
+# nothing that used to get artwork can stop getting it.
+while IFS= read -r -d '' _info; do
+    _gd="${_info%.*}"
+    [ -d "$_gd" ] && merge_targets+=( "$_gd" )
+done < <(find "$whdload_path" -mindepth 5 -maxdepth 8 -type f -iname '*.info' -print0 2>/dev/null)
+unset _info _gd
 
 total_targets="${#merge_targets[@]}"
 
@@ -640,7 +676,7 @@ try_copy_matched_artwork() {
     #    Preserve original names; skip any that already exist.
     for f in "$best_dir"/*; do
         [ -f "$f" ] || continue
-        base="$(basename "$f")"
+        base="${f##*/}"
         case "$base" in
             *:a314) continue ;;  # A314 bridge metadata sidecar file, not real artwork
         esac
@@ -649,7 +685,7 @@ try_copy_matched_artwork() {
         esac
         dest_file="$dest_sub/$base"
         if [ ! -e "$dest_file" ]; then
-            debug_log " Non-IFF copy: $base -> $(basename "$dest_file")"
+            debug_log " Non-IFF copy: $base -> ${dest_file##*/}"
             if ! cp -p "$f" "$dest_file" 2>/dev/null; then
                 echo "ERROR copying non-IFF $best_section for $dest_name from $f" >> "$ERROR_LOG"
             fi
@@ -668,7 +704,7 @@ try_copy_matched_artwork() {
     chosen_src_iff=""
     for f in "$best_dir"/*; do
         [ -f "$f" ] || continue
-        base="$(basename "$f")"
+        base="${f##*/}"
         case "$base" in
             *:a314) continue ;;  # A314 bridge metadata sidecar file
         esac
@@ -682,7 +718,7 @@ try_copy_matched_artwork() {
 
     [ -z "$chosen_src_iff" ] && return 1
 
-    base="$(basename "$chosen_src_iff")"
+    base="${chosen_src_iff##*/}"
     dest_file="$dest_sub/$base"
 
     # Priority-based renaming for iGame.iff
@@ -692,7 +728,7 @@ try_copy_matched_artwork() {
         2) dest_file="$dest_sub/igame2.iff" ;;
     esac
 
-    debug_log " iGame.iff copy: $(basename "$chosen_src_iff") -> $(basename "$dest_file")"
+    debug_log " iGame.iff copy: ${chosen_src_iff##*/} -> ${dest_file##*/}"
 
     if cp -f "$chosen_src_iff" "$dest_file" 2>/dev/null; then
         igameecs_found=1
@@ -701,10 +737,10 @@ try_copy_matched_artwork() {
         src_stem="${chosen_src_iff%.*}"
         data_src="${src_stem}.data"
         if [ -f "$data_src" ]; then
-            data_base="$(basename "$data_src")"
+            data_base="${data_src##*/}"
             data_dst="$dest_sub/$data_base"
             if [ ! -e "$data_dst" ]; then
-                debug_log " Paired .data copy: $data_base -> $(basename "$data_dst")"
+                debug_log " Paired .data copy: $data_base -> ${data_dst##*/}"
                 if ! cp -p "$data_src" "$data_dst" 2>/dev/null; then
                     echo "ERROR copying .data for $dest_name from $data_src" >> "$ERROR_LOG"
                 fi
@@ -727,7 +763,7 @@ try_copy_matched_artwork() {
 
 for dest_sub in "${merge_targets[@]}"; do
     [ -z "$dest_sub" ] && continue
-    dest_name="$(basename "$dest_sub")"
+    dest_name="${dest_sub##*/}"
     debug_log "Processing target: $dest_name -> $dest_sub"
 
     # --only-missing: skip this target entirely if it already has an
@@ -829,7 +865,7 @@ for dest_sub in "${merge_targets[@]}"; do
             for ext in iff IFF; do
                 candidate="$search_dir/${dest_name}_SCR${tl_primary_index}.${ext}"
                 if [ -f "$candidate" ]; then
-                    debug_log " FOUND TinyLauncher candidate: $(basename "$candidate")"
+                    debug_log " FOUND TinyLauncher candidate: ${candidate##*/}"
                     tl_src="$candidate"
                     break
                 fi
@@ -885,6 +921,11 @@ for dest_sub in "${merge_targets[@]}"; do
 
     if [ "$igameecs_found" -eq 0 ] && [ "$tinylauncher_found" -eq 0 ]; then
         debug_log "NO ARTWORK FOUND for $dest_name"
+        # Only real game folders (those with a drawer icon beside them) are
+        # reported, so structural folders like AGA/ or S/ never show up.
+        if [ -n "$REPORT_MISSING" ] && [ -e "$dest_sub.info" ]; then
+            printf '%s\n' "${dest_sub#"$DEST"/}" >> "$REPORT_MISSING"
+        fi
     fi
 
     # Progress and counters for this dest_sub

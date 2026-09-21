@@ -1,42 +1,66 @@
 # whdsync
 
-> ⚠️ **Before copying anything onto a PFS Amiga partition:** set its filename size to 107, or PFS's default limit can corrupt the partition when it encounters the longer filenames some Retroplay archives extract to.
+> ⚠️ **Before copying anything onto a PFS Amiga partition:** set its filename size to 107, or PFS's default limit can corrupt the partition when it meets the long filenames some Retroplay archives extract to.
 >
 > ```
 > setfnsize <drive:> 107
 > ```
 >
-> `setfnsize` ships in the PFS package on [Aminet](https://aminet.net/). Run this once per partition before your first sync — it is **not** something these scripts can do for you from the Pi/macOS/Linux side, since it has to be set on the Amiga itself.
+> `setfnsize` ships in the PFS package on [Aminet](https://aminet.net/). Run it once per partition, on the Amiga, before your first sync.
 
-A collection of Bash scripts to automate downloading, extracting, merging artwork into, sorting, and deploying Retroplay WHDLoad archives for Amiga setups. Designed to run unattended (e.g. via cron) on modest hardware such as a Raspberry Pi Zero 2W, as well as on macOS and Linux desktops.
+Bash scripts that download the Retroplay WHDLoad packs, extract them, add iGame/TinyLauncher artwork, sort them into variant and language folders, and keep everything up to date — unattended, nightly, on something as small as a Raspberry Pi Zero 2W, as well as on macOS and Linux.
+
+## Quick start
+
+```bash
+chmod +x *.sh
+./doctor.sh              # checks your setup and tells you what to fix
+./all.sh                 # first run: downloads and builds retro_aga, retro_ecs, retro_rtg
+./install_cron.sh        # then keep it up to date every night at 2am
+```
 
 ## Notes
 
-- After downloading the scripts into a directory, run `chmod +x *.sh` to make them executable.
-- All scripts move and rename files as part of normal operation. Keep backups of your WHDLoad tree before first use.
-- This README intentionally avoids including any copyrighted third-party content and only describes the behaviour of the provided scripts.
-- Every script can be run from any directory (e.g. `~/retroplay/aga.sh` from your home directory) — each one switches to its own directory first.
-- Bash 3.2+ is supported everywhere **except** `merge.sh`, which needs Bash 4+ (associative arrays). On macOS, `merge.sh` automatically re-launches itself under a Homebrew Bash if one is available; if not, it exits with an install hint (`brew install bash`).
+- Scripts move and rename files as part of normal operation. Keep a backup of your WHDLoad tree before first use.
+- Every script can be run from any directory — each one switches to its own folder first.
+- Temporary folders (`extract_tmp.*` and friends) are removed whenever a script finishes, fails or is stopped. Leftovers from a crash or power cut are swept up at the start of the next run (a folder whose run is still going is never touched).
+- Bash 3.2+ everywhere, except `merge.sh`, which needs Bash 4+. On macOS it relaunches itself under Homebrew's bash automatically (`brew install bash`).
+- This README only describes the scripts; it contains no third-party content.
 
 ## Prerequisites
 
-- **wget** – for `update.sh`.
-- **lha**, **unlzx**, **7z** (p7zip-full), **unar** – for `extract.sh`.
-- **detox** (optional) – for filename pre-cleaning in `sort.sh`; skip with `--no-detox` if not installed or not wanted.
-- **flock** (recommended) – lets `all.sh` refuse to run a second overlapping instance (e.g. if cron fires while a previous run is still going). Provided by `util-linux`; `all.sh` offers to install it if missing. On macOS, Homebrew installs it keg-only (not on `PATH`) — `all.sh` finds it via `brew --prefix util-linux` automatically, no `PATH` changes needed.
-- On Linux, make sure at least these locales are generated for extract.sh's encoding fallback chain:
-  - `C.UTF-8`
-  - `en_US.ISO-8859-1`
+- **wget** (downloads), **lha**, **unlzx**, **7z**, **unar** (extraction).
+- **flock** (recommended) — stops two runs overlapping. Part of `util-linux`; on macOS Homebrew installs it keg-only and the scripts find it automatically.
+- **detox** (optional) — only if you set `USE_DETOX=yes`.
+- **curl** or **wget**, and/or **mail** — only for notifications.
+- Linux locales `C.UTF-8` and `en_US.ISO-8859-1`.
 
-Each script offers to auto-install missing tools via `apt` (Linux) or `brew` (macOS) when run interactively; under cron or any other non-interactive context, it prints what's missing and continues without prompting.
+Run `./doctor.sh` to check all of this at once. Scripts offer to install missing tools via `apt`/`brew` when run interactively. `unlzx` has no package and must be built from [source on Aminet](https://aminet.net/package/util/arc/unlzx).
 
-Every install these scripts perform is recorded in `.retroplay_installed_deps.log`, so `uninstall_deps.sh` can later remove exactly those — and nothing else. A package is only recorded if the package manager confirms it was **not** already installed beforehand, so anything you already had (including a package that was installed but not on your `PATH`) is never touched by the uninstaller.
+Everything the scripts install is recorded, and only recorded if the package manager confirms it **wasn't** already installed — so `uninstall_deps.sh` can later remove exactly that and nothing you already had.
 
-`unlzx` has no apt/brew package and must be built from source ([Aminet](https://aminet.net/package/util/arc/unlzx)); the scripts print build instructions if it's missing.
+## Settings: `retroplay.conf`
+
+Copy `retroplay.conf.example` to `retroplay.conf` and edit it. Every setting is optional; command-line options override it. The file is read as plain `KEY=VALUE` lines (never executed), and `doctor.sh` warns about typos.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `VARIANTS` | `aga ecs rtg` | Which variants `all.sh` builds (`aga-laced`, `ecs-laced`, or any `iGame_NAME` set also work). |
+| `OUTPUT_ROOT` | `.` | Where `retro_*`, `new_*` and working files go — e.g. a USB SSD, which is far faster than an SD card. |
+| `ART_ORDER`, `ART_ORDER_<VARIANT>` | `Covers,Screens,Titles` | Artwork priority (per variant if needed). |
+| `DEMO_ART_ORDER` | `Titles,Screens,Covers` | Artwork priority for demos. |
+| `EXCLUDE_TAGS_<VARIANT>` | ECS variants: `AGA,CD32` | Releases a variant leaves out (see below). |
+| `FILESYSTEM` | `pfs` | Filename limits: `pfs` (107 characters) or `ffs` (30). |
+| `USE_DETOX` | `no` | Clean filenames with detox before sorting. |
+| `MIN_FREE_MB`, `SPACE_FACTOR` | `1024`, `3` | Free space to always keep, and how much bigger extracted files are than the archives. |
+| `KEEP_NEW_BATCHES` | `14` | Dated `new_*` batch folders to keep per variant. |
+| `OLD_ARCHIVE_DAYS` | `30` | Days to keep superseded archives in `old/`. |
+| `LOG_MAX_MB`, `LOG_KEEP` | `5`, `4` | Rotation of the nightly `all_cron.log`. |
+| `NTFY_TOPIC`, `NTFY_SERVER`, `NOTIFY_EMAIL`, `NOTIFY_ON_SUCCESS` | off | Notifications when a run fails (or succeeds). |
 
 ## Artwork directory layout
 
-To merge artwork, create the following structure next to the scripts, once per artwork set you want to use (at minimum `iGame_AGA`, `iGame_ECS`, `iGame_RTG`):
+Create this next to the scripts for each artwork set (at least `iGame_AGA`, `iGame_ECS`, `iGame_RTG`):
 
 ```
 iGame_AGA/
@@ -44,229 +68,171 @@ iGame_AGA/
 │   ├── Games/<A-Z, 0-9>/<GameName>/iGame.iff (+ matching .data file)
 │   ├── Demos/<A-Z, 0-9>/<GameName>/iGame.iff
 │   └── Magazines/<A-Z, 0-9>/<GameName>/iGame.iff
-├── Screens/
-│   └── ...same Games/Demos/Magazines/<letter>/<GameName> layout
-└── Titles/
-    └── ...same Games/Demos/Magazines/<letter>/<GameName> layout
+├── Screens/   (same layout)
+└── Titles/    (same layout)
 ```
 
-`<GameName>` must match the name of the extracted game/demo/magazine directory under `WHDLoad/`. `Games`/`Demos`/`Magazines` and `Covers`/`Screens`/`Titles` may also be singular (`Game`, `Cover`, etc.) — both are recognised.
+`<GameName>` must match the extracted game folder's name. Singular folder names (`Game`, `Cover`) also work. Any `iGame_<NAME>` folder is picked up automatically and usable as `--set NAME`. A generic `iGame_art` is a catch-all fallback, and `TinyLauncher/<Game|Demo|Magazine|Beta>/<GameName>_SCR<n>.iff` a last resort.
 
-Any directory named `iGame_<NAME>` next to the scripts is automatically picked up as a usable artwork set — not just AGA/ECS/RTG. Drop in `iGame_CD32`, `iGame_MyPack`, etc. and it becomes selectable via `--set <NAME>` with no script changes needed. A generic `iGame_art` (or anything starting `iGame_Art`) acts as a catch-all fallback pool tried before giving up on a game entirely. `TinyLauncher/<Game|Demo|Magazine|Beta>/<GameName>_SCR<0|1|2>.iff` is used as a last-resort screenshot source if no iGame artwork is found anywhere.
+## What gets built
 
-## Directory layout produced
+| Folder | Contents |
+|---|---|
+| `retro_aga`, `retro_ecs`, `retro_rtg` (and `retro_aga_laced`, `retro_ecs_laced`, `retro_<name>`) | The full collection for each variant. |
+| `new_<variant>/<date_time>/` | Just the games added or updated in each run — handy for copying only what changed to the Amiga. The newest `KEEP_NEW_BATCHES` are kept. |
+| `old/<date>/` | Superseded archives, kept `OLD_ARCHIVE_DAYS` days in case one was wrongly retired. |
+| `reports/` | A summary of every run, plus lists of games that got no artwork. |
 
-Each artwork variant builds into its own destination, named automatically from which artwork option was chosen (no manual renaming needed):
+**ECS leaves out AGA and CD32 releases.** An ECS machine can't run them, so archives whose name has an `AGA` or `CD32` field (e.g. `Game_v1.1_AGA_HD.lha`, but not a game merely called *Agamemnon*) are never extracted into `retro_ecs` or `retro_ecs_laced`. `retro_aga` and `retro_rtg` get everything. Change this with `EXCLUDE_TAGS_ECS` in `retroplay.conf`.
 
-- `retro_aga`, `retro_ecs`, `retro_rtg` — the three main variants
-- `retro_aga_laced`, `retro_ecs_laced` — the "Laced" artwork tiers, if selected directly
-- `retro_<name>` — for a custom `--set NAME` selection
-- `retro` — if no artwork variant was specified at all
+## How a run works (and why it's safe to interrupt)
 
-Override with `--dest <path>` on any script/action.
+`all.sh` is the engine; `start.sh --auto` and `aga.sh`/`ecs.sh`/`rtg.sh` run through it for a single variant.
 
-## Overview
+1. **Update.** `update.sh` mirrors the Retroplay FTP packs and **queues** every new archive for each finished variant. An archive stays queued until that variant has actually absorbed it, so a run that fails or is interrupted part-way is simply picked up by the next one.
+2. **Plan.** Each variant is either *not built yet*, *interrupted* (a full build that never finished — it's redone, never mistaken for a finished one), *has queued archives*, or *up to date*.
+3. **Full builds** extract and sort every archive **once**, then copy the result per variant; only the artwork differs.
+4. **Updates** stage just the queued archives, extract and sort them once, add each variant's artwork, then install them. A game in the batch **replaces** its old folder, so files from older versions don't linger. A dated copy goes into `new_<variant>/`, and a quick artwork gap-fill runs over the whole collection.
+5. **Report** in `reports/`, and a notification if something failed.
+
+Free disk space is checked before extracting and before each copy, and an existing collection is only removed once its replacement is ready to install.
+
+## Script reference
 
 | Script | Purpose |
 |---|---|
-| `start.sh` | Top-level dispatcher: runs update/extract/merge/sort/quick, or an interactive menu. |
-| `update.sh` | Mirrors Retroplay FTP packs, logging genuinely new files. |
-| `extract.sh` | Parallel archive extractor for `.lha`/`.lzx`/`.zip`, memory-aware on low-RAM devices. |
-| `merge.sh` | Copies the best available iGame/TinyLauncher artwork into each game's directory. |
-| `sort.sh` | Moves games into variant (CD32/AGA/NTSC/MT32/CDTV) and language subfolders, then checks/fixes Amiga filesystem compliance. |
-| `quick.sh` | Processes only newly downloaded files into a separate `new` directory, without touching the main collection. |
-| `all.sh` | Runs all three artwork variants (AGA, ECS, RTG) in one pass, extracting archives only once. |
-| `aga.sh` / `ecs.sh` / `rtg.sh` | One-liner wrappers around `start.sh --auto` for a single variant. |
-| `install_cron.sh` | Installs a daily (2am) cron job that runs `all.sh`. |
-| `uninstall_deps.sh` | Removes only the dependencies these scripts themselves installed. |
+| `all.sh` | The pipeline engine — builds/updates every variant in `VARIANTS`. |
+| `start.sh` | Menu and individual steps (update, extract, merge, sort, quick). |
+| `aga.sh` / `ecs.sh` / `rtg.sh` | One variant, via `start.sh --auto`. |
+| `update.sh` | Downloads, queues, and retires superseded archives. |
+| `extract.sh` | Parallel, memory-aware archive extractor. |
+| `merge.sh` | Adds artwork to game folders. |
+| `sort.sh` | Variant/language sorting and Amiga filename checks. |
+| `quick.sh` | Preview new downloads in `new/` without touching the collection. |
+| `doctor.sh` | Checks the whole setup and explains fixes. |
+| `install_cron.sh` | Nightly 2am run. |
+| `uninstall_deps.sh` | Removes only the tools these scripts installed. |
+| `lib.sh` | Shared helpers (not run directly). |
 
-## start.sh (dispatcher)
-
-The main entry point. With no action flag given, it shows an interactive menu instead.
+### all.sh
 
 ```
-Select an action:
+./all.sh [--aga] [--ecs] [--rtg] [--aga-laced] [--ecs-laced] [--set NAME] [--variants "a b"]
+         [--rebuild | --clean] [--skip-update] [--force] [--dry-run] [--cron] [--dest PATH]
+         [--art ORDER] [--demo-art ORDER] [--ffs | --pfs] [--no-detox | --detox] [--debug]
+```
+
+- No variant options: builds `VARIANTS` from `retroplay.conf`.
+- `--rebuild` — rebuild from the archives already downloaded, **without checking for updates**.
+- `--clean` — check for updates, then rebuild from scratch.
+- `--skip-update` — don't download; process whatever is queued.
+- `--force` — also run the artwork gap-fill on variants that are up to date.
+- `--dry-run` — show the plan, what's queued, the space needed, and an estimate from the server of what would be downloaded. Changes nothing.
+- `--cron` — for cron: full `PATH` (cron's default misses `/usr/local/bin` and Homebrew), log rotation, output to `all_cron.log`.
+- `--dest PATH` — custom output folder (single variant only).
+- Exit codes: `0` work done, `2` nothing to do, `1` failure.
+
+### start.sh
+
+With no options it shows a menu:
+
+```
   1) Auto (update, extract, merge, sort, clean)
   2) Update only
   3) Extract only
   4) Merge artwork
   5) Sort languages
   6) Quick (process new files)
-  7) Full rebuild, skip update (update already ran, or use option 1 instead)
+  7) Rebuild from downloaded archives (no update check)
+  8) Check setup (doctor)
   0) Exit
 ```
 
-Options:
+Options: `--auto`, `--rebuild`, `--update`, `--extract`, `--merge`, `--sort`, `--quick`, `--doctor`, `--ecs`/`--aga`/`--rtg`/`--ecs-laced`/`--aga-laced`, `--set NAME`, `--ffs`/`--pfs`, `--dest PATH`, `--art ORDER`, `--demo-art ORDER`, `--no-detox`/`--detox`, `--clean`, `--skip-update`, `--force`, `--skipchk`, `--skip-variant-sort`, `--only-missing`, `--report-missing FILE`, `--debug`, `--exit`, `-h`. All are case-insensitive.
 
-- `--auto` — Full pipeline: update, extract, merge, sort. If the destination directory already exists, this runs **incrementally** (stages and processes only newly downloaded files, then merges the result in, plus a light artwork gap-fill pass) instead of rebuilding everything.
-- `--clean` — Forces a full rebuild even if the destination already exists (removes it first).
-- `--skip-update` — Skip calling `update.sh`; reuse the existing `update.log` from this run to decide whether there's anything to process. Used internally by `all.sh`'s per-variant chaining.
-- `--update` — Only run `update.sh` (exit code passed straight through: 0 = new files, 2 = nothing new, 3 = wget error).
-- `--extract` — Only run `extract.sh`.
-- `--merge` — Only run `merge.sh`.
-- `--sort` — Only run `sort.sh`.
-- `--quick` — Only run `quick.sh`.
-- `--ecs` / `--aga` / `--rtg` — Select an artwork variant (also determines the destination directory name).
-- `--ecs-laced` / `--aga-laced` — Select the "Laced" tier of ECS/AGA artwork directly (matches `iGame_ECS_Laced`/`iGame_AGA_Laced`).
-- `--set [name]` — Select any other discovered `iGame_<name>` artwork directory.
-- `--ffs` / `--pfs` — Filesystem filename-length limits for `sort.sh` (PFS is the default).
-- `--dest [path]` — Override the destination directory.
-- `--art [order]` / `--demo-art [order]` — Artwork-section priority order for non-demos/demos, e.g. `Screens,Covers,Titles`.
-- `--no-detox` — Skip the detox pre-clean step (and its startup dependency check) entirely.
-- `--skipchk` — Skip the Amiga filesystem compliance check in `sort.sh`.
-- `--skip-variant-sort` — Skip the CD32/AGA/NTSC/MT32/CDTV and language-folder reorganization in `sort.sh` (used by `all.sh` for a shared compliance-only pass — see below).
-- `--debug` — Verbose debug output, forwarded to `extract.sh`/`merge.sh`.
-- `--exit` — Exit immediately.
-- `-h`, `--help` — Show help.
+### aga.sh / ecs.sh / rtg.sh
 
-At the end of a run, if anything was logged to `extract_errors.log`, `merge_errors.log`, `sort.log`, or `amiga_filename_issues.log`, these are consolidated into a single `retroerror.log` and you're prompted to view, delete, or leave it (skipped automatically when there's no terminal attached, e.g. under cron, or when running as part of `all.sh` — see below).
+```bash
+./ecs.sh              # update, then build or update retro_ecs
+./ecs.sh --rebuild    # rebuild retro_ecs from the downloaded archives, no update check
+./ecs.sh --clean      # update, then rebuild retro_ecs from scratch
+```
 
-## update.sh (Retroplay FTP mirroring)
+Any `start.sh` option can be added.
 
-Mirrors five WHDLoad pack directories from the Retroplay FTP server (`HD_Loaders/Games`, `JST/Games`, `WHDLoad/Magazines`, `WHDLoad/Demos`, `WHDLoad/Games`), and works out what's genuinely new by diffing the local file list before and after each mirror pass (`wget`'s own mirror mode doesn't report this directly).
+### update.sh
 
-- Logs newly downloaded files with timestamps to `update.log`.
-- Exit codes: `0` = new files found, `2` = nothing new anywhere, `3` = a `wget` error occurred (don't trust "0 new" in that case).
+Mirrors `HD_Loaders/Games`, `JST/Games`, `WHDLoad/Magazines`, `WHDLoad/Demos` and `WHDLoad/Games`, logs new files to `update.log`, and queues them.
 
-## extract.sh (archive extractor)
+**Retiring old versions.** An existing archive is only treated as an older version of a new one when the two names are **identical apart from the `_vX.Y` field**, and its version is **strictly lower**. Versions compare number by number, so `1.10` > `1.9` > `1.1`. So `_AGA`, `_CD32`, `_HD` and `_68040` releases of the same game are separate files and never touch each other. Retired archives go to `old/<date>/`, not the bin. If the server keeps offering one that was retired, it's exempted from then on rather than downloaded and retired every night.
 
-Scans **only** `HD_Loaders/`, `JST/`, and `WHDLoad/` (up to 4 levels deep) for `.lha`/`.lzx`/`.zip` archives and extracts them in parallel, trying ASCII, then ISO-8859-1, then the system locale for filenames that don't decode cleanly. The search is deliberately scoped to those three directories rather than the whole script directory, so artwork-pack folders sitting alongside them (some of which are themselves distributed as compressed archives) never get mistaken for WHDLoad games.
+- `--dry-run` — ask the server what would be downloaded (a name-based estimate), without downloading.
+- Exit codes: `0` new files, `2` nothing new, `3` network/server error.
 
-- Parallelism is capped based on available memory (as low as 1 job on devices with under ~768MB RAM) as well as CPU core count, with a per-archive timeout and detection of jobs killed by the OS (e.g. an out-of-memory kill).
-- Failed extractions are logged to `extract_errors.log`; killed jobs are reported separately from ordinary failures.
+### extract.sh
 
-Options:
+Extracts `.lha`/`.lzx`/`.zip` from `HD_Loaders/`, `JST/` and `WHDLoad/` in parallel. It caps parallelism by available memory (a single job on a 512MB Pi Zero 2W) and falls back through ASCII, ISO-8859-1 and system locales for awkward filenames.
 
-- `-d, --dest <path>` — Destination root (default `./retro`).
-- `-u, --unattended` — Run without prompts.
-- `--debug` — Verbose debug output.
-- `-h, --help` — Show help.
+Options: `-d, --dest PATH`, `-u, --unattended`, `--exclude-tags LIST`, `--only-tags LIST` (filter by name fields, e.g. `AGA,CD32`), `--debug`, `-h`.
 
-## merge.sh (iGame / TinyLauncher artwork merger)
+### merge.sh
 
-For every game/demo/magazine directory under `DEST/WHDLoad`, finds the best available iGame-style artwork and copies it in — the primary `iGame.iff` (renamed to `igame1.iff`/`igame2.iff` for lower-priority art sections found for the same game), its paired `.data` file, and any other files sitting alongside them in that artwork source directory. Falls back to TinyLauncher screenshots if no iGame artwork exists at all for that game.
-
-"Best available" is an ordered **fallback chain** of artwork sets, not just the one you asked for — so a game missing artwork in your chosen set can still pick it up from a lower-priority one rather than being left with nothing:
+For each game folder under `DEST/WHDLoad`, copies the best artwork found along a fallback chain:
 
 | Selection | Fallback chain |
 |---|---|
-| `--rtg` | RTG → AGA_Laced → AGA → iGame_art → ECS_Laced → ECS → TinyLauncher → *(any other discovered set)* |
+| `--rtg` | RTG → AGA_Laced → AGA → iGame_art → ECS_Laced → ECS → TinyLauncher → *(any other set)* |
 | `--aga` | AGA → iGame_art → ECS → TinyLauncher → *(other)* |
 | `--aga-laced` | AGA_Laced → AGA → iGame_art → ECS → TinyLauncher → *(other)* |
 | `--ecs` | ECS → iGame_art → TinyLauncher → *(other)* |
 | `--ecs-laced` | ECS_Laced → ECS → iGame_art → TinyLauncher → *(other)* |
-| `--set NAME` / `--custom` | the chosen set → iGame_art → TinyLauncher → *(other)* |
+| `--set NAME` | the chosen set → iGame_art → TinyLauncher → *(other)* |
 
-Options:
+Games already sorted into variant/language folders are found at any depth.
 
-- `--custom` — Interactive menu listing every discovered artwork set.
-- `--ecs` / `--aga` / `--rtg` — Shortcuts for `--set ECS` / `AGA` / `RTG`.
-- `--ecs-laced` / `--aga-laced` — Shortcuts for `--set ECS_LACED` / `AGA_LACED`.
-- `--set NAME` — Use the `iGame_NAME` directory as the artwork source (case-insensitive).
-- `-d, --dest <path>` — Destination root (default `./retro`).
-- `--art <order>` — Artwork-section priority for non-demos (default `Screens,Covers,Titles`).
-- `--demo-art <order>` — Artwork-section priority for demos (default `Titles,Screens,Covers`).
-- `--a314` — Hint that this is running on an A314 bridge (lower parallelism, fewer progress updates).
-- `--only-missing` — Skip any target that already has both an iGame.iff-family file and a `.data` file — a cheap way to fill gaps in an existing collection instead of re-checking everything.
-- `--debug` — Trace artwork matching decisions.
-- `-h, --help` — Show help, including the fallback chain reference above.
+Options: `--custom`, `--ecs`/`--aga`/`--rtg`/`--ecs-laced`/`--aga-laced`, `--set NAME`, `-d, --dest PATH`, `--art ORDER`, `--demo-art ORDER`, `--a314`, `--only-missing`, `--report-missing FILE`, `--debug`, `-h`.
 
-## sort.sh (variant/language sorter and compliance checker)
+### sort.sh
 
-The final pipeline step. Runs three largely independent passes:
+Moves games tagged CD32/AGA/NTSC/MT32/CDTV into `WHDLoad/<Variant>/` and language releases into `WHDLoad/Languages/<Language>/`. It also checks every filename against Amiga limits (forbidden characters, FFS/PFS length), fixing what it safely can and logging the rest to `amiga_filename_issues.log`.
 
-1. **Detox pre-clean** (optional, external tool) — cleans up problematic characters in filenames. Skip with `--no-detox`.
-2. **Variant and language sorting** — moves games with a recognised suffix (e.g. `SomeGame_AGA`, `SomeGame_De`) into `WHDLoad/<Variant>/...` or `WHDLoad/Languages/<Language>/...`, preserving `.info` icons alongside. Runs in parallel across several directories at once. Skip with `--skip-variant-sort`.
-3. **Amiga filesystem compliance check** — scans every file for forbidden characters (colon, slash, control characters, trailing spaces) and filename-length limits (FFS or PFS), auto-fixing what it safely can (truncation only — no transliteration) and logging what it can't to `amiga_filename_issues.log`. This check is parallelized across multiple worker processes for speed on large collections. Skip with `--skipchk`.
+Options: `-d, --dest PATH`, `--ffs`, `--pfs`, `--skipchk`, `--no-detox`, `--skip-variant-sort`, `-h`.
 
-Options:
+### quick.sh
 
-- `-d, --dest <path>` — Destination root (default `./retro`).
-- `--ffs` — FFS filename limits (30 characters — shorter).
-- `--pfs` — PFS filename limits (107 characters — default, more permissive).
-- `--skipchk` — Skip the compliance check entirely.
-- `--no-detox` — Skip detox, even if installed.
-- `--skip-variant-sort` — Skip the variant/language reorganization (used by `all.sh` — see below).
-- `--custom` — Reserved for dispatcher integration (no-op here).
-- `-h, --help` — Show help.
+Previews only the newest downloads (from `update.log`) in a separate `new/` folder, without touching your collection. ECS previews leave out AGA/CD32 releases too.
 
-## quick.sh (incremental processing)
+Options: `--ecs`/`--aga`/`--rtg`/`--ecs-laced`/`--aga-laced`/`--set NAME`, `--art`, `--demo-art`, `--no-detox`, `-d`/`--dest`, `--skip-update`, `-h`.
 
-Runs `extract.sh → merge.sh → sort.sh` on only the files named in the most recent `update.log`, into a separate `new` directory (override with `-d`/`--dest`; a relative path is resolved against the scripts' directory) rather than touching your main collection — useful for previewing what a batch of new downloads looks like before folding it into the real archive.
+### install_cron.sh
 
-Options: `--ecs` / `--aga` / `--rtg` / `--ecs-laced` / `--aga-laced` / `--set NAME` (mutually exclusive, last one wins), `--art`, `--demo-art`, `--no-detox`, `-d`/`--dest`, `--skip-update`, `-h`/`--help`.
+Installs `0 2 * * * cd "<script dir>" && ./all.sh --cron` — every night at 2am. Re-running it replaces the old entry, including ones from older versions.
 
-## all.sh (all three variants in one pass)
+**Run it from the terminal where your tools work.** cron starts jobs with a minimal `PATH` (usually just `/usr/bin:/bin`), which is why a tool such as `unlzx` can work everywhere in your terminal yet be "not found" in the nightly run. `install_cron.sh` remembers your terminal's `PATH`, and every script adds it back when running unattended; any interactive run of a script refreshes it too. `./doctor.sh` checks that the nightly run will find everything.
 
-Runs AGA, ECS, and RTG end to end, always extracting archives once and reusing the result for all three variants rather than extracting the same archives three times — whether this is a fresh build or a routine incremental update, since that's the far more common case in practice (e.g. the nightly cron run).
+### uninstall_deps.sh
 
-**Fresh build** (none of `retro_aga`/`retro_ecs`/`retro_rtg` exist yet, or `--clean` is given):
+Removes only what these scripts installed (tracked in `.retroplay_installed_deps.log`), with per-item confirmation. `--yes` skips the prompts, `--dry-run` only lists.
 
-1. Runs `update.sh` once.
-2. **Extracts archives once**, into `retro_aga` — not once per variant. Decompression is by far the most expensive step, so this alone roughly triples build speed for a fresh archive.
-3. Runs the **compliance check once** on that extracted tree (filename length/character fixes don't depend on which variant's artwork ends up sitting next to them, or on the later variant/language reorganization, so there's no need to repeat it three times).
-4. Copies that extracted-and-checked tree into `retro_ecs` and `retro_rtg` (a plain filesystem copy, much cheaper than re-extracting).
-5. Runs artwork merge + variant/language sorting **separately for each variant** against its own copy — this part genuinely differs per variant (different artwork, and each variant needs its own reorganization pass since the newly-merged artwork moves along with its game folder).
+### doctor.sh
 
-**Incremental update** (all three destinations already exist): the same idea, applied to just the newly downloaded batch instead of the whole archive collection — stages and extracts only the files named in this run's `update.log` once, runs the compliance check on that small batch once, copies it into a per-variant working copy, merges and sorts each copy separately, then folds each into its real destination (plus a `--only-missing` gap-fill pass, same as the original per-variant path did).
+Checks bash, tools, locales, `retroplay.conf`, artwork folders, disk space, build and queue state, and the nightly job, with a fix for each problem. Also `./start.sh --doctor` or menu option 8.
 
-**Mixed state** (some but not all of the three destinations exist — a rare edge case, typically from an interrupted prior run): falls back to the original per-variant path (`aga.sh` → `ecs.sh --skip-update` → `rtg.sh --skip-update`), so each variant is correctly treated as fresh or incremental on its own terms rather than risking a genuinely-missing variant getting only the latest batch instead of its full history.
-
-Other behaviour:
-
-- Uses `flock` to refuse a second overlapping run (e.g. if cron fires while a previous run is still going).
-- Errors from all three variants (or all pipeline steps, in the optimized paths) are accumulated into one `retroerror.log` for the whole run, and the end-of-run "view error log?" prompt is skipped even if a terminal is attached — answering it after variant one would otherwise stall the whole unattended pipeline waiting on input.
-
-## aga.sh / ecs.sh / rtg.sh
-
-One-liner wrappers for a single variant, forwarding any extra arguments through:
+## Tests
 
 ```bash
-./aga.sh   # ./start.sh --auto --aga --no-detox "$@"
-./ecs.sh   # ./start.sh --auto --ecs --no-detox "$@"
-./rtg.sh   # ./start.sh --auto --rtg --art Covers,Screens,Titles --no-detox "$@"
+tests/run_tests.sh        # add -v to see each script's output
 ```
 
-## install_cron.sh
-
-Installs a cron entry that runs `all.sh` every day at 2am, with output appended to `all_cron.log`:
-
-```
-0 2 * * * cd "<script dir>" && ./all.sh >> "<script dir>/all_cron.log" 2>&1
-```
-
-Idempotent — re-running it replaces the previous entry rather than adding a duplicate.
-
-## uninstall_deps.sh
-
-Removes **only** the tools these scripts auto-installed for you (when you answered `y` to an install prompt), working entirely from `.retroplay_installed_deps.log`. It never guesses: if a package isn't in that file, it isn't touched — so anything that was on your system before these scripts ran is left alone.
-
-- `apt` packages are removed with `sudo apt-get remove`, `brew` packages with `brew uninstall`, and a from-source detox build by deleting the exact binary it installed.
-- Each removal is confirmed individually unless `--yes` is given.
-- Successfully removed items are deleted from the tracking file; anything skipped or failed stays there, so re-running retries just those.
-
-Options:
-
-- `--yes`, `-y` — Remove everything tracked without per-item prompts (required for non-interactive use).
-- `--dry-run` — Show what would be removed, without changing anything.
-- `-h`, `--help` — Show help.
+End-to-end tests against a mock Retroplay server with mock tools — no network needed. They cover full builds, updates, version retirement, ECS exclusion, failure recovery, interrupted builds, `--rebuild`, `--dry-run`, disk-space refusal, running from another folder, overlapping runs, cron's minimal `PATH`, and temp-folder cleanup (including when a run is stopped part-way). GitHub Actions runs them on Ubuntu and on macOS with the stock bash 3.2 (`.github/workflows/tests.yml`).
 
 ## Typical usage
 
 ```bash
-# One-off: build a single variant
-./start.sh --auto --aga
-
-# Everything, extracting archives only once (recommended for a fresh setup)
-./all.sh
-
-# Preview what a batch of new downloads contains before committing to it
-./quick.sh --aga
-
-# Set up unattended daily (2am) updates
-./install_cron.sh
-
-# Later: remove only the dependencies these scripts installed
+./all.sh                  # the nightly job, by hand
+./all.sh --dry-run        # what would happen?
+./all.sh --rebuild        # rebuild everything from the downloaded archives
+./ecs.sh --rebuild        # ...or just one variant
+./install_cron.sh         # nightly at 2am
 ./uninstall_deps.sh --dry-run
-./uninstall_deps.sh
 ```
