@@ -13,7 +13,14 @@
 # Exit status: 0 if every test passed, 1 otherwise.
 
 set -u
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Works from tests/ (the documented location) or from the project root.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$HERE/all.sh" ]; then REPO="$HERE"; else REPO="$(cd "$HERE/.." && pwd)"; fi
+if [ ! -f "$REPO/all.sh" ] || [ ! -f "$REPO/lib.sh" ]; then
+    echo "ERROR: can't find the scripts (all.sh and lib.sh) next to this test runner or one folder up." >&2
+    echo "       Run it from a complete checkout: tests/run_tests.sh" >&2
+    exit 2
+fi
 VERBOSE=0; [ "${1:-}" = "-v" ] && VERBOSE=1
 PASS=0; FAIL=0; FAILED_NAMES=""
 
@@ -21,6 +28,9 @@ ok()   { PASS=$((PASS + 1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL + 1)); FAILED_NAMES="$FAILED_NAMES
   - $1"; printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
+# Fixture setup: a failure here is a broken test environment, not a failed
+# test - stop immediately with a clear setup error.
+setup() { "$@" || { echo "SETUP ERROR (test fixture could not be created): $*" >&2; exit 3; }; }
 section() { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/retroplay_tests.XXXXXX")"
@@ -28,6 +38,7 @@ trap 'rm -rf "$T"' EXIT
 ROOT="$T/retroplay"; SERVER="$T/server"; MOCK="$T/mockbin"
 mkdir -p "$ROOT" "$SERVER" "$MOCK"
 export TMPDIR="$T/tmp"; mkdir -p "$TMPDIR"
+export RP_RETRY_WAIT=0          # no pauses between download retries in tests
 cp "$REPO"/*.sh "$ROOT"/
 chmod +x "$ROOT"/*.sh
 
@@ -41,6 +52,8 @@ cat > "$MOCK/lha" << 'EOF'
 #!/usr/bin/env bash
 arc=""; for a in "$@"; do case "$a" in *.lha|*.LHA|*.lzx|*.zip) arc="$a";; esac; done
 [ -n "$arc" ] || exit 0
+# "lha t <archive>" = integrity test: fails only for archives marked CORRUPT
+if [ "${1:-}" = "t" ]; then grep -q CORRUPT "$arc" 2>/dev/null && exit 1; exit 0; fi
 stem="${arc##*/}"; stem="${stem%.*}"
 pat="$(cat "$(dirname "$0")/fail_pattern" 2>/dev/null)"
 [ -n "$pat" ] && case "$stem" in *"$pat"*) exit 1;; esac
@@ -60,10 +73,28 @@ cat > "$MOCK/wget" << EOF
 echo called >> "$MOCK/wget_calls"
 rel="\$(pwd -P)"; rel="\${rel#$ROOT_P/}"
 [ -d "$SERVER/\$rel" ] || exit 0
+log=""; prev=""; for a in "\$@"; do case "\$prev" in -a|-o) log="\$a";; esac; prev="\$a"; done
 ( cd "$SERVER/\$rel" && find . -type f ) | while IFS= read -r f; do
-    [ -e "\$f" ] || { mkdir -p "\$(dirname "\$f")"; cp "$SERVER/\$rel/\$f" "\$f"; }
+    f="\${f#./}"
+    # new, or re-published on the server (content differs): download it
+    if [ ! -e "\$f" ] || ! cmp -s "$SERVER/\$rel/\$f" "\$f"; then
+        mkdir -p "\$(dirname "\$f")"
+        pp="\$(cat "$MOCK/partial_pattern" 2>/dev/null)"
+        # simulated interrupted transfer: a truncated file, no "->" log line
+        if [ -n "\$pp" ]; then case "\$f" in *"\$pp"*) head -c 3 "$SERVER/\$rel/\$f" > "\$f"; touch "$MOCK/.interrupted"; continue ;; esac; fi
+        cp "$SERVER/\$rel/\$f" "\$f"
+        # simulated corrupt download - only the FIRST time this file is fetched
+        cp_pat="\$(cat "$MOCK/corrupt_once" 2>/dev/null)"
+        if [ -n "\$cp_pat" ] && [ ! -e "$MOCK/.corrupted_\${f##*/}" ]; then
+            case "\$f" in *"\$cp_pat"*) echo CORRUPT > "\$f"; touch "$MOCK/.corrupted_\${f##*/}" ;; esac
+        fi
+        [ -e "$MOCK/nolog" ] && continue      # simulate an unreadable wget log
+        [ -n "\$log" ] && echo "2026-01-01 00:00:00 URL: ftp://mock/\$f [1] -> \"\$f\" [1]" >> "\$log"
+    fi
 done
-exit 0
+# (the loop above runs in a subshell, so its result is passed back via a file)
+if [ -e "$MOCK/.interrupted" ]; then rm -f "$MOCK/.interrupted"; exit 4; fi
+exit "\$(cat "$MOCK/wget_exit" 2>/dev/null || echo 0)"
 EOF
 # curl: records notifications; returns an empty listing for --dry-run.
 cat > "$MOCK/curl" << EOF
@@ -89,7 +120,7 @@ mkdir -p "$T/thisbash"; ln -sf "$BASH" "$T/thisbash/bash"; export PATH="$T/thisb
 echo "Testing with bash $BASH_VERSION ($BASH)"
 
 # -------------------------------------------------------------- fixtures ---
-server_add() { mkdir -p "$SERVER/$(dirname "$1")"; echo "archive $1" > "$SERVER/$1"; }
+server_add() { setup mkdir -p "$SERVER/$(dirname "$1")"; echo "archive $1" > "$SERVER/$1" || setup false "write $1"; }
 art() {   # art <SET> <Section> <Game>
     mkdir -p "$ROOT/iGame_$1/$2/Games/${3:0:1}/$3"
     echo "$1-$3" > "$ROOT/iGame_$1/$2/Games/${3:0:1}/$3/iGame.iff"
@@ -182,7 +213,7 @@ section "5. A failed run is picked up again by the next one"
 echo Broken > "$MOCK/fail_pattern"
 server_add WHDLoad/Games/B/Broken_v1.0.lha
 run failing ./all.sh; st=$?
-check "failure reported with exit 1" '[ "$st" -eq 1 ]'
+check "extraction failure reported with exit 5 (integrity)" '[ "$st" -eq 5 ]'
 check "the download stays queued" 'grep -q Broken "$ROOT/.retroplay/queue/retro_aga.list" 2>/dev/null'
 check "a failure notification was sent" 'grep -q "FAILED" "$MOCK/notifications" 2>/dev/null || grep -q "retroplay-test" "$MOCK/notifications" 2>/dev/null'
 rm -f "$MOCK/fail_pattern"
@@ -224,7 +255,7 @@ check "nothing on disk changed" '[ "$(snap)" = "$before" ]'
 section "9. Not enough disk space: stops safely"
 echo "MIN_FREE_MB=99999999" >> "$ROOT/retroplay.conf"
 run nospace ./all.sh; st=$?
-check "exit 1 with a clear message" '[ "$st" -eq 1 ] && grep -q "not enough" "$T/nospace.log"'
+check "exit 4 (prerequisite) with a clear message" '[ "$st" -eq 4 ] && grep -q "not enough" "$T/nospace.log"'
 check "collection untouched and download still queued" \
   '[ -n "$(game retro_aga Alpha)" ] && grep -q Delta "$ROOT/.retroplay/queue/retro_aga.list"'
 sed -i.bak '/MIN_FREE_MB=99999999/d' "$ROOT/retroplay.conf"
@@ -243,7 +274,7 @@ if [ -n "$FLOCK" ]; then
     sleep 1
     run locked ./all.sh --skip-update; st=$?
     wait "$holder"
-    check "second instance exits 1 while the first holds the lock" '[ "$st" -eq 1 ] && grep -q "already running" "$T/locked.log"'
+    check "second instance refused (exit 4) while the first holds the lock" '[ "$st" -eq 4 ] && grep -q "already running" "$T/locked.log"'
 else
     echo "  (skipped: flock not installed)"
 fi
@@ -329,7 +360,7 @@ check "WHDLoad symlinked to another drive extracts into dest/WHDLoad/..." \
 mkdir -p "$ROOT/retro_ecs/Users/someone"
 run doctor_layout ./doctor.sh; st=$?
 check "doctor.sh spots a folder in the wrong place and explains the fix" \
-  '[ "$st" -eq 1 ] && grep -q "retro_ecs/Users" "$T/doctor_layout.log" && grep -q -- "--rebuild" "$T/doctor_layout.log"'
+  '[ "$st" -eq 1 ] && grep -q "retro_ecs/Users" "$T/doctor_layout.log" && grep -q "just run ./all.sh" "$T/doctor_layout.log"'
 rm -rf "$ROOT/retro_ecs/Users"
 
 
@@ -358,6 +389,198 @@ echo 'STRUCTURED_ART_SETS="AGA ECS RTG ART"' > "$M/retroplay.conf"
 ( cd "$M" && bash merge.sh --aga -d retro ) > "$T/anyart2.log" 2>&1
 check "STRUCTURED_ART_SETS in retroplay.conf can switch this off per pack" \
   '[ -z "$(g Omega iGame.iff)" ] && [ "$(g Kappa iGame.iff)" = cd32-Kappa ]'
+
+
+section "16. Leftover Users/... folders are healed automatically"
+mkdir -p "$ROOT/retro_aga/Users/Dwight/Downloads/Amiga/WHDLoad/Games/A/Alpha"
+mkdir -p "$ROOT/new_aga/2026-01-01_000000/Users/Dwight/Downloads/Amiga/WHDLoad"
+run heal_dry ./all.sh --skip-update --variants aga --dry-run; st=$?
+check "dry run explains it will rebuild, and which batch it would remove" \
+  'grep -q "wrong place (Users)" "$T/heal_dry.log" && grep -q "Would remove new_aga/2026-01-01_000000" "$T/heal_dry.log"'
+run heal ./all.sh --skip-update --variants aga; st=$?
+check "the run rebuilds retro_aga (exit 0)" '[ "$st" -eq 0 ]'
+check "retro_aga now holds only WHDLoad/HD_Loaders/JST" '[ -z "$(rp_layout_problems "$ROOT/retro_aga")" ]'
+check "games are back in place WITH artwork and sorted" \
+  '[ "$(art_in retro_aga/WHDLoad/Games/A/Alpha)" = AGA-Alpha ] && [ -n "$(game retro_aga/WHDLoad/AGA Zool_AGA)" ]'
+check "the broken new_aga batch was removed" '[ ! -e "$ROOT/new_aga/2026-01-01_000000" ]'
+
+section "17. A mix of old and new scripts is refused"
+cp "$ROOT/extract.sh" "$T/extract.sh.good"
+sed -i.bak '/^# retroplay-suite:/d' "$ROOT/extract.sh"
+run mixed ./all.sh --skip-update; st=$?
+check "all.sh refuses to run and names the out-of-date script" \
+  '[ "$st" -eq 4 ] && grep -q "extract.sh (older version)" "$T/mixed.log"'
+run mixed_doc ./doctor.sh; st=$?
+check "doctor.sh reports it too" '[ "$st" -eq 1 ] && grep -q "extract.sh (older version)" "$T/mixed_doc.log"'
+cp "$T/extract.sh.good" "$ROOT/extract.sh"; rm -f "$ROOT/extract.sh.bak"
+run mixed_ok ./all.sh --skip-update; st=$?
+check "with the complete set restored it runs again" '[ "$st" -eq 0 ] || [ "$st" -eq 2 ]'
+
+
+section "18. Leftover temp folders from older versions don't break sorting"
+setup mkdir -p "$TMPDIR/sort_compliance.OLDVER1"          # no .owner_pid, as older versions left them
+mkdir -p "$T/sortfix/WHDLoad/Games/A/Alpha_AGA"; touch "$T/sortfix/WHDLoad/Games/A/Alpha_AGA.info"
+run sortfix bash ./sort.sh --no-detox -d "$T/sortfix"; st=$?
+check "sort.sh succeeds despite an ownerless leftover (it used to crash under set -e)" '[ "$st" -eq 0 ]'
+check "...and removes the leftover" '[ ! -e "$TMPDIR/sort_compliance.OLDVER1" ]'
+
+
+section "19. A corrupt archive doesn't block the rest, and is retried then re-fetched"
+echo BadGame > "$MOCK/fail_pattern"
+server_add WHDLoad/Games/G/GoodGame_v1.0.lha; server_add WHDLoad/Games/B/BadGame_v1.0.lha
+run partial1 ./all.sh --variants aga; st=$?
+check "run completes the good archive but reports the failure (exit 5)" '[ "$st" -eq 5 ] && [ -n "$(game retro_aga GoodGame)" ]'
+check "the corrupt one stays queued, the good one doesn't" \
+  'grep -q BadGame "$ROOT/.retroplay/queue/retro_aga.list" && ! grep -q GoodGame "$ROOT/.retroplay/queue/retro_aga.list"'
+run partial2 ./all.sh --variants aga --skip-update
+run partial3 ./all.sh --variants aga --skip-update; st=$?
+check "after 3 failed attempts it's moved to old/corrupt-<date>/ and dropped from the queue" \
+  '[ "$st" -eq 5 ] && [ -n "$(find "$ROOT/old" -path "*corrupt-*" -name BadGame_v1.0.lha)" ] && ! grep -qs BadGame "$ROOT/.retroplay/queue/retro_aga.list"'
+check "the report says what happened" 'grep -q "GAVE UP on WHDLoad/Games/B/BadGame_v1.0.lha" "$T/partial3.log"'
+rm -f "$MOCK/fail_pattern"
+run partial4 ./all.sh --variants aga; st=$?
+check "next update downloads a fresh copy, which then installs fine" '[ "$st" -eq 0 ] && [ -n "$(game retro_aga BadGame)" ]'
+
+section "20. Re-published and partially downloaded files"
+echo "republished content" > "$SERVER/WHDLoad/Games/G/GoodGame_v1.0.lha"
+run republish ./all.sh --variants aga; st=$?
+check "a file re-published under the same name is downloaded AND processed" \
+  '[ "$st" -eq 0 ] && grep -q "GoodGame_v1.0.lha" "$ROOT/update.log" && [ -n "$(find "$ROOT/new_aga" -type d -name GoodGame)" ]'
+echo PartGame > "$MOCK/partial_pattern"
+server_add WHDLoad/Games/P/PartGame_v1.0.lha
+run partdl ./all.sh --variants aga; st=$?
+check "an interrupted download stops the run as a network problem (exit 3)" '[ "$st" -eq 3 ]'
+check "...and the partial file is NOT queued as if complete" '! grep -qs PartGame "$ROOT/.retroplay/queue/retro_aga.list"'
+rm -f "$MOCK/partial_pattern"
+run partdl2 ./all.sh --variants aga; st=$?
+check "next run re-downloads it in full and installs it" '[ "$st" -eq 0 ] && [ -n "$(game retro_aga PartGame)" ]'
+
+section "21. A refused second run says who holds the lock"
+if [ -n "$FLOCK" ]; then
+    echo SlowGame > "$MOCK/slow_pattern"; echo x > "$ROOT/WHDLoad/Games/S/SlowGame_v1.0.lha"
+    ( cd "$ROOT" && ./all.sh --rebuild --variants aga ) < /dev/null > "$T/holder.log" 2>&1 & hp=$!
+    sleep 3
+    run locked2 ./all.sh --skip-update; st=$?
+    wait "$hp"
+    check "second run refused (exit 4) and names the holder's PID and command" \
+      '[ "$st" -eq 4 ] && grep -q "Held by: pid=$hp" "$T/locked2.log" && grep -q "command=all.sh --rebuild --variants aga" "$T/locked2.log"'
+    check "the lock record is removed when the holder finishes" '[ ! -e "$ROOT/.all.lock.info" ]'
+    rm -f "$MOCK/slow_pattern" "$ROOT/WHDLoad/Games/S/SlowGame_v1.0.lha"
+else
+    echo "  (skipped: flock not installed)"
+fi
+
+
+section "22. Output drive not mounted: refuse instead of rebuilding onto the SD card"
+USB="$T/usb"; setup mkdir -p "$USB"
+cp "$ROOT/retroplay.conf" "$T/conf.bak"; echo "OUTPUT_ROOT=\"$USB\"" >> "$ROOT/retroplay.conf"
+run usb1 ./all.sh --skip-update --variants aga; st=$?
+check "first use: builds on the drive and marks it" '[ "$st" -eq 0 ] && [ -s "$USB/.retroplay_output" ] && [ -d "$USB/retro_aga/WHDLoad" ]'
+mv "$USB" "$T/usb_unplugged"; mkdir -p "$USB"          # empty mount point = drive not mounted
+run usb2 ./all.sh --skip-update --variants aga; st=$?
+check "drive 'unplugged': refused (exit 4) and nothing written to the empty mount point" \
+  '[ "$st" -eq 4 ] && [ -z "$(ls -A "$USB")" ] && grep -q "not mounted" "$T/usb2.log"'
+rmdir "$USB"
+run usb3 ./all.sh --skip-update --variants aga; st=$?
+check "mount point missing entirely: refused (exit 4), not created" '[ "$st" -eq 4 ] && [ ! -e "$USB" ]'
+mv "$T/usb_unplugged" "$USB"
+run usb4 ./all.sh --skip-update --variants aga; st=$?
+check "drive back: runs normally again" '[ "$st" -eq 0 ] || [ "$st" -eq 2 ]'
+cp "$T/conf.bak" "$ROOT/retroplay.conf"
+
+section "23. State backups, and automatic restore if the state folder is lost"
+server_add WHDLoad/Games/Q/QueuedGame_v1.0.lha
+run q_upd ./update.sh
+run q_rtg ./all.sh --skip-update --variants rtg          # takes a backup; aga/ecs keep QueuedGame queued
+check "rolling state backups are kept" '[ -n "$(ls "$ROOT"/.retroplay_backups/state-*.tgz 2>/dev/null)" ]'
+rm -rf "$ROOT/.retroplay"
+run restore ./all.sh --skip-update --variants aga; st=$?
+check "lost state folder is restored, and its queued download still gets installed" \
+  '[ "$st" -eq 0 ] && grep -q "restored it from" "$T/restore.log" && [ -n "$(game retro_aga QueuedGame)" ]'
+run drain ./all.sh --skip-update
+
+section "24. Artwork gap-fill runs only when artwork changed (or weekly)"
+run gap0 ./all.sh --skip-update --variants ecs; st=$?
+check "nothing changed: nothing to do (exit 2)" '[ "$st" -eq 2 ]'
+sleep 1
+setup mkdir -p "$ROOT/iGame_ECS/Covers/Games/Q/QueuedGame"; echo ECS-Queued > "$ROOT/iGame_ECS/Covers/Games/Q/QueuedGame/iGame.iff"
+run gap1 ./all.sh --skip-update --variants ecs; st=$?
+check "an artwork pack changed: gap-fill runs by itself and adds the new artwork" \
+  '[ "$st" -eq 0 ] && grep -q "artwork packs changed" "$T/gap1.log" && [ "$(art_in retro_ecs/WHDLoad/Games/Q/QueuedGame)" = ECS-Queued ]'
+run gap2 ./all.sh --skip-update --variants ecs; st=$?
+check "...and not again until something changes (exit 2)" '[ "$st" -eq 2 ]'
+
+section "25. Corrupt downloads are fetched again in the same run"
+echo VerifyGame > "$MOCK/corrupt_once"; server_add WHDLoad/Games/V/VerifyGame_v1.0.lha
+run verify ./all.sh --variants aga; st=$?
+check "detected, re-downloaded and installed in one run" \
+  '[ "$st" -eq 0 ] && grep -q "CORRUPT download, fetching it again: WHDLoad/Games/V/VerifyGame_v1.0.lha" "$ROOT/update.log" && grep -q "re-downloaded OK" "$ROOT/update.log" && [ -n "$(game retro_aga VerifyGame)" ]'
+rm -f "$MOCK/corrupt_once"
+
+section "26. An unreadable wget log is reported, not silently ignored"
+touch "$MOCK/nolog"; server_add WHDLoad/Games/N/NoLogGame_v1.0.lha
+run nolog ./all.sh --variants aga; st=$?
+check "warning logged, and the new file is still processed" \
+  '[ "$st" -eq 0 ] && grep -q "download log" "$ROOT/update.log" && [ -n "$(game retro_aga NoLogGame)" ]'
+rm -f "$MOCK/nolog"
+
+section "27. Status view and test notification"
+run status ./start.sh --status; st=$?
+check "status shows the last run and each variant's state" \
+  '[ "$st" -eq 0 ] && grep -q "Last run:" "$T/status.log" && grep -q "retro_aga: *built" "$T/status.log" && grep -q "Output folder:" "$T/status.log"'
+: > "$MOCK/notifications"
+run tn ./all.sh --test-notify; st=$?
+check "test notification sent (exit 0)" '[ "$st" -eq 0 ] && grep -q "test notification" "$MOCK/notifications"'
+cp "$ROOT/retroplay.conf" "$T/conf.bak"; grep -v NTFY_TOPIC "$T/conf.bak" > "$ROOT/retroplay.conf"
+run tn2 ./start.sh --test-notify; st=$?
+check "not configured: says how to set it up (exit 4)" '[ "$st" -eq 4 ] && grep -q "NTFY_TOPIC" "$T/tn2.log"'
+cp "$T/conf.bak" "$ROOT/retroplay.conf"
+( cd "$ROOT" && printf '9\n' | ./start.sh ) > "$T/menu9.log" 2>&1
+check "the menu shows a status summary on top, and option 9 the full status" \
+  '[ "$(grep -c "Amiga Retroplay status" "$T/menu9.log")" -ge 2 ] && grep -q "Nightly run:" "$T/menu9.log"'
+
+section "28. setup.sh installs everything on a bare system, and is safe to repeat"
+S="$T/setupbox"; SM="$T/setupmock"; IB="$T/installed"; SB="$T/setupsys"
+setup mkdir -p "$S" "$SM" "$IB" "$SB" "$T/h"
+cp "$REPO"/*.sh "$REPO"/retroplay.conf.example "$S"/ 2>/dev/null; chmod +x "$S"/*.sh
+for d in /usr/bin /bin; do for f in "$d"/*; do n="${f##*/}"
+    case "$n" in lha|7z|7za|unar|lsar|unlzx|wget|curl|unzip|flock|detox|locale|locale-gen|crontab|apt-get|dpkg-query|sudo) continue ;; esac
+    [ -e "$SB/$n" ] || ln -s "$f" "$SB/$n"; done; done
+printf '#!/bin/sh\n[ "$1" = x ] && printf "#include <stdio.h>\\nint main(void){puts(\\"unlzx test build\\");return 0;}\\n" > unlzx.c\nexit 0\n' > "$SM/stub_lha"
+printf '#!/bin/sh\no=""; p=""; for a in "$@"; do [ "$p" = "-o" ] && o="$a"; p="$a"; done; [ -n "$o" ] && echo archive > "$o"; exit 0\n' > "$SM/stub_curl"
+printf '#!/bin/sh\nexit 0\n' > "$SM/stub_generic"
+cat > "$SM/apt-get" << EOF
+#!/usr/bin/env bash
+echo "apt-get \$*" >> "$SM/apt_calls"
+[ "\$1" = install ] || exit 0
+for p in "\$@"; do
+  case "\$p" in install|-y|-qq) continue ;; esac
+  echo "\$p" >> "$SM/installed_pkgs"
+  case "\$p" in lhasa) c=lha ;; p7zip-full) c=7z ;; util-linux) c=flock ;; *) c="\$p" ;; esac
+  cp "$SM/stub_\$c" "$IB/\$c" 2>/dev/null || cp "$SM/stub_generic" "$IB/\$c"; chmod +x "$IB/\$c"
+done
+EOF
+printf '#!/bin/sh\nfor p in "$@"; do :; done; grep -qx "$p" "%s/installed_pkgs" 2>/dev/null && printf "install ok installed"\nexit 0\n' "$SM" > "$SM/dpkg-query"
+printf '#!/bin/sh\nexec "$@"\n' > "$SM/sudo"
+printf '#!/bin/sh\necho C.utf8\ngrep -qx "en_US ISO-8859-1" "%s/locale.gen" && echo en_US.iso88591\nexit 0\n' "$SM" > "$SM/locale"
+printf '#!/bin/sh\nexit 0\n' > "$SM/locale-gen"
+chmod +x "$SM"/*
+printf '# C.UTF-8 UTF-8\n# en_US ISO-8859-1\n# en_US.UTF-8 UTF-8\n' > "$SM/locale.gen"
+setup_run() {
+    ( cd "$S" && env -i HOME="$T/h" TMPDIR="$TMPDIR" PATH="$IB:$SM:$SB" RP_SETUP_OS=linux \
+        RP_LOCALE_GEN_FILE="$SM/locale.gen" RP_INSTALL_BIN="$IB" RP_UNLZX_URL="http://mock/unlzx.lha" \
+        bash ./setup.sh --yes --no-cron ) < /dev/null > "$T/$1.log" 2>&1
+}
+setup_run setup1
+check "missing tools installed with one apt-get call, and recorded for uninstalling" \
+  '[ "$(grep -c "install -y" "$SM/apt_calls")" -eq 1 ] && grep -q "apt:lhasa" "$S/.retroplay_installed_deps.log" && grep -q "apt:p7zip-full" "$S/.retroplay_installed_deps.log"'
+check "unlzx downloaded, compiled, installed and recorded" \
+  '[ "$("$IB/unlzx")" = "unlzx test build" ] && grep -q "source-build:$IB/unlzx" "$S/.retroplay_installed_deps.log"'
+check "the missing locale was enabled" 'grep -qx "en_US ISO-8859-1" "$SM/locale.gen"'
+check "retroplay.conf created with the default variants" 'grep -qx "VARIANTS=\"aga ecs rtg\"" "$S/retroplay.conf"'
+calls_before="$(wc -l < "$SM/apt_calls")"
+setup_run setup2
+check "running it again changes nothing (no new installs)" '[ "$(wc -l < "$SM/apt_calls")" -eq "$calls_before" ] && grep -q "retroplay.conf already exists" "$T/setup2.log"'
 
 # ================================================================ summary ===
 echo

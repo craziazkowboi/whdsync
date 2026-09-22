@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
 
 # Amiga Retroplay Archive Extractor (OS-adaptive, encoding-robust)
 # Version: 1.4.0-bash32-compatible
@@ -95,41 +96,11 @@ sanitize_amiga_names_macos() {
 }
 
 # Progress bar: block for macOS, text for others
-progress_bar() {
-    local current="${1:-0}" total="${2:-1}" width="${3:-40}"
-    if [[ "$OS_TYPE" == "darwin" ]]; then
-        local percent bar_len whole partial partial_block left bar prog_chars
-        prog_chars=(' ' '▏' '▎' '▍' '▌' '▋' '▊' '▉' '█')
-        (( total > 0 )) && percent=$(( 100 * current / total )) || percent=0
-        bar_len=$(awk "BEGIN{printf \"%.2f\", ($width * $current) / $total + 0 }")
-        whole=${bar_len%.*}
-        partial_frac="0.${bar_len#*.}"
-        partial_block=$(awk "BEGIN{print int((${partial_frac}*8)+0.5)}")
-        bar=""
-        i=0
-        while [ $i -lt $whole ]; do bar="${bar}█";  i=$((i + 1)); done
-        if [ $whole -lt $width ]; then
-            bar="${bar}${prog_chars[$partial_block]}"
-            left=$((width - whole - 1))
-        else left=0; fi
-        while [ $left -gt 0 ]; do bar="${bar} "; left=$((left-1)); done
-        printf "\r%3d%% [%-${width}s] %d/%d" "$percent" "$bar" "$current" "$total"
-    else
-        local percent filled empty done_fill todo_fill
-        (( total > 0 )) && percent=$(( 100 * current / total )) || percent=0
-        filled=$(( width * current / total )); (( filled < 0 )) && filled=0
-        empty=$(( width - filled ))
-        done_fill=$(printf "%${filled}s" | tr ' ' '#')
-        todo_fill=$(printf "%${empty}s" | tr ' ' '-')
-        printf "\rProgress %3d%% [%s%s] %3d%% (%d/%d)" "$percent" "$done_fill" "$todo_fill" "$percent" "$current" "$total"
-    fi
-    tput el 2>/dev/null || true
+progress_bar() {   # progress_bar <current> <total> [width] - shared display (lib.sh)
+    rp_progress "$1" "$2" "Extracting"
 }
 
-format_elapsed_time() {
-    local t="$1"
-    printf '%d:%02d:%02d' $((t/3600)) $(((t%3600)/60)) $((t%60))
-}
+format_elapsed_time() { rp_format_duration "$1"; }   # shared (lib.sh)
 
 # Path handling: resolve to an absolute, symlink-free path. Chosen by what
 # actually WORKS here rather than by OS name: Linux's readlink -f, macOS
@@ -176,10 +147,10 @@ DEBUG=0
 while [ $# -gt 0 ]; do
     opt_lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
     case "$opt_lc" in
-    -d|--dest) DESTOVERRIDE="$2"; CUSTOM=1; shift 2 ;;
+    -d|--dest) rp_require_option_value "$1" "$#" "${2-}"; DESTOVERRIDE="$2"; CUSTOM=1; shift 2 ;;
     -u|--unattended) UNATTENDED=1; shift ;;
-    --exclude-tags) EXCLUDE_TAGS="${2:-}"; shift 2 ;;
-    --only-tags) ONLY_TAGS="${2:-}"; shift 2 ;;
+    --exclude-tags) rp_require_option_value "$1" "$#" "${2-}"; EXCLUDE_TAGS="$2"; shift 2 ;;
+    --only-tags) rp_require_option_value "$1" "$#" "${2-}"; ONLY_TAGS="$2"; shift 2 ;;
     --debug) DEBUG=1; shift ;;
     -h|--help)
         echo "Usage: $(basename $0) [options]"
@@ -195,7 +166,7 @@ while [ $# -gt 0 ]; do
         echo "Encoding preference: ASCII first, ISO-8859-1 second, system locale last"
         exit 0
         ;;
-    *) echo -e "${RED}Unknown option: $1${NC}"; exit 1 ;;
+    *) echo -e "${RED}Unknown option: $1${NC}"; exit 4 ;;
     esac
 done
 unset opt_lc
@@ -355,7 +326,7 @@ done
 archives=()
 while IFS= read -r _line; do
     [ -n "$_line" ] && archives+=("$_line")
-done < <(find "${find_roots[@]}" -maxdepth 4 -type f \( -iname "*.lha" -o -iname "*.lzx" -o -iname "*.zip" \))
+done < <(find -H "${find_roots[@]}" -maxdepth 4 -type f \( -iname "*.lha" -o -iname "*.lzx" -o -iname "*.zip" \))
 unset _line _root
 
 # Optional filtering by archive-name fields (e.g. leaving AGA and CD32
@@ -598,7 +569,22 @@ declare -a JOB_DIRS=()
 declare -a JOB_LOGS=()
 
 for srcdir in "${dirs[@]}"; do
-    reldir="${srcdir#$SRCROOT/}"
+    # Where this folder's archives go inside DEST comes from the RELATIVE
+    # path find reported (e.g. WHDLoad/Games/S) - never from the resolved
+    # absolute path. Stripping the working directory off a resolved path
+    # silently fails whenever the two are spelled differently - macOS's
+    # case-insensitive disks (~/downloads vs ~/Downloads), symlinks such as
+    # /tmp -> /private/tmp, or WHDLoad symlinked to another drive - and the
+    # whole absolute path (Users/you/Downloads/Amiga/...) then got recreated
+    # inside retro_*/new_*.
+    reldir="$(awk -F'\t' -v r="$srcdir" '$2 == r { print $1; exit }' "$RESOLVE_MAP")"
+    reldir="${reldir#./}"
+    [ -n "$reldir" ] || reldir="."
+    case "$reldir" in
+        /*|..|../*|*/../*|*/..)
+            echo -e "${RED}Skipping $srcdir: can't place it inside $DEST safely.${NC}" >&2
+            continue ;;
+    esac
     destdir="$DEST/${reldir}"
     mkdir -p "$destdir" || continue
 
@@ -699,15 +685,22 @@ ERROR_LOG="$SRCROOT/extract_errors.log"
 : > "$ERROR_LOG"
 
 if [ -d "$tmpdir" ]; then
+    # THIS run's failures only (the error log can also hold older runs').
+    cat "$tmpdir"/dir_*.log 2>/dev/null | sed -n 's/^FAILED: \(.*\) (format: .*$/\1/p' > "$tmpdir/.run_failed"
+    errors="$(grep -c . "$tmpdir/.run_failed" 2>/dev/null)"; errors="${errors:-0}"
+    # Machine-readable list for all.sh: one failed archive per line, plus
+    # "DIR:<folder>" for folders whose job was killed (none of their
+    # archives can be trusted to have been extracted).
+    if [ -n "${RP_EXTRACT_FAILED_LIST:-}" ]; then
+        {
+            cat "$tmpdir/.run_failed"
+            for _kd in "${killed_dirs[@]+"${killed_dirs[@]}"}"; do printf 'DIR:%s\n' "$_kd"; done
+        } > "$RP_EXTRACT_FAILED_LIST"
+    fi
     cat "$tmpdir"/dir_*.log 2>/dev/null >>"$ERROR_LOG"
     rm -rf "$tmpdir"
 fi
-
-if [ -s "$ERROR_LOG" ]; then
-    errors="$(grep -c '^FAILED:' "$ERROR_LOG" 2>/dev/null || echo 0)"
-else
-    errors=0
-fi
+: "${errors:=0}"
 
 extraction_end=$(date +%s)
 total_time=$((extraction_end - extraction_start))
@@ -732,3 +725,10 @@ if [ "${#killed_dirs[@]}" -gt 0 ]; then
     echo "not a fixed count of individual failures.)"
 fi
 echo -e "${BOLD}======================================================${NC}"
+
+# 5 = some archives could not be extracted (see the log). Everything else
+# that could be extracted has been.
+if [ "$errors" -gt 0 ] || [ "${#killed_dirs[@]}" -gt 0 ]; then
+    exit 5
+fi
+exit 0

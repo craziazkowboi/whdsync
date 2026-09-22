@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
 set -o pipefail
 
 # Amiga Retroplay Quick Update & Process Script
@@ -116,6 +117,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --set)
+      rp_require_option_value "$1" "$#" "${2-}"
       if [ -z "${2:-}" ]; then
         echo -e "${RED}Error: --set requires a NAME argument (matching an iGame_NAME directory)${NC}" >&2
         exit 1
@@ -124,6 +126,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --art)
+      rp_require_option_value "$1" "$#" "${2-}"
       if [ -z "${2:-}" ]; then
         echo -e "${RED}Error: --art requires an ORDER argument, e.g. \"Screens,Covers,Titles\"${NC}" >&2
         exit 1
@@ -132,6 +135,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --demo-art)
+      rp_require_option_value "$1" "$#" "${2-}"
       if [ -z "${2:-}" ]; then
         echo -e "${RED}Error: --demo-art requires an ORDER argument, e.g. \"Titles,Screens,Covers\"${NC}" >&2
         exit 1
@@ -144,6 +148,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     -d|--dest)
+      rp_require_option_value "$1" "$#" "${2-}"
       if [ -z "${2:-}" ]; then
         echo -e "${RED}Error: $1 requires a directory argument${NC}" >&2
         exit 1
@@ -158,7 +163,7 @@ while [[ $# -gt 0 ]]; do
     *)
       echo -e "${RED}Unknown option: $1${NC}" >&2
       echo "Run '$0 --help' for usage." >&2
-      exit 1
+      exit 4
       ;;
   esac
 done
@@ -232,7 +237,7 @@ if [ ! -f "$UPDATE_LOG" ]; then
   exit 0
 fi
 
-new_file_count=$(grep -c "^" "$UPDATE_LOG" 2>/dev/null || echo 0)
+new_file_count=$(grep -c "^" "$UPDATE_LOG" 2>/dev/null); new_file_count="${new_file_count:-0}"   # (grep -c prints 0 itself on no match)
 if [ "$new_file_count" -eq 0 ]; then
   echo -e "${YELLOW}No new files downloaded. Nothing to process.${NC}"
   exit 0

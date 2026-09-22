@@ -40,6 +40,19 @@ USE_DETOX="no"
 MIN_FREE_MB=1024
 SPACE_FACTOR=3
 
+# Failed extractions of one archive before it's moved to old/corrupt-<date>/
+# (so the next update downloads a fresh copy), and download attempts.
+MAX_EXTRACT_ATTEMPTS=3
+DOWNLOAD_RETRIES=3
+
+# The artwork gap-fill runs when an artwork pack changes, or after this many days.
+GAPFILL_DAYS=7
+
+# Test new downloads straight away (a corrupt one is fetched again in the
+# same run): yes, no, or auto (= only batches of up to 100 files, so a huge
+# first download isn't slowed down).
+VERIFY_DOWNLOADS="auto"
+
 # How many dated new_<variant>/ batch folders to keep.
 KEEP_NEW_BATCHES=14
 

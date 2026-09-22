@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
 
 # Amiga Retroplay - Artwork Merger
 #
@@ -79,55 +80,11 @@ PROGRESS_STEP=100
 # Platform hint (optional override, e.g. --a314)
 PLATFORM_HINT=""
 
-progress_bar() {
-    local current="${1:-0}" total="${2:-1}" width="${3:-40}"
-
-if [[ "$(uname)" = "Darwin" ]]; then
-  local percent barlen whole partialfrac partialblock left bar
-  local progchars=(' ' '▏' '▎' '▍' '▌' '▋' '▊' '▉' '█')
-
-  (( total > 0 )) && percent=$(( 100 * current / total )) || percent=0
-  barlen=$(awk "BEGIN{printf \"%.2f\", ($width * $current) / $total}")
-  whole=${barlen%.*}
-  partialfrac="0.${barlen#*.}"
-  partialblock=$(awk "BEGIN{print int(${partialfrac}*8+0.5)}")
-
-  bar=""
-  # Fill all completed cells with a full block
-  for ((i=0; i < whole; i++)); do bar+="${progchars[8]}"; done
-
-  # Add one partial cell if needed
-  if [ "$partialblock" -gt 0 ] && [ "$whole" -lt "$width" ]; then
-    bar+="${progchars[$partialblock]}"
-    left=$(( width - whole - 1 ))
-  else
-    left=$(( width - whole ))
-  fi
-
-  # Pad the rest with spaces
-  for ((i=0; i < left; i++)); do bar+=" "; done
-
-  printf "\rProgress: %3d%% [%-${width}s] %d/%d" "$percent" "$bar" "$current" "$total"
-else
-    local percent filled empty bar
-
-    (( total > 0 )) && percent=$(( 100 * current / total )) || percent=0
-    filled=$(( width * current / total )); (( filled < 0 )) && filled=0
-    empty=$(( width - filled ))
-
-    bar=$(printf "%${filled}s" | tr ' ' '#')
-    bar="${bar}$(printf "%${empty}s" | tr ' ' '-')"
-
-    printf "\rProgress: %3d%% [%-${width}s] %d/%d" "$percent" "$bar" "$current" "$total"
-fi
-
-tput el 2>/dev/null || true
+progress_bar() {   # progress_bar <current> <total> [width] - shared display (lib.sh)
+    rp_progress "$1" "$2" "Adding artwork"
 }
 
-format_elapsed_time() {
-    local t="$1"
-    printf '%d:%02d:%02d' $((t/3600)) $(((t%3600)/60)) $((t%60))
-}
+format_elapsed_time() { rp_format_duration "$1"; }   # shared (lib.sh)
 
 wait_for_job_slot() {
     local max_jobs="$1" job_count
@@ -147,11 +104,12 @@ debug_log() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Settings from retroplay.conf (via the shared lib.sh), if present.
-RP_STRUCTURED_ART_SETS="AGA ECS RTG"
-if [ -f "$SCRIPT_DIR/lib.sh" ]; then
-    . "$SCRIPT_DIR/lib.sh"
-    rp_load_config
+if [ ! -f "$SCRIPT_DIR/lib.sh" ]; then
+    echo "ERROR: lib.sh is missing from $SCRIPT_DIR - it ships with these scripts." >&2
+    exit 4
 fi
+. "$SCRIPT_DIR/lib.sh"
+rp_load_config
 # Artwork sets matched ONLY by the standard Covers|Screens|Titles/<Games|
 # Demos|Magazines>/<letter>/<game> layout. Every other set (iGame_art,
 # custom packs, ...) ALSO matches a game folder anywhere inside it.
@@ -261,6 +219,7 @@ while [ $# -gt 0 ]; do
         --ecs-laced) SET_OPT="ECS_LACED"; shift ;;
         --aga-laced) SET_OPT="AGA_LACED"; shift ;;
         --set)
+          rp_require_option_value "$1" "$#" "${2-}"
             if [ -z "${2:-}" ]; then
                 echo "Error: --set requires a NAME argument (matching an iGame_NAME directory)" >&2
                 exit 1
@@ -268,19 +227,21 @@ while [ $# -gt 0 ]; do
             SET_OPT="$2"
             shift 2
             ;;
-        -d|--dest) DEST="$2"; shift 2 ;;
+        -d|--dest) rp_require_option_value "$1" "$#" "${2-}"; DEST="$2"; shift 2 ;;
         --art)
+          rp_require_option_value "$1" "$#" "${2-}"
         GAME_ART_PRIORITY="$2"
         shift 2
         ;;
     --demo-art)
+      rp_require_option_value "$1" "$#" "${2-}"
         DEMO_ART_PRIORITY="$2"
         DEMO_ART_OVERRIDE=1
         shift 2
         ;; 
         --a314) PLATFORM_HINT="a314"; shift ;;
         --only-missing) ONLY_MISSING=1; shift ;;
-        --report-missing) REPORT_MISSING="$2"; shift 2 ;;
+        --report-missing) rp_require_option_value "$1" "$#" "${2-}"; REPORT_MISSING="$2"; shift 2 ;;
         --debug) DEBUG=1; shift ;;
         -h|--help)
             echo
@@ -338,7 +299,7 @@ while [ $# -gt 0 ]; do
             echo "Supports singular and plural section/category names."
             exit 0
             ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
+        *) echo "Unknown option: $1"; exit 4 ;;
     esac
 done
 unset opt_lc

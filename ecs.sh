@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
 # Builds or updates the ECS variant (retro_ecs). Extra options are passed
 # through to start.sh, for example:
 #   ./ecs.sh --rebuild   rebuild from the downloaded archives, no update check

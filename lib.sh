@@ -48,6 +48,10 @@ rp_load_config() {
     RP_NOTIFY_EMAIL=""
     RP_NOTIFY_ON_SUCCESS="no"
     RP_STRUCTURED_ART_SETS="AGA ECS RTG"
+    RP_MAX_EXTRACT_ATTEMPTS="3"
+    RP_DOWNLOAD_RETRIES="3"
+    RP_GAPFILL_DAYS="7"
+    RP_VERIFY_DOWNLOADS="auto"
     RP_CONFIG_WARNINGS=""
 
     [ -f "$RP_CONF_FILE" ] || { rp_finish_config; return 0; }
@@ -72,7 +76,8 @@ rp_load_config() {
         case "$key" in
             VARIANTS|OUTPUT_ROOT|ART_ORDER|DEMO_ART_ORDER|FILESYSTEM|USE_DETOX|\
             MIN_FREE_MB|SPACE_FACTOR|KEEP_NEW_BATCHES|OLD_ARCHIVE_DAYS|LOG_MAX_MB|\
-            LOG_KEEP|NTFY_TOPIC|NTFY_SERVER|NOTIFY_EMAIL|NOTIFY_ON_SUCCESS|STRUCTURED_ART_SETS)
+            LOG_KEEP|NTFY_TOPIC|NTFY_SERVER|NOTIFY_EMAIL|NOTIFY_ON_SUCCESS|STRUCTURED_ART_SETS|\
+            MAX_EXTRACT_ATTEMPTS|DOWNLOAD_RETRIES|GAPFILL_DAYS|VERIFY_DOWNLOADS)
                 printf -v "RP_$key" '%s' "$val" ;;
             ART_ORDER_[A-Z0-9_]*|EXCLUDE_TAGS_[A-Z0-9_]*)
                 printf -v "RP_$key" '%s' "$val" ;;
@@ -86,7 +91,7 @@ rp_load_config() {
 
 rp_finish_config() {
     local n ref
-    for n in MIN_FREE_MB SPACE_FACTOR KEEP_NEW_BATCHES OLD_ARCHIVE_DAYS LOG_MAX_MB LOG_KEEP; do
+    for n in MIN_FREE_MB SPACE_FACTOR KEEP_NEW_BATCHES OLD_ARCHIVE_DAYS LOG_MAX_MB LOG_KEEP MAX_EXTRACT_ATTEMPTS DOWNLOAD_RETRIES GAPFILL_DAYS; do
         ref="RP_$n"
         case "${!ref}" in
             ''|*[!0-9]*)
@@ -97,6 +102,13 @@ rp_finish_config() {
     done
     : "${RP_MIN_FREE_MB:=1024}" "${RP_SPACE_FACTOR:=3}" "${RP_KEEP_NEW_BATCHES:=14}"
     : "${RP_OLD_ARCHIVE_DAYS:=30}" "${RP_LOG_MAX_MB:=5}" "${RP_LOG_KEEP:=4}"
+    : "${RP_MAX_EXTRACT_ATTEMPTS:=3}" "${RP_DOWNLOAD_RETRIES:=3}" "${RP_GAPFILL_DAYS:=7}"
+    [ "$RP_GAPFILL_DAYS" -ge 1 ] 2>/dev/null || RP_GAPFILL_DAYS=1
+    case "$(printf '%s' "$RP_VERIFY_DOWNLOADS" | tr '[:upper:]' '[:lower:]')" in
+        yes|no|auto) RP_VERIFY_DOWNLOADS="$(printf '%s' "$RP_VERIFY_DOWNLOADS" | tr '[:upper:]' '[:lower:]')" ;;
+        *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}VERIFY_DOWNLOADS must be yes, no or auto - using auto
+"; RP_VERIFY_DOWNLOADS=auto ;;
+    esac
     RP_FILESYSTEM="$(printf '%s' "$RP_FILESYSTEM" | tr '[:upper:]' '[:lower:]')"
     case "$RP_FILESYSTEM" in
         ffs|pfs) ;;
@@ -204,7 +216,7 @@ rp_queue_new_archive() {
         dest="$(cat "$m" 2>/dev/null)"
         [ -n "$dest" ] && [ -d "$dest" ] || continue
         grep -qxF "$path" "$(rp_queue_file "$key")" 2>/dev/null || \
-            printf '%s\n' "$path" >> "$(rp_queue_file "$key")"
+            { cat "$(rp_queue_file "$key")" 2>/dev/null; printf '%s\n' "$path"; } | rp_atomic_write "$(rp_queue_file "$key")"
     done
 }
 
@@ -220,10 +232,10 @@ rp_queue_remove_processed() {
 
 rp_queue_clear() { rm -f "$(rp_queue_file "$1")"; }
 
-rp_mark_building() { rp_state_init; printf '%s\n' "$2" > "$RP_STATE_DIR/building/$1"; }
+rp_mark_building() { rp_state_init; printf '%s\n' "$2" | rp_atomic_write "$RP_STATE_DIR/building/$1"; }
 rp_mark_complete() {
     rp_state_init
-    printf '%s\n' "$2" > "$RP_STATE_DIR/complete/$1"
+    printf '%s\n' "$2" | rp_atomic_write "$RP_STATE_DIR/complete/$1"
     rm -f "$RP_STATE_DIR/building/$1"
 }
 
@@ -246,7 +258,7 @@ rp_adopt_legacy() {   # args: key dest
     [ -d "$2" ] || return 0
     [ -e "$RP_STATE_DIR/complete/$1" ] && return 0
     [ -e "$RP_STATE_DIR/building/$1" ] && return 0
-    printf '%s\n' "$2" > "$RP_STATE_DIR/complete/$1"
+    printf '%s\n' "$2" | rp_atomic_write "$RP_STATE_DIR/complete/$1"
 }
 
 rp_adopt_configured_variants() {
@@ -374,27 +386,27 @@ rp_rotate_log() {   # args: file max_mb keep
 }
 
 # rp_notify <title> <message> - never fails the caller.
-rp_notify() {
-    local title="$1" msg="$2" url
+rp_notify() {   # rp_notify <title> <message>; returns 0 if at least one channel got it
+    local title="$1" msg="$2" url sent=1
     if [ -n "${RP_NTFY_TOPIC:-}" ]; then
         url="${RP_NTFY_SERVER%/}/$RP_NTFY_TOPIC"
         if command -v curl >/dev/null 2>&1; then
-            curl -fsS -m 20 -H "Title: $title" -d "$msg" "$url" >/dev/null 2>&1 || \
+            curl -fsS -m 20 -H "Title: $title" -d "$msg" "$url" >/dev/null 2>&1 && sent=0 || \
                 echo "Note: could not send ntfy notification to $url" >&2
         elif command -v wget >/dev/null 2>&1; then
-            wget -q -T 20 -O /dev/null --header="Title: $title" --post-data="$msg" "$url" 2>/dev/null || \
+            wget -q -T 20 -O /dev/null --header="Title: $title" --post-data="$msg" "$url" 2>/dev/null && sent=0 || \
                 echo "Note: could not send ntfy notification to $url" >&2
         fi
     fi
     if [ -n "${RP_NOTIFY_EMAIL:-}" ]; then
         if command -v mail >/dev/null 2>&1; then
-            printf '%s\n' "$msg" | mail -s "$title" "$RP_NOTIFY_EMAIL" 2>/dev/null || \
+            printf '%s\n' "$msg" | mail -s "$title" "$RP_NOTIFY_EMAIL" 2>/dev/null && sent=0 || \
                 echo "Note: could not send email to $RP_NOTIFY_EMAIL" >&2
         else
             echo "Note: NOTIFY_EMAIL is set but no 'mail' command is installed." >&2
         fi
     fi
-    return 0
+    return "$sent"
 }
 
 # ============================================================================
@@ -498,7 +510,7 @@ rp_remember_path() {   # rp_remember_path [force]
     local f; f="$(rp_path_file)"
     [ -f "$f" ] && [ "$(cat "$f" 2>/dev/null)" = "$PATH" ] && return 0
     rp_state_init
-    printf '%s\n' "$PATH" > "$f" 2>/dev/null || true
+    printf '%s\n' "$PATH" | rp_atomic_write "$f" 2>/dev/null || true
 }
 
 rp_extend_path() {
@@ -525,13 +537,371 @@ rp_sweep_stale_temp() {   # rp_sweep_stale_temp <folder-glob>...
     local d pid
     for d in "$@"; do
         [ -d "$d" ] || continue
-        pid="$(cat "$d/.owner_pid" 2>/dev/null)"
+        pid="$(cat "$d/.owner_pid" 2>/dev/null)" || pid=""   # no owner file = leftover (must not trip set -e)
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then continue; fi
         rm -rf -- "$d"
     done
 }
 
-# Runs as soon as lib.sh is sourced - i.e. before any script checks for its
-# tools - so even a cron job that calls start.sh or aga.sh directly finds them.
+
+# ============================================================================
+# 9. Folder layout and script-set consistency
+# ============================================================================
+# The only folders allowed at the top of retro_*, new_*/<batch> and every
+# extracted tree. Prints each unexpected (non-hidden) entry, one per line.
+rp_layout_problems() {
+    local e
+    for e in "$1"/*; do
+        [ -e "$e" ] || continue
+        case "${e##*/}" in WHDLoad|HD_Loaders|JST) ;; *) printf '%s\n' "${e##*/}" ;; esac
+    done
+}
+
+# Every script in the set carries a "retroplay-suite:" stamp. A mix of old
+# and new scripts (easy to end up with when copying files over in stages)
+# can do real damage - e.g. an older extract.sh recreating
+# Users/<you>/Downloads/Amiga/... inside retro_* - so the set is checked as
+# a whole. Prints each script whose stamp doesn't match this lib.sh.
+RP_SUITE_VERSION="2026.09.22"
+RP_SUITE_FILES="all.sh start.sh extract.sh merge.sh sort.sh update.sh quick.sh aga.sh ecs.sh rtg.sh doctor.sh install_cron.sh uninstall_deps.sh setup.sh"
+
+rp_suite_mismatches() {
+    local f v
+    for f in $RP_SUITE_FILES; do
+        [ -f "$SCRIPT_DIR/$f" ] || { printf '%s (missing)\n' "$f"; continue; }
+        v="$(sed -n 's/^# retroplay-suite: *\([^ ]*\).*/\1/p' "$SCRIPT_DIR/$f" | head -1)"
+        [ "$v" = "$RP_SUITE_VERSION" ] || printf '%s (%s)\n' "$f" "${v:-older version}"
+    done
+}
+
+# ============================================================================
+# 10. Exit codes, messages, option values, paths, progress
+# ============================================================================
+# Exit codes used across the suite:
+RP_EXIT_OK=0            # completed work
+RP_EXIT_NOWORK=2        # nothing to do / no changes
+RP_EXIT_REMOTE=3        # transient network / server failure - try again later
+RP_EXIT_CONFIG=4        # bad option, configuration or missing prerequisite
+RP_EXIT_INTEGRITY=5     # extraction / validation / integrity failure
+RP_EXIT_INTERRUPTED=130 # stopped by Ctrl-C or a signal
+
+rp_is_interactive() { [ -t 0 ] && [ -t 1 ]; }
+rp_ts()    { date '+%Y-%m-%d %H:%M:%S'; }
+rp_log()   { printf '[%s] %s\n' "$(rp_ts)" "$*"; }
+rp_warn()  { printf 'WARNING: %s\n' "$*" >&2; }
+rp_debug() { [ "${RP_DEBUG:-0}" = "1" ] && printf '[debug] %s\n' "$*" >&2; return 0; }
+rp_die()   {   # rp_die <exit-code> <message...>
+    local code="$1"; shift
+    printf 'ERROR: %s\n' "$*" >&2
+    exit "$code"
+}
+
+# Guards an option that takes a value, e.g. inside a parser:
+#   --dest) rp_require_option_value "$1" "$#" "${2-}"; DEST="$2"; shift 2 ;;
+# A missing value (end of the line) or another option in its place
+# (e.g. "--dest --aga") is a clear error instead of a hang or a crash.
+rp_require_option_value() {
+    if [ "$2" -lt 2 ] || [ -z "$3" ]; then
+        rp_die "$RP_EXIT_CONFIG" "$1 needs a value (see --help)"
+    fi
+    case "$3" in
+        -*) rp_die "$RP_EXIT_CONFIG" "$1 needs a value, but was followed by the option '$3' (see --help)" ;;
+    esac
+}
+
+# Absolute form of a path; relative paths are taken relative to the scripts'
+# folder (the scripts always run from there). The path need not exist.
+rp_resolve_path() {
+    case "$1" in
+        /*) printf '%s\n' "${1%/}" ;;
+        *)  local p="${1#./}"; printf '%s\n' "${SCRIPT_DIR%/}/${p%/}" ;;
+    esac
+}
+
+rp_format_duration() {   # seconds -> H:MM:SS
+    printf '%d:%02d:%02d' $(($1 / 3600)) $((($1 % 3600) / 60)) $(($1 % 60))
+}
+
+# One progress display for every script. On a terminal: a bar redrawn in
+# place. Anywhere else (cron, logs, pipes): a plain timestamped line at 0,
+# 25, 50, 75 and 100% - no carriage returns or escape codes in log files.
+RP_PROGRESS_LAST=""
+rp_progress() {   # rp_progress <current> <total> [label]
+    local cur="$1" tot="$2" label="${3:-Progress}" pct width=40 fill bar
+    [ "$tot" -gt 0 ] 2>/dev/null || return 0
+    [ "$cur" -gt "$tot" ] && cur="$tot"
+    pct=$((cur * 100 / tot))
+    if [ -t 1 ]; then
+        fill=$((pct * width / 100))
+        bar="$(printf '%*s' "$fill" '' | tr ' ' '#')"
+        printf '\r%s %3d%% [%-*s] %d/%d' "$label" "$pct" "$width" "$bar" "$cur" "$tot"
+        [ "$cur" -ge "$tot" ] && printf '\n'
+    else
+        local bucket=$((pct / 25))
+        if [ "$cur" -le 1 ] || [ "$bucket" != "$RP_PROGRESS_LAST" ]; then
+            [ "$bucket" = "$RP_PROGRESS_LAST" ] && [ "$cur" -gt 1 ] || \
+                printf '[%s] %s: %d%% (%d/%d)\n' "$(rp_ts)" "$label" "$pct" "$cur" "$tot"
+            RP_PROGRESS_LAST="$bucket"
+        fi
+    fi
+    return 0
+}
+
+# Writes stdin to a file atomically: a reader never sees a half-written file,
+# and a crash mid-write leaves the previous version intact.
+rp_atomic_write() {   # rp_atomic_write <file>   (content on stdin)
+    local f="$1" tmp
+    tmp="$(dirname "$f")/.$(basename "$f").tmp.$$"
+    cat > "$tmp" && mv -f "$tmp" "$f" || { rm -f "$tmp"; return 1; }
+}
+
+# ============================================================================
+# 13. Status view and test notification
+# ============================================================================
+rp_test_notify() {
+    if [ -z "${RP_NTFY_TOPIC:-}" ] && [ -z "${RP_NOTIFY_EMAIL:-}" ]; then
+        echo "Notifications aren't set up. Set NTFY_TOPIC (and/or NOTIFY_EMAIL) in retroplay.conf."
+        return 4
+    fi
+    if rp_notify "Amiga Retroplay: test notification" "If you can read this, notifications work. Sent $(rp_ts) from $(hostname 2>/dev/null || uname -n)."; then
+        echo "Test notification sent${RP_NTFY_TOPIC:+ to ntfy topic '$RP_NTFY_TOPIC'}${RP_NOTIFY_EMAIL:+ to $RP_NOTIFY_EMAIL}. Check it arrived."
+        return 0
+    fi
+    echo "Couldn't send the test notification - see the note above."
+    return 3
+}
+
+# rp_print_status [short]: what the collection looks like right now.
+rp_print_status() {
+    local short="${1:-}" v key dest q st last code when result ls free drive
+    echo "Amiga Retroplay status"
+    if [ -f "$RP_STATE_DIR/last_run" ]; then
+        code="$(sed -n 's/^code=//p' "$RP_STATE_DIR/last_run")"
+        when="$(sed -n 's/^time=//p' "$RP_STATE_DIR/last_run")"
+        echo "  Last run:      $when - $(rp_exit_meaning "$code")"
+    else
+        echo "  Last run:      none recorded yet"
+    fi
+    for v in $(printf '%s' "$RP_VARIANTS" | tr ',' ' '); do
+        key="retro_$(rp_variant_suffix "$v")"; dest="$RP_OUTPUT_ROOT/$key"
+        q="$(rp_queue_count "$key")"
+        case "$(rp_build_state "$key" "$dest")" in
+            fresh)      st="not built yet" ;;
+            incomplete) st="a full build was interrupted - the next run redoes it" ;;
+            *)          st="built"
+                        [ -f "$RP_STATE_DIR/last_success/$key" ] && st="built, last updated $(cat "$RP_STATE_DIR/last_success/$key")"
+                        [ "$q" -gt 0 ] && st="$st - $q new archive(s) waiting" ;;
+        esac
+        printf '  %-14s %s
+' "$key:" "$st"
+    done
+    if drive="$(rp_check_output_root dry 2>&1)"; then
+        free="$(rp_free_kb "$RP_OUTPUT_ROOT")"
+        echo "  Output folder: $RP_OUTPUT_ROOT${free:+ ($((free / 1024)) MB free)}"
+    else
+        echo "  Output folder: NOT AVAILABLE - $drive"
+    fi
+    [ -n "$short" ] && return 0
+    if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -q "retroplay-all-sh"; then
+        echo "  Nightly run:   installed (every night at 2am)"
+    else
+        echo "  Nightly run:   not installed (./install_cron.sh)"
+    fi
+    if [ -n "${RP_NTFY_TOPIC:-}${RP_NOTIFY_EMAIL:-}" ]; then
+        echo "  Notifications: ${RP_NTFY_TOPIC:+ntfy topic '$RP_NTFY_TOPIC' }${RP_NOTIFY_EMAIL:+email $RP_NOTIFY_EMAIL}"
+    else
+        echo "  Notifications: off (set NTFY_TOPIC or NOTIFY_EMAIL in retroplay.conf)"
+    fi
+    last="$(ls -1 "$SCRIPT_DIR"/reports/*.txt 2>/dev/null | grep -v '_no_artwork' | sort | tail -1)"
+    [ -n "$last" ] && echo "  Last report:   reports/${last##*/}"
+    return 0
+}
+
+# ============================================================================
+# Run at load time (kept at the very end so every helper above exists):
+# before any script checks for its tools, so even a cron job that calls
+# start.sh or aga.sh directly finds them.
+# ============================================================================
 rp_remember_path
 rp_extend_path
+
+# ============================================================================
+# 11. Fast superseded-archive detection (one awk pass instead of a process
+#     per archive pair). Same rules as rp_archive_version_key/rp_version_cmp.
+# ============================================================================
+# rp_find_superseded <exempt-list> <new-archives> <all-archives>
+# Each list: one path per line. Prints, tab-separated, for every archive to
+# retire:  <old path>  <old version>  <new version>  <new path>
+# An archive is retired only when a NEW archive in the SAME folder has the
+# identical name apart from the version field, and a strictly higher version.
+rp_find_superseded() {
+    awk -F'\t' '
+    function keyver(path,   n, i, stem, f, tok, key, ver, rest) {
+        n = split(path, f, "/"); stem = f[n]; dir = substr(path, 1, length(path) - length(stem))
+        sub(/\.[^.]*$/, "", stem)
+        n = split(stem, f, "_")
+        if (n > 1 && f[n] == "") n--          # like bash read: no trailing empty field
+        key = ""; ver = ""
+        for (i = 1; i <= n; i++) {
+            tok = f[i]
+            if (ver == "" && i > 1 && tok ~ /^[Vv][0-9]/) {
+                rest = substr(tok, 2)
+                if (rest !~ /[^0-9A-Za-z.]/) { ver = rest; tok = "#VERSION#" }
+            }
+            key = key (i > 1 ? "_" : "") tok
+        }
+        KEY = dir key; VER = ver
+        return ver != ""
+    }
+    function vcmp(a, b,   pa, pb, ia, ib, na, nb, sa, sb) {
+        while (a != "" || b != "") {
+            ia = index(a, "."); if (ia) { pa = substr(a, 1, ia - 1); a = substr(a, ia + 1) } else { pa = a; a = "" }
+            ib = index(b, "."); if (ib) { pb = substr(b, 1, ib - 1); b = substr(b, ib + 1) } else { pb = b; b = "" }
+            match(pa, /^[0-9]*/); na = substr(pa, 1, RLENGTH); sa = substr(pa, RLENGTH + 1)
+            match(pb, /^[0-9]*/); nb = substr(pb, 1, RLENGTH); sb = substr(pb, RLENGTH + 1)
+            na += 0; nb += 0
+            if (na < nb) return -1
+            if (na > nb) return 1
+            if (sa < sb) return -1
+            if (sa > sb) return 1
+        }
+        return 0
+    }
+    FILENAME == ARGV[1] { exempt[$0] = 1; next }
+    FILENAME == ARGV[2] {
+        if (keyver($0)) {
+            if (!(KEY in best) || vcmp(VER, bestver[KEY]) > 0) { best[KEY] = $0; bestver[KEY] = VER }
+            isnew[$0] = 1
+        }
+        next
+    }
+    {
+        if ($0 in exempt) next
+        if (!keyver($0) || !(KEY in best)) next
+        if ($0 == best[KEY]) next
+        if (vcmp(VER, bestver[KEY]) < 0) print $0 "\t" VER "\t" bestver[KEY] "\t" best[KEY]
+    }' "$1" "$2" "$3"
+}
+
+# rp_queue_new_archives <file of paths>: rp_queue_new_archive for a whole
+# batch - one read and one atomic write per queue instead of per archive.
+rp_queue_new_archives() {
+    local list="$1" m key dest q
+    [ -s "$list" ] || return 0
+    rp_state_init
+    for m in "$RP_STATE_DIR"/complete/*; do
+        [ -f "$m" ] || continue
+        key="${m##*/}"
+        dest="$(cat "$m" 2>/dev/null)" || dest=""
+        [ -n "$dest" ] && [ -d "$dest" ] || continue
+        q="$(rp_queue_file "$key")"
+        { cat "$q" 2>/dev/null; cat "$list"; } | awk 'NF && !seen[$0]++' | rp_atomic_write "$q"
+    done
+}
+
+# ============================================================================
+# 12. Output-drive guard, state backups, gap-fill scheduling, exit meanings
+# ============================================================================
+RP_OUTPUT_MARKER=".retroplay_output"
+
+# If OUTPUT_ROOT is on a USB drive that isn't mounted, its folder is either
+# missing or an empty mount point on the SD card - and a run would quietly
+# rebuild everything there, filling the card. So the output folder gets a
+# marker file with an ID the first time it's used, recorded in the state
+# folder (which lives with the scripts, not on that drive). Later runs
+# refuse unless the same marker is there.
+# rp_check_output_root [dry]  - "dry": check only, never create the marker.
+rp_check_output_root() {
+    local root="$RP_OUTPUT_ROOT" idf="$RP_STATE_DIR/output_root_id" want id
+    if [ ! -d "$root" ]; then
+        echo "The output folder $root doesn't exist. If it's on a USB drive, check the drive is connected and mounted." >&2
+        return 1
+    fi
+    want="$(cat "$idf" 2>/dev/null)" || want=""
+    if [ -n "$want" ] && [ "${want%%|*}" = "$root" ]; then
+        id="$(cat "$root/$RP_OUTPUT_MARKER" 2>/dev/null)" || id=""
+        [ "$id" = "${want#*|}" ] && return 0
+        echo "The output folder $root is missing its marker file ($RP_OUTPUT_MARKER), so it isn't the drive this collection was built on." >&2
+        echo "If it's a USB drive, it's probably not mounted - nothing was changed. (To really start over on a new drive, delete $idf.)" >&2
+        return 1
+    fi
+    [ "${1:-}" = "dry" ] && return 0
+    id="$(date '+%s')-$$-${RANDOM:-0}"
+    printf '%s\n' "$id" | rp_atomic_write "$root/$RP_OUTPUT_MARKER" 2>/dev/null || {
+        echo "Can't write to the output folder $root." >&2; return 1; }
+    rp_state_init
+    printf '%s|%s\n' "$root" "$id" | rp_atomic_write "$idf"
+}
+
+# Rolling backups of the small state folder (queues, build markers, ...),
+# so losing it doesn't mean losing what's queued. The newest 7 are kept.
+RP_BACKUP_DIR="$SCRIPT_DIR/.retroplay_backups"
+rp_backup_state() {
+    [ -d "$RP_STATE_DIR" ] || return 0
+    mkdir -p "$RP_BACKUP_DIR" 2>/dev/null || return 0
+    tar -czf "$RP_BACKUP_DIR/.state-new.tgz" --exclude='.retroplay/stage' -C "$SCRIPT_DIR" .retroplay 2>/dev/null \
+        && mv -f "$RP_BACKUP_DIR/.state-new.tgz" "$RP_BACKUP_DIR/state-$(date '+%Y%m%d-%H%M%S').tgz"
+    rm -f "$RP_BACKUP_DIR/.state-new.tgz"
+    ls -1 "$RP_BACKUP_DIR"/state-*.tgz 2>/dev/null | sort -r | awk 'NR > 7' | while IFS= read -r old; do rm -f "$old"; done
+    return 0
+}
+
+# If the state folder has gone missing (deleted by mistake, disk problem)
+# but backups exist, restore the newest one rather than silently starting
+# over - which would lose every queued download.
+rp_restore_state_if_lost() {
+    local latest
+    [ -d "$RP_STATE_DIR/complete" ] && return 0
+    latest="$(ls -1 "$RP_BACKUP_DIR"/state-*.tgz 2>/dev/null | sort | tail -1)"
+    [ -n "$latest" ] || return 0
+    if tar -xzf "$latest" -C "$SCRIPT_DIR" 2>/dev/null; then
+        echo "The state folder (.retroplay) was missing - restored it from ${latest##*/}."
+        echo "(To deliberately start from scratch, delete both .retroplay and .retroplay_backups.)"
+    fi
+    return 0
+}
+
+# Is the artwork gap-fill worth running for this output folder? Only if an
+# artwork pack changed since the last one, or it's been GAPFILL_DAYS days.
+rp_gapfill_due() {   # <key>
+    local stamp="$RP_STATE_DIR/gapfill/$1" d
+    [ -f "$stamp" ] || return 0
+    [ -n "$(find "$stamp" -mtime +"$(( RP_GAPFILL_DAYS - 1 ))" 2>/dev/null)" ] && return 0
+    for d in "$SCRIPT_DIR"/[iI][gG][aA][mM][eE]_* "$SCRIPT_DIR/TinyLauncher"; do
+        [ -d "$d" ] || continue
+        [ -n "$(find "$d" -newer "$stamp" 2>/dev/null | head -1)" ] && return 0
+    done
+    return 1
+}
+rp_gapfill_done() { mkdir -p "$RP_STATE_DIR/gapfill" 2>/dev/null; touch "$RP_STATE_DIR/gapfill/$1"; }
+
+# Plain-English meaning of an exit code, for summaries and notifications.
+rp_exit_meaning() {
+    case "$1" in
+        0)   echo "finished successfully" ;;
+        2)   echo "nothing to do - everything is up to date" ;;
+        3)   echo "network or server problem - it will try again next run" ;;
+        4)   echo "setup problem (missing tool, drive not mounted, another run in progress, or not enough space) - see the message above" ;;
+        5)   echo "some archives couldn't be extracted - everything else was installed, and they'll be retried" ;;
+        130) echo "stopped before finishing (interrupted)" ;;
+        *)   echo "unexpected error (code $1) - see the log" ;;
+    esac
+}
+
+# rp_test_archive <file>: integrity test with the format's own tool. A tool
+# that isn't installed means "can't test" - treated as OK, never as corrupt.
+rp_test_archive() {
+    case "$1" in
+        *.lha|*.LHA|*.lzh|*.LZH)
+            command -v lha >/dev/null 2>&1 || return 0
+            lha t "$1" >/dev/null 2>&1 ;;
+        *.zip|*.ZIP)
+            if command -v unzip >/dev/null 2>&1; then unzip -tqq "$1" >/dev/null 2>&1
+            elif command -v 7z >/dev/null 2>&1; then 7z t "$1" >/dev/null 2>&1
+            else return 0; fi ;;
+        *.lzx|*.LZX)
+            command -v lsar >/dev/null 2>&1 || return 0
+            lsar -t "$1" >/dev/null 2>&1 ;;
+        *) return 0 ;;
+    esac
+}

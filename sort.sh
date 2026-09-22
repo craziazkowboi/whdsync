@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
 
 # Amiga Retroplay Archive Organizer & Sorter - Ultimate Edition
 # Compatible: macOS, Linux, Debian 12/13, Amiga A314
@@ -128,6 +129,7 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         -d|--dest)
+          rp_require_option_value "$1" "$#" "${2-}"
             DEST_OVERRIDE="$2"
             shift 2
             ;;
@@ -167,7 +169,7 @@ while [ $# -gt 0 ]; do
             ;;
         *)
             echo "Unknown option: $1" >&2
-            exit 1
+            exit 4
             ;;
     esac
 done
@@ -185,86 +187,18 @@ AMIGA_ISSUES_LOG="$(pwd)/amiga_filename_issues.log"
 # ============================================================================
 # SMOOTH UNICODE PROGRESS BAR (macOS GUI-optimized)
 # ============================================================================
-progress_bar_smooth() {
-    local current="$1" total="$2" width="${3:-50}"
-    local percent bar_len whole partial_frac partial_block left bar
-    local prog_chars=(' ' '▏' '▎' '▍' '▌' '▋' '▊' '▉' '█')
 
-    if [ "$total" -gt 0 ]; then
-        percent=$((100 * current / total))
-    else
-        percent=0
-    fi
-
-    bar_len=$(awk "BEGIN{printf \"%.2f\", ($width * $current) / $total + 0 }")
-    whole="${bar_len%.*}"
-    partial_frac="0.${bar_len#*.}"
-    partial_block=$(awk "BEGIN{print int(($partial_frac * 8) + 0.5)}")
-
-    bar=""
-    i=0
-    while [ "$i" -lt "$whole" ]; do
-        bar="${bar}█"
-        i=$((i + 1))
-    done
-
-    if [ "$whole" -lt "$width" ]; then
-        bar="${bar}${prog_chars[$partial_block]}"
-        left=$((width - whole - 1))
-    else
-        left=0
-    fi
-
-    while [ "$left" -gt 0 ]; do
-        bar="${bar} "
-        left=$((left - 1))
-    done
-
-    printf "\r%3d%% [%-${width}s] %d/%d" "$percent" "$bar" "$current" "$total"
-    tput el 2>/dev/null || true
-}
 
 # ============================================================================
 # ASCII PROGRESS BAR (Debian/Linux/A314 compatible)
 # ============================================================================
-progress_bar_ascii() {
-    local current="$1" total="$2" width="${3:-50}"
-    local percent bar_len whole left bar
 
-    if [ "$total" -gt 0 ]; then
-        percent=$((100 * current / total))
-    else
-        percent=0
-    fi
-
-    bar_len=$((width * current / (total > 0 ? total : 1)))
-    whole=$bar_len
-
-    bar=""
-    i=0
-    while [ $i -lt "$whole" ]; do
-        bar="${bar}#"
-        i=$((i + 1))
-    done
-
-    left=$((width - whole))
-    while [ $left -gt 0 ]; do
-        bar="${bar}-"
-        left=$((left - 1))
-    done
-
-    printf "\r%3d%% [%-${width}s] %d/%d" "$percent" "$bar" "$current" "$total"
-}
 
 # ============================================================================
 # ADAPTIVE PROGRESS BAR WRAPPER
 # ============================================================================
-progress_bar() {
-    if [[ "$OS_TYPE" == "Darwin" ]]; then
-        progress_bar_smooth "$@"
-    else
-        progress_bar_ascii "$@"
-    fi
+progress_bar() {   # progress_bar <current> <total> [width] - shared display (lib.sh)
+    rp_progress "$1" "$2" "Sorting"
 }
 
 # ============================================================================
@@ -623,46 +557,40 @@ langs=(
 move_and_tag() {
     local variant="$1"
     local src_dir="$2"
-    local rel_path="${src_dir#$SRC/}"
+    local rel_path="${src_dir#"$SRC"/}"
     local language_found=""
+    local name="${src_dir##*/}" entry code dest_path
 
-    # Check for language suffix
-    local name
-    name="$(basename "$src_dir")"
+    # Language code (case-sensitive) at the end of the name?
     for entry in "${langs[@]}"; do
-        local lang="${entry%%:*}"
-        local code="${entry##*:}"
-        # Case-sensitive, exact language code at end of basename
+        code="${entry##*:}"
         if [[ "$name" =~ ${code}$ ]]; then
-            language_found="$lang"
+            language_found="${entry%%:*}"
             break
         fi
     done
 
-    local dest_path
     if [ -n "$language_found" ]; then
         dest_path="$LANG_ROOT/$language_found/$rel_path"
     else
         dest_path="$SRC/$variant/$rel_path"
     fi
+    move_game_dir "$src_dir" "$dest_path"
+}
 
-    # Move .info file
-    local info_file
-    info_file="$(dirname "$src_dir")/$(basename "$src_dir").info"
-    local new_info_file
-    new_info_file="$(dirname "$dest_path")/$(basename "$dest_path").info"
-
-    mkdir -p "$(dirname "$new_info_file")"
-
-    if [ -e "$info_file" ] && [ ! -e "$new_info_file" ]; then
-        mv "$info_file" "$new_info_file" > /dev/null 2>> "$LOGFILE"
+# move_game_dir <folder> <new path>: moves a game folder and its .info icon.
+# Moves are plain renames on one drive - instant - so they run in order
+# rather than as background jobs. A failed move is logged, never fatal.
+move_game_dir() {
+    local src="$1" dst="$2"
+    mkdir -p "${dst%/*}" 2>> "$LOGFILE" || { echo "could not create ${dst%/*}" >> "$LOGFILE"; return 0; }
+    if [ -e "$src.info" ] && [ ! -e "$dst.info" ]; then
+        mv "$src.info" "$dst.info" 2>> "$LOGFILE" || echo "could not move $src.info" >> "$LOGFILE"
     fi
-
-    # Move directory
-    mkdir -p "$(dirname "$dest_path")"
-    if [ ! -e "$dest_path" ]; then
-        mv "$src_dir" "$dest_path" > /dev/null 2>> "$LOGFILE"
+    if [ ! -e "$dst" ]; then
+        mv "$src" "$dst" 2>> "$LOGFILE" || echo "could not move $src" >> "$LOGFILE"
     fi
+    return 0
 }
 
 # ============================================================================
@@ -670,38 +598,29 @@ move_and_tag() {
 # ============================================================================
 move_lang() {
     local lang="$1" code="$2" dir="$3" lang_dir="$4"
-    local relpath="${dir#$SRC/}"
-    local newpath="$lang_dir/$relpath"
-    local info_file
-    info_file="$(dirname "$dir")/$(basename "$dir").info"
-    local new_info_path
-    new_info_path="$(dirname "$newpath")/$(basename "$dir").info"
-
-    mkdir -p "$(dirname "$new_info_path")"
-
-    if [ -f "$info_file" ] && [ ! -e "$new_info_path" ]; then
-        mv "$info_file" "$new_info_path" > /dev/null 2>> "$LOGFILE"
-    fi
-
-    mkdir -p "$(dirname "$newpath")"
-    if [ ! -e "$newpath" ]; then
-        mv "$dir" "$newpath" > /dev/null 2>> "$LOGFILE"
-    fi
+    move_game_dir "$dir" "$lang_dir/${dir#"$SRC"/}"
 }
 
 # ============================================================================
 # VARIANT SORTING (CD32, AGA, NTSC, MT32, CDTV) - with parallel processing
 # ============================================================================
+# Patterns for variant_sort_strict, matched with bash's built-in [[ =~ ]]
+# (same extended regular expressions grep -E used, without starting a grep
+# process for every folder). Kept in variables: that's how bash 3.2 and
+# later all treat them as regexes rather than literal text.
+RE_AGA_2LETTER='AGA[a-zA-Z]{2}$'
+RE_AGA='AGA([0-9][0-9]?MB)?$|AGA$|AGA_.*$'
+RE_CD32AGA='CD32AGA$'
+
 variant_sort_strict() {
-    local variant="$1"
+    local variant="$1" re_var
     echo "Sorting $variant"
     local found_dirs=()
 
     for search_dir in "$SRC" "$SRC/Games" "$SRC/Demos" "$SRC/Magazines"; do
         if [ -d "$search_dir" ]; then
             while IFS= read -r -d '' dir; do
-                local name
-                name="$(basename "$dir")"
+                local name="${dir##*/}"
 
                 case "$variant" in
                     CD32)
@@ -719,15 +638,15 @@ variant_sort_strict() {
                             :
                         elif [[ "$name" == *_AGA ]]; then
                             found_dirs+=("$dir")
-                        elif echo "$name" | grep -Eq 'AGA[a-zA-Z]{2}$'; then
+                        elif [[ $name =~ $RE_AGA_2LETTER ]]; then
                             found_dirs+=("$dir")
-                        elif echo "$name" | grep -Eq 'AGA([0-9][0-9]?MB)?$|AGA$|AGA_.*$' && \
-                             ! echo "$name" | grep -Eq 'CD32AGA$'; then
+                        elif [[ $name =~ $RE_AGA ]] && ! [[ $name =~ $RE_CD32AGA ]]; then
                             found_dirs+=("$dir")
                         fi
                         ;;
                     NTSC|MT32|CDTV)
-                        if echo "$name" | grep -Eq "${variant}$|${variant}[a-zA-Z]{2}$|${variant}_.*$"; then
+                        re_var="${variant}\$|${variant}[a-zA-Z]{2}\$|${variant}_.*\$"
+                        if [[ $name =~ $re_var ]]; then
                             found_dirs+=("$dir")
                         fi
                         ;;
@@ -743,7 +662,7 @@ variant_sort_strict() {
     local variant_processed=0
 
     for src_dir in "${found_dirs[@]}"; do
-        _start_job move_and_tag "$variant" "$src_dir"
+        move_and_tag "$variant" "$src_dir"
         variant_processed=$((variant_processed + 1))
         progress_bar "$variant_processed" "$variant_total" "$BAR_WIDTH"
     done
@@ -772,24 +691,23 @@ lang_sort() {
     done
 
     # First pass: count total language directories to be moved
-    local lang_total=0
+    # The folder tree is scanned ONCE and reused for every language (it used
+    # to be re-scanned twice per language, running a basename process for
+    # each folder every time). Codes are distinct two-letter endings, so a
+    # folder can match only one language - reusing the list is exact.
+    local all_dirs=() lang_total=0
+    for search_dir in "${variant_dirs[@]+"${variant_dirs[@]}"}"; do
+        if [ -d "$search_dir" ]; then
+            while IFS= read -r -d '' dir; do
+                all_dirs+=("$dir")
+            done < <(find "$search_dir" -mindepth 1 -maxdepth 2 -type d -print0 2>/dev/null || true)
+        fi
+    done
     for entry in "${langs[@]}"; do
-        local lang="${entry%%:*}"
         local code="${entry##*:}"
-        local dir_matches=()
-        for search_dir in "${variant_dirs[@]+"${variant_dirs[@]}"}"; do
-            if [ -d "$search_dir" ]; then
-                while IFS= read -r -d '' dir; do
-                    local name
-                    name="$(basename "$dir")"
-                    # Case-sensitive, exact language code at end of basename
-                    if [[ "$name" =~ ${code}$ ]]; then
-                        dir_matches+=("$dir")
-                    fi
-                done < <(find "$search_dir" -mindepth 1 -maxdepth 2 -type d -print0 2>/dev/null || true)
-            fi
+        for dir in "${all_dirs[@]+"${all_dirs[@]}"}"; do
+            if [[ "${dir##*/}" =~ ${code}$ ]]; then lang_total=$((lang_total + 1)); fi
         done
-        lang_total=$((lang_total + ${#dir_matches[@]}))
     done
 
     # Second pass: actually move each language directory with progress
@@ -799,17 +717,9 @@ lang_sort() {
         local code="${entry##*:}"
         local lang_dir="$SRC/Languages/$lang"
         local dir_matches=()
-        for search_dir in "${variant_dirs[@]+"${variant_dirs[@]}"}"; do
-            if [ -d "$search_dir" ]; then
-                while IFS= read -r -d '' dir; do
-                    local name
-                    name="$(basename "$dir")"
-                    # Case-sensitive, exact language code at end of basename
-                    if [[ "$name" =~ ${code}$ ]]; then
-                        dir_matches+=("$dir")
-                    fi
-                done < <(find "$search_dir" -mindepth 1 -maxdepth 2 -type d -print0 2>/dev/null || true)
-            fi
+        for dir in "${all_dirs[@]+"${all_dirs[@]}"}"; do
+            # Case-sensitive, exact language code at end of the name
+            if [[ "${dir##*/}" =~ ${code}$ ]] && [ -d "$dir" ]; then dir_matches+=("$dir"); fi
         done
 
         local total_items=${#dir_matches[@]}
@@ -819,7 +729,7 @@ lang_sort() {
         mkdir -p "$lang_dir"
 
         for dir in "${dir_matches[@]}"; do
-            _start_job move_lang "$lang" "$code" "$dir" "$lang_dir"
+            move_lang "$lang" "$code" "$dir" "$lang_dir"
             lang_processed=$((lang_processed + 1))
             progress_bar "$lang_processed" "$lang_total" "$BAR_WIDTH"
         done
@@ -1035,11 +945,11 @@ if [ "$RUN_COMPLIANCE_CHECK" = true ]; then
                 n=$(cat "$pf" 2>/dev/null) || n=0
                 [ -n "$n" ] && sum=$((sum + n))
             done
-            printf "\rScanned: %d/%d files" "$sum" "$total_files"
+            rp_progress "$sum" "$total_files" "Checking filenames"
             [ "$still_running" -eq 0 ] && break
             sleep 0.5
         done
-        printf "\r%-60s\n" " "
+        [ -t 1 ] && printf "\r%-60s\n" " "
 
         for pid in "${compliance_pids[@]+"${compliance_pids[@]}"}"; do
             # `wait` must be `if`-guarded, not bare, under this script's

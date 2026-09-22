@@ -1,4 +1,5 @@
 #!/bin/bash
+# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
 
 # Amiga Retroplay - Update Script
 #
@@ -48,7 +49,7 @@ for _arg in "$@"; do
             echo "  --dry-run  Ask the server what WOULD be downloaded, without downloading."
             echo "Exit codes: 0 = new files, 2 = nothing new, 3 = server/network error."
             exit 0 ;;
-        *) echo "Unknown option: $_arg (try --help)" >&2; exit 1 ;;
+        *) echo "Unknown option: $_arg (try --help)" >&2; exit 4 ;;
     esac
 done
 unset _arg
@@ -79,7 +80,7 @@ if ! command -v wget >/dev/null 2>&1; then
     fi
     if ! command -v wget >/dev/null 2>&1; then
         echo "Error: wget not found. Please install wget before running this script."
-        exit 2
+        exit 4   # a missing tool is a setup problem - NOT "nothing new" (exit 2)
     fi
 fi
 
@@ -186,6 +187,7 @@ fi
 
 # Folders built by older versions of these scripts are adopted now, so
 # anything downloaded below gets queued for them too.
+rp_restore_state_if_lost
 rp_adopt_configured_variants
 
 SECONDS=0
@@ -214,7 +216,7 @@ do
 
     # Snapshot of what's already on disk, BEFORE downloading anything, so
     # we can later tell "already had it" apart from "wget just fetched it".
-    find "$dir" -type f | sort > before.txt
+    find -H "$dir" -type f | sort > before.txt
 
     pushd "$dir" > /dev/null || exit 1
 
@@ -227,64 +229,147 @@ do
     # server (by size/date), so re-running this is safe and cheap when
     # nothing new has been published. -np/-nH/--cut-dirs=2 keep the local
     # layout flat instead of recreating the whole remote path structure.
-    wget -q --mirror -np -nH --cut-dirs=2 "$FTP_BASE/$dirpath" > /dev/null
-    wget_status=$?
+    # -nv logs one line per file wget finishes writing; that log (not just
+    # the before/after listing) is what tells us which files are new OR were
+    # re-published under the same name - and which ones actually completed.
+    # Transient failures are retried with a growing pause.
+    dl_log="$SCRIPT_DIR/.wget_download.log"
+    : > "$dl_log"
+    attempt=1
+    while :; do
+        wget -nv -a "$dl_log" --mirror -np -nH --cut-dirs=2 --tries=3 --waitretry=10 \
+             --timeout=60 "$FTP_BASE/$dirpath" > /dev/null 2>&1
+        wget_status=$?
+        [ "$wget_status" -eq 0 ] && break
+        [ "$attempt" -ge "$RP_DOWNLOAD_RETRIES" ] && break
+        printf '\r%-*s | download problem (wget exit %d), retrying (%d of %d)...\n' \
+            "$maxlen" "Checking for updates in: $dir" "$wget_status" "$((attempt + 1))" "$RP_DOWNLOAD_RETRIES"
+        sleep $(( attempt * ${RP_RETRY_WAIT:-30} ))
+        attempt=$((attempt + 1))
+    done
 
     popd > /dev/null || exit 1
 
     # Snapshot again AFTER downloading, so the before/after diff below
     # shows exactly what the mirror added.
-    find "$dir" -type f | sort > after.txt
+    find -H "$dir" -type f | sort > after.txt
 
     # `comm -13` prints lines that are ONLY in the second file (after.txt),
     # i.e. genuinely new since the "before" snapshot - exactly the files
     # this run added, regardless of how many already existed.
-    new_files=0
-    while IFS= read -r nf; do
-        if [ -n "$nf" ]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') $nf" >> "$logfile"
-            new_files=$((new_files + 1))
-            # Queue it for every finished output folder; it stays queued
-            # until that folder has actually absorbed it (see lib.sh).
-            rp_queue_new_archive "$nf"
+    # Files wget reports as completely written (relative to the scripts' folder).
+    sed -n 's/.* -> "\([^"]*\)".*/\1/p' "$dl_log" | sed 's|^\./||' | grep -v '\.listing$' \
+        | sed "s|^|$dir/|" | sort -u > wget_done.txt
+    if [ "$wget_status" -eq 0 ]; then
+        # New files (listing diff) plus anything re-published under the same name.
+        { comm -13 before.txt after.txt; cat wget_done.txt; } | sort -u > new_list.txt
+    else
+        # The transfer failed part-way: trust only files wget confirmed as
+        # complete. A partial file is re-downloaded - and queued - next run.
+        cp wget_done.txt new_list.txt
+    fi
 
-            # Prune superseded archives. An existing archive is only an
-            # older version of the new one when their names are IDENTICAL
-            # apart from the version field (see rp_archive_version_key in
-            # lib.sh) AND its version is strictly lower (1.10 > 1.9 > 1.1).
-            # So _AGA / _CD32 / _HD / _68040 releases of the same game are
-            # separate files and are never touched, and an equal or newer
-            # version is never removed. Pruned archives are quarantined in
-            # old/, not deleted.
-            new_kv="$(rp_archive_version_key "$nf")"
-            exempt_file="$(rp_prune_exempt_file)"
-            # Came back after being quarantined? Then the server still has
-            # it - exempt it from pruning so it isn't re-downloaded and
-            # removed again on every run.
-            if ls old/*/"$nf" >/dev/null 2>&1 && ! grep -qxF "$nf" "$exempt_file" 2>/dev/null; then
-                rp_state_init
-                printf '%s\n' "$nf" >> "$exempt_file"
-                echo "$(date '+%Y-%m-%d %H:%M:%S') KEPT (server still offers it, no longer pruned): $nf" >> "$logfile"
+    # Guard: files clearly arrived but wget's log yielded nothing readable
+    # (e.g. a different wget version's log format). New files are still
+    # found from the listing, but re-published ones could be missed - say so.
+    comm_n="$(comm -13 before.txt after.txt | grep -c .)"
+    done_n="$(grep -c . wget_done.txt)"
+    if [ "$wget_status" -eq 0 ] && [ "${comm_n:-0}" -gt 0 ] && [ "${done_n:-0}" -eq 0 ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') WARNING: couldn't read wget's download log - files re-published under the same name may be missed" >> "$logfile"
+        [ -n "${wget_log_warned:-}" ] || echo "Warning: couldn't read wget's download log (a different wget version?) - re-published files may be missed." >&2
+        wget_log_warned=1
+    fi
+
+    # Test new downloads straight away, so a corrupt one is fetched again in
+    # THIS run rather than failing extraction for several nights first.
+    # VERIFY_DOWNLOADS: yes, no, or auto (= only batches of up to 100 files,
+    # so a huge first download isn't slowed down - extraction checks those).
+    verify_n="$(grep -c . new_list.txt)"; verify_n="${verify_n:-0}"
+    if [ "$verify_n" -gt 0 ] && { [ "$RP_VERIFY_DOWNLOADS" = "yes" ] || { [ "$RP_VERIFY_DOWNLOADS" = "auto" ] && [ "$verify_n" -le 100 ]; }; }; then
+        : > bad.txt
+        while IFS= read -r nf; do
+            [ -f "$nf" ] || continue
+            rp_test_archive "$nf" || { printf '%s\n' "$nf" >> bad.txt; rm -f "$nf"; }
+        done < new_list.txt
+        if [ -s bad.txt ]; then
+            sed "s|^|$(date '+%Y-%m-%d %H:%M:%S') CORRUPT download, fetching it again: |" bad.txt >> "$logfile"
+            pushd "$dir" > /dev/null || exit 1
+            wget -nv -a "$dl_log" --mirror -np -nH --cut-dirs=2 --tries=3 --waitretry=10 \
+                 --timeout=60 "$FTP_BASE/$dirpath" > /dev/null 2>&1
+            popd > /dev/null || exit 1
+            : > gone.txt
+            while IFS= read -r nf; do
+                if [ ! -f "$nf" ]; then
+                    printf '%s\n' "$nf" >> gone.txt       # re-download failed: next run
+                elif rp_test_archive "$nf"; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') re-downloaded OK: $nf" >> "$logfile"
+                else
+                    # Corrupt again - likely corrupt on the server. Kept and
+                    # queued: extraction retries it and reports it by name.
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') STILL CORRUPT after re-downloading (server copy?): $nf" >> "$logfile"
+                fi
+            done < bad.txt
+            if [ -s gone.txt ]; then
+                grep -vxF -f gone.txt new_list.txt > new_list.tmp || true
+                mv new_list.tmp new_list.txt
             fi
-            if [ -n "$new_kv" ]; then
-                new_key="${new_kv%|*}"; new_ver="${new_kv##*|}"
-                game_dir="$(dirname "$nf")"
-                while IFS= read -r -d '' old_archive; do
-                    [ "$old_archive" != "$nf" ] || continue
-                    old_kv="$(rp_archive_version_key "$old_archive")"
-                    [ -n "$old_kv" ] && [ "${old_kv%|*}" = "$new_key" ] || continue
-                    [ "$(rp_version_cmp "${old_kv##*|}" "$new_ver")" = "-1" ] || continue
-                    grep -qxF "$old_archive" "$exempt_file" 2>/dev/null && continue
-                    q_dest="old/$(date '+%Y-%m-%d')/$old_archive"
-                    mkdir -p "$(dirname "$q_dest")"
-                    if mv "$old_archive" "$q_dest"; then
-                        echo "$(date '+%Y-%m-%d %H:%M:%S') QUARANTINED (v${old_kv##*|} superseded by v$new_ver $nf): $old_archive -> $q_dest" >> "$logfile"
-                        pruned_count=$((pruned_count + 1))
-                    fi
-                done < <(find "$game_dir" -maxdepth 1 -type f \( -iname "*.lha" -o -iname "*.lzx" -o -iname "*.zip" \) -print0 2>/dev/null)
-            fi
+            rm -f gone.txt
         fi
-    done < <(comm -13 before.txt after.txt)
+        rm -f bad.txt
+    fi
+    # Everything below works on the whole batch at once - one timestamp, one
+    # queue update and one retirement pass per folder - instead of several
+    # processes per archive (a first download of thousands of archives used
+    # to take minutes here; on a Pi Zero much longer).
+    grep -v '^$' new_list.txt > new_list.tmp 2>/dev/null; mv new_list.tmp new_list.txt
+    new_files="$(grep -c . new_list.txt 2>/dev/null)"; new_files="${new_files:-0}"
+    if [ "$new_files" -gt 0 ]; then
+        ts="$(date '+%Y-%m-%d %H:%M:%S')"
+        sed "s|^|$ts |" new_list.txt >> "$logfile"
+
+        # Queue them for every finished output folder; each stays queued
+        # until that folder has actually absorbed it (see lib.sh).
+        rp_queue_new_archives new_list.txt
+
+        # Came back after being quarantined? Then the server still offers it:
+        # exempt it from pruning, so it isn't re-downloaded and retired again
+        # every run.
+        exempt_file="$(rp_prune_exempt_file)"
+        : > exempt_add.txt
+        while IFS= read -r nf; do
+            set -- old/*/"$nf"
+            if [ -e "$1" ] && ! grep -qxF "$nf" "$exempt_file" 2>/dev/null; then
+                printf '%s\n' "$nf" >> exempt_add.txt
+                echo "$ts KEPT (server still offers it, no longer pruned): $nf" >> "$logfile"
+            fi
+        done < new_list.txt
+        if [ -s exempt_add.txt ]; then
+            rp_state_init
+            { cat "$exempt_file" 2>/dev/null; cat exempt_add.txt; } | rp_atomic_write "$exempt_file"
+        fi
+
+        # Retire superseded archives. An archive is only an older version of
+        # a new one when their names are IDENTICAL apart from the version
+        # field AND its version is strictly lower (1.10 > 1.9 > 1.1) - so
+        # _AGA / _CD32 / _HD / _68040 releases of a game are separate files
+        # and never touched. Retired archives are quarantined in old/.
+        sed 's|/[^/]*$||' new_list.txt | sort -u | while IFS= read -r gd; do
+            find -H "$gd" -maxdepth 1 -type f \( -iname "*.lha" -o -iname "*.lzx" -o -iname "*.zip" \) 2>/dev/null
+        done > folder_archives.txt
+        : > "$exempt_file.check"; [ -f "$exempt_file" ] && cp "$exempt_file" "$exempt_file.check"
+        rp_find_superseded "$exempt_file.check" new_list.txt folder_archives.txt > retire.txt
+        rm -f "$exempt_file.check"
+        while IFS="$(printf '\t')" read -r old_archive old_ver new_ver new_path; do
+            [ -f "$old_archive" ] || continue
+            q_dest="old/$(date '+%Y-%m-%d')/$old_archive"
+            mkdir -p "${q_dest%/*}"
+            if mv "$old_archive" "$q_dest"; then
+                echo "$ts QUARANTINED (v$old_ver superseded by v$new_ver $new_path): $old_archive -> $q_dest" >> "$logfile"
+                pruned_count=$((pruned_count + 1))
+            fi
+        done < retire.txt
+        rm -f exempt_add.txt folder_archives.txt retire.txt
+    fi
 
     # A failed wget with 0 "new files" looks identical to "already up to
     # date" unless we check its exit status - report the failure instead
@@ -298,7 +383,7 @@ do
         total_new_files=$((total_new_files + new_files))
     fi
 
-    rm -f before.txt after.txt
+    rm -f before.txt after.txt wget_done.txt new_list.txt "$dl_log"
 done
 
 # Quarantine folders (one per day) are deleted after OLD_ARCHIVE_DAYS days.

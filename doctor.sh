@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
 # Amiga Retroplay - setup check ("doctor")
 #
 # Checks everything the scripts need and reports what to fix, in plain terms.
@@ -6,6 +7,12 @@
 # Exit status: 0 = no problems found, 1 = at least one problem.
 
 set -u
+for _a in "$@"; do
+    case "$_a" in
+        -h|--help) echo "Usage: doctor.sh"; echo "Checks the setup and explains how to fix any problems. Changes nothing."; echo "Exit status: 0 = no problems, 1 = problems found."; exit 0 ;;
+        *) echo "Unknown option: $_a (try --help)" >&2; exit 4 ;;
+    esac
+done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
 if [ ! -f "$SCRIPT_DIR/lib.sh" ]; then
@@ -37,6 +44,15 @@ for b in /opt/homebrew/bin/bash /usr/local/bin/bash; do
 done
 if [ -n "$bash4" ]; then good "bash 4 or newer available for merge.sh ($bash4)"
 else prob "merge.sh needs bash 4 or newer and none was found" "Fix: brew install bash"; fi
+
+suite_bad="$(rp_suite_mismatches)"
+if [ -n "$suite_bad" ]; then
+    prob "scripts from different versions (lib.sh is $RP_SUITE_VERSION):
+$(printf '%s\n' "$suite_bad" | sed 's/^/      /')" \
+         "Fix: copy the COMPLETE current set of scripts - all.sh refuses to run until they match"
+else
+    good "all scripts are from the same version ($RP_SUITE_VERSION)"
+fi
 
 head_ "Required tools"
 for t in wget lha 7z unar; do
@@ -119,9 +135,16 @@ done
 [ -d "$SCRIPT_DIR/TinyLauncher" ] && good "TinyLauncher (last-resort screenshots)"
 
 head_ "Disk space"
-mkdir -p "$RP_OUTPUT_ROOT" 2>/dev/null
-if [ -w "$RP_OUTPUT_ROOT" ]; then good "output folder is writable: $RP_OUTPUT_ROOT"
-else prob "cannot write to the output folder $RP_OUTPUT_ROOT" "Check OUTPUT_ROOT in retroplay.conf, and that the drive is mounted"; fi
+# (Never create the output folder here: if it's on a USB drive that isn't
+# mounted, that would create it on the SD card instead.)
+if ! guard_msg="$(rp_check_output_root dry 2>&1)"; then
+    prob "output folder not available: $guard_msg" "Connect/mount the drive, or check OUTPUT_ROOT in retroplay.conf"
+elif [ -w "$RP_OUTPUT_ROOT" ]; then good "output folder is available and writable: $RP_OUTPUT_ROOT"
+else prob "cannot write to the output folder $RP_OUTPUT_ROOT" "Check its permissions"; fi
+# Speed hint: on a Raspberry Pi, an SD card is by far the slowest place to build.
+case "$(df -P "$RP_OUTPUT_ROOT" 2>/dev/null | awk 'NR==2 {print $1}')" in
+    */mmcblk*) good "tip: builds run far faster on a USB SSD - set OUTPUT_ROOT in retroplay.conf to its mount point" ;;
+esac
 free_kb="$(rp_free_kb "$RP_OUTPUT_ROOT")"; arch_kb="$(rp_du_kb HD_Loaders JST WHDLoad)"
 if [ -n "$free_kb" ]; then
     good "$((free_kb / 1024)) MB free; downloaded archives use $((arch_kb / 1024)) MB"
@@ -149,15 +172,13 @@ done
 bad_layout=""
 for d in "$RP_OUTPUT_ROOT"/retro_* "$RP_OUTPUT_ROOT"/new_*/*; do
     [ -d "$d" ] || continue
-    for e in "$d"/*; do
-        [ -e "$e" ] || continue
-        case "${e##*/}" in WHDLoad|HD_Loaders|JST) ;; *) bad_layout="$bad_layout
-      ${d#"$RP_OUTPUT_ROOT"/}/${e##*/}"; break ;; esac
-    done
+    e="$(rp_layout_problems "$d" | head -1)"
+    [ -n "$e" ] && bad_layout="$bad_layout
+      ${d#"$RP_OUTPUT_ROOT"/}/$e"
 done
 if [ -n "$bad_layout" ]; then
     prob "folders in the wrong place (should only hold WHDLoad, HD_Loaders, JST):$bad_layout" \
-         "Fix: ./all.sh --rebuild  (rebuilds retro_* correctly), then delete the new_* batch folders listed"
+         "Fix: just run ./all.sh - it rebuilds those retro_* folders from your archives and removes the broken new_* batches"
 else
     good "all retro_* and new_* folders have the correct layout"
 fi

@@ -14,14 +14,17 @@ Bash scripts that download the Retroplay WHDLoad packs, extract them, add iGame/
 
 ```bash
 chmod +x *.sh
-./doctor.sh              # checks your setup and tells you what to fix
+./setup.sh               # installs everything, asks 3 questions, offers the nightly run
 ./all.sh                 # first run: downloads and builds retro_aga, retro_ecs, retro_rtg
-./install_cron.sh        # then keep it up to date every night at 2am
+./start.sh --status      # any time: last run, what's queued, drive, schedule
 ```
+
+`setup.sh` installs the tools (via apt or Homebrew), downloads and compiles `unlzx` from Aminet, enables the locales Linux needs, creates `retroplay.conf`, offers the nightly run and finishes with `doctor.sh`. It's safe to run again at any time — each step only does what's missing. `--yes` answers every question with its default; `--dry-run` shows what it would do.
 
 ## Notes
 
 - Scripts move and rename files as part of normal operation. Keep a backup of your WHDLoad tree before first use.
+- **Always update the scripts as a complete set.** Each one carries a `retroplay-suite:` version stamp, and `all.sh` refuses to run on a mix of versions (naming the out-of-date files), because an old script mixed with new ones can damage a collection. `./doctor.sh` checks this too.
 - Every script can be run from any directory — each one switches to its own folder first. The archive folders (`WHDLoad`, `HD_Loaders`, `JST`) may be symlinks to another drive.
 - Temporary folders (`extract_tmp.*` and friends) are removed whenever a script finishes, fails or is stopped. Leftovers from a crash or power cut are swept up at the start of the next run (a folder whose run is still going is never touched).
 - Bash 3.2+ everywhere, except `merge.sh`, which needs Bash 4+. On macOS it relaunches itself under Homebrew's bash automatically (`brew install bash`).
@@ -49,6 +52,10 @@ Copy `retroplay.conf.example` to `retroplay.conf` and edit it. Every setting is 
 | `OUTPUT_ROOT` | `.` | Where `retro_*`, `new_*` and working files go — e.g. a USB SSD, which is far faster than an SD card. |
 | `ART_ORDER`, `ART_ORDER_<VARIANT>` | `Covers,Screens,Titles` | Artwork priority (per variant if needed). |
 | `DEMO_ART_ORDER` | `Titles,Screens,Covers` | Artwork priority for demos. |
+| `MAX_EXTRACT_ATTEMPTS` | `3` | Failed extractions of one archive before it is moved to `old/corrupt-<date>/` and re-downloaded. |
+| `DOWNLOAD_RETRIES` | `3` | Attempts at each download pass before giving up (exit 3). |
+| `GAPFILL_DAYS` | `7` | The artwork gap-fill runs when an artwork pack changes, or after this many days. |
+| `VERIFY_DOWNLOADS` | `auto` | Test new downloads straight away (`yes`/`no`/`auto` = batches of up to 100 files). |
 | `STRUCTURED_ART_SETS` | `AGA ECS RTG` | Artwork packs matched only by the standard layout; all others are also searched at any depth. |
 | `EXCLUDE_TAGS_<VARIANT>` | ECS variants: `AGA,CD32` | Releases a variant leaves out (see below). |
 | `FILESYSTEM` | `pfs` | Filename limits: `pfs` (107 characters) or `ffs` (30). |
@@ -98,7 +105,19 @@ iGame_AGA/
 4. **Updates** stage just the queued archives, extract and sort them once, add each variant's artwork, then install them. A game in the batch **replaces** its old folder, so files from older versions don't linger. A dated copy goes into `new_<variant>/`, and a quick artwork gap-fill runs over the whole collection.
 5. **Report** in `reports/`, and a notification if something failed.
 
-Free disk space is checked before extracting and before each copy, and an existing collection is only removed once its replacement is ready to install. Every extraction is also checked to contain only `WHDLoad`, `HD_Loaders` and `JST` at the top; anything else stops the run before it reaches a collection.
+**Corrupt or failed archives never block the rest.** Everything that extracts is installed; an archive that fails stays queued and is retried next run. After `MAX_EXTRACT_ATTEMPTS` failures (default 3) it is moved to `old/corrupt-<date>/`, so the next update downloads a fresh copy. The run exits 5 and the report names it.
+
+**A USB drive that isn't mounted is never mistaken for an empty one.** The output folder gets a marker file on first use; if it's missing later (drive not mounted, so the mount point is just an empty folder on the SD card), the run stops with exit 4 and changes nothing, instead of rebuilding everything onto the SD card.
+
+**The state folder is backed up** (`.retroplay_backups/`, newest 7) at the start of every run. If `.retroplay` is ever lost, it's restored automatically, so queued downloads aren't lost. To deliberately start from scratch, delete both folders.
+
+**New downloads are tested straight away** (`lha t`, `unzip -t`, `lsar -t` for .lzx when available). A corrupt download is deleted and fetched again in the same run.
+
+**Artwork gap-fill runs only when it can help:** when an artwork pack has changed (so new artwork reaches an up-to-date collection by itself), after `GAPFILL_DAYS` days, or with `--force`.
+
+**Downloads are retried** (`DOWNLOAD_RETRIES`, default 3, with growing pauses). A file the server re-publishes under the same name is picked up and processed, and a file left half-downloaded by an interrupted transfer is never processed as if complete: it is re-downloaded in full on the next run.
+
+Free disk space is checked before extracting and before each copy, and an existing collection is only removed once its replacement is ready to install. Every extraction is also checked to contain only `WHDLoad`, `HD_Loaders` and `JST` at the top; anything else stops the run before it reaches a collection. If a `retro_*` folder ever holds anything else at the top (such as a `Users/…` tree left by an older version), the next run rebuilds that variant from your archives, and `new_*` batches with the wrong layout are removed.
 
 ## Script reference
 
@@ -112,6 +131,7 @@ Free disk space is checked before extracting and before each copy, and an existi
 | `merge.sh` | Adds artwork to game folders. |
 | `sort.sh` | Variant/language sorting and Amiga filename checks. |
 | `quick.sh` | Preview new downloads in `new/` without touching the collection. |
+| `setup.sh` | One-step install and setup (safe to repeat). |
 | `doctor.sh` | Checks the whole setup and explains fixes. |
 | `install_cron.sh` | Nightly 2am run. |
 | `uninstall_deps.sh` | Removes only the tools these scripts installed. |
@@ -125,15 +145,17 @@ Free disk space is checked before extracting and before each copy, and an existi
          [--art ORDER] [--demo-art ORDER] [--ffs | --pfs] [--no-detox | --detox] [--debug]
 ```
 
-- No variant options: builds `VARIANTS` from `retroplay.conf`.
+- No variant options: builds `VARIANTS` from `retroplay.conf`. Lists may use spaces or commas (`--variants aga,ecs`); an unknown variant name is rejected rather than building a folder with the wrong artwork.
 - `--rebuild` — rebuild from the archives already downloaded, **without checking for updates**.
 - `--clean` — check for updates, then rebuild from scratch.
 - `--skip-update` — don't download; process whatever is queued.
 - `--force` — also run the artwork gap-fill on variants that are up to date.
 - `--dry-run` — show the plan, what's queued, the space needed, and an estimate from the server of what would be downloaded. Changes nothing.
+- `--status` — last run, each variant's state, queued downloads, output drive, schedule. Also `./start.sh --status`, and a summary heads the menu.
+- `--test-notify` — send a test ntfy/email notification and say whether it worked.
 - `--cron` — for cron: full `PATH` (cron's default misses `/usr/local/bin` and Homebrew), log rotation, output to `all_cron.log`.
 - `--dest PATH` — custom output folder (single variant only).
-- Exit codes: `0` work done, `2` nothing to do, `1` failure.
+- Exit codes: `0` work done, `2` nothing to do, `3` network/server problem (try again later), `4` setup or option problem (e.g. a missing tool, another run in progress, not enough disk space), `5` some archives couldn't be extracted (everything else was installed), `130` interrupted, `1` any other failure.
 
 ### start.sh
 
@@ -148,6 +170,8 @@ With no options it shows a menu:
   6) Quick (process new files)
   7) Rebuild from downloaded archives (no update check)
   8) Check setup (doctor)
+  9) Show full status
+ 10) Send a test notification
   0) Exit
 ```
 
@@ -224,8 +248,12 @@ Checks bash, tools, locales, `retroplay.conf`, artwork folders, disk space, buil
 ## Tests
 
 ```bash
-tests/run_tests.sh        # add -v to see each script's output
+tests/run_tests.sh        # end-to-end scenarios; add -v to see each script's output
+tests/option_matrix.sh    # every option of every script, and combinations (slower)
+MATRIX_SECTIONS="1 2" tests/option_matrix.sh   # just some sections (1-6)
 ```
+
+The runner also works if copied to the project root. The option matrix fails on any unexpected exit code, hang, or shell error (unbound variable, bad substitution, etc.) in any output.
 
 End-to-end tests against a mock Retroplay server with mock tools — no network needed. They cover full builds, updates, version retirement, ECS exclusion, failure recovery, interrupted builds, `--rebuild`, `--dry-run`, disk-space refusal, running from another folder, overlapping runs, cron's minimal `PATH`, and temp-folder cleanup (including when a run is stopped part-way). GitHub Actions runs them on Ubuntu and on macOS with the stock bash 3.2 (`.github/workflows/tests.yml`).
 

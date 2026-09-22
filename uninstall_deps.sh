@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
 set -uo pipefail
 
 # Amiga Retroplay - Dependency Uninstaller
@@ -56,7 +57,7 @@ while [ $# -gt 0 ]; do
         *)
             echo "Unknown option: $1" >&2
             echo "Run with --help for usage." >&2
-            exit 1
+            exit 4
             ;;
     esac
 done

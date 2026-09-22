@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
 set -e
 
 # Installs (or updates) a cron job that runs all.sh every morning at 2am.

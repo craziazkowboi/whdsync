@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
 
 # Amiga Retroplay Archive Minimal CLI Dispatcher
 # Copyright (c) 2025 Craziazkowboi
@@ -216,7 +217,7 @@ if [ ${#missing[@]} -ne 0 ]; then
             done
             echo "Or via apt (Linux): sudo apt install ${apt_names[*]}"
         fi
-        exit 1
+        exit 4
     fi
 fi
 
@@ -356,6 +357,8 @@ while [ $# -gt 0 ]; do
       echo "  --detox               Use detox even if retroplay.conf says USE_DETOX=no."
       echo "  --report-missing FILE With --merge: list games that got no artwork in FILE."
       echo "  --doctor              Check the setup and explain how to fix any problems."
+      echo "  --status              Show the last run, each variant's state, drive and schedule."
+      echo "  --test-notify         Send a test notification (ntfy/email from retroplay.conf)."
       echo "  --debug               Enable debug output (also passed to extract.sh/merge.sh)."
       echo "  --exit                Exit immediately."
       echo
@@ -406,6 +409,7 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --set)
+      rp_require_option_value "$1" "$#" "${2-}"
       SET_OPT="$2"
       shift 2
       ;;
@@ -418,14 +422,17 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     -d|--dest)
+      rp_require_option_value "$1" "$#" "${2-}"
       DEST_OPT="$2"
       shift 2
       ;;
     --art)
+      rp_require_option_value "$1" "$#" "${2-}"
       ART_ORDER_OPT="$2"
       shift 2
       ;;
     --demo-art)
+      rp_require_option_value "$1" "$#" "${2-}"
       DEMO_ART_OPT="$2"
       shift 2
       ;;
@@ -449,11 +456,20 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --report-missing)
+      rp_require_option_value "$1" "$#" "${2-}"
       REPORT_MISSING_OPT="$2"
       shift 2
       ;;
     --doctor)
       exec "$SCRIPT_DIR/doctor.sh"
+      ;;
+    --status)
+      rp_print_status
+      exit 0
+      ;;
+    --test-notify)
+      rp_test_notify
+      exit $?
       ;;
     --skipchk)
       SKIPCHK_OPT=1
@@ -493,7 +509,7 @@ while [ $# -gt 0 ]; do
       ;;
     *)
       echo "Unknown option: $1"
-      exit 1
+      exit 4
       ;;
   esac
 done
@@ -505,6 +521,8 @@ if [ -z "$ACTION" ]; then
   echo "Amiga Retroplay Archive Minimal CLI Dispatcher"
   echo "Version: ${version}"
   echo
+  rp_print_status short
+  echo
   echo "Select an action:"
   echo "  1) Auto (update, extract, merge, sort, clean)"
   echo "  2) Update only"
@@ -514,10 +532,12 @@ if [ -z "$ACTION" ]; then
   echo "  6) Quick (process new files)"
   echo "  7) Rebuild from downloaded archives (no update check)"
   echo "  8) Check setup (doctor)"
+  echo "  9) Show full status"
+  echo " 10) Send a test notification"
   echo "  0) Exit"
   echo
 
-  printf "Enter choice [0-8]: "
+  printf "Enter choice [0-10]: "
   # 3-minute timeout: if this menu is here because --auto's own update.sh
   # found nothing new (NOTHING_NEW_FALLBACK), don't wait forever for a
   # human who isn't there - and propagate that "nothing happened" outcome
@@ -560,6 +580,14 @@ if [ -z "$ACTION" ]; then
     8)
       exec "$SCRIPT_DIR/doctor.sh"
       ;;
+    9)
+      rp_print_status
+      exit 0
+      ;;
+    10)
+      rp_test_notify
+      exit $?
+      ;;
     0|"")
       echo "Exiting."
       if [ "$NOTHING_NEW_FALLBACK" -eq 1 ]; then
@@ -569,7 +597,7 @@ if [ -z "$ACTION" ]; then
       ;;
     *)
       echo "Invalid choice: $menu_choice"
-      exit 1
+      exit 4
       ;;
   esac
 fi
@@ -587,11 +615,15 @@ missing_locales=""
 
 # Only check locales if not running on macOS
 if [ "$(uname -s)" != "Darwin" ]; then
-  if ! locale -a | grep -qi "$ascii_locale"; then
+  # locale -a spells the same locale differently depending on the system
+  # (C.utf8 / C.UTF-8, en_US.iso88591 / en_US.ISO-8859-1), so compare
+  # case-insensitively with dashes removed - the same way doctor.sh does.
+  _norm_locales="$(locale -a 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '-')"
+  if ! printf '%s\n' "$_norm_locales" | grep -qx "c.utf8"; then
     missing_locales="$ascii_locale"
   fi
 
-  if ! locale -a | grep -qi "$latin1_locale"; then
+  if ! printf '%s\n' "$_norm_locales" | grep -qx "en_us.iso88591"; then
     if [ -n "$missing_locales" ]; then
       missing_locales="$missing_locales, $latin1_locale"
     else
@@ -761,6 +793,7 @@ if [ "$ACTION" = "auto" ]; then
 
   DELEGATED_AUTO=1
   if ./all.sh "${engine_args[@]}"; then AUTO_EXIT=0; else AUTO_EXIT=$?; fi
+  [ "$AUTO_EXIT" -ne 0 ] && echo "Result: $(rp_exit_meaning "$AUTO_EXIT")"
 
   # Nothing new: offer the menu instead (interactive runs only).
   if [ "$AUTO_EXIT" -eq 2 ] && [ "$NOTHING_NEW_FALLBACK" -eq 0 ] && [ -t 0 ] \

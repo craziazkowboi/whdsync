@@ -29,3 +29,5 @@ jobs:
         run: for f in *.sh tests/*.sh; do ${{ matrix.shell }} -n "$f" || exit 1; done
       - name: Run the test suite
         run: ${{ matrix.shell }} tests/run_tests.sh -v
+      - name: Run the option matrix (every option and combination)
+        run: ${{ matrix.shell }} tests/option_matrix.sh

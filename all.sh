@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
 # Amiga Retroplay - pipeline engine
 #
 # Builds and updates one or more artwork variants (by default AGA, ECS and
@@ -54,6 +55,8 @@ What to do:
   --skip-update         Don't download; process whatever is already queued
   --force               Also run the artwork gap-fill on up-to-date variants
   --dry-run             Show what would happen, change nothing
+  --status              Show the last run, each variant's state, drive, schedule
+  --test-notify         Send a test notification and report whether it worked
   --cron                Unattended mode for cron: sets a full PATH, rotates
                         and writes to all_cron.log
 
@@ -64,6 +67,7 @@ Exit codes: 0 = work done, 2 = nothing to do, 1 = failure.
 USAGE
 }
 
+ORIG_ARGS="$*"
 VARIANT_ARGS=""; DEST_OVERRIDE=""
 CLEAN=0; SKIP_UPDATE=0; FORCE=0; DRY_RUN=0; CRON=0; DEBUG=0
 ART_OVERRIDE=""; DEMO_ART_OVERRIDE=""; FS_OVERRIDE=""; DETOX_OVERRIDE=""
@@ -72,27 +76,27 @@ while [ $# -gt 0 ]; do
     opt="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
     case "$opt" in
         --aga|--ecs|--rtg|--aga-laced|--ecs-laced) VARIANT_ARGS="$VARIANT_ARGS ${opt#--}"; shift ;;
-        --set)       [ $# -ge 2 ] || { echo "--set needs a name" >&2; exit 1; }
-                     VARIANT_ARGS="$VARIANT_ARGS $2"; shift 2 ;;
-        --variants)  [ $# -ge 2 ] || { echo "--variants needs a list" >&2; exit 1; }
-                     VARIANT_ARGS="$VARIANT_ARGS $2"; shift 2 ;;
-        --variant)   VARIANT_ARGS="$VARIANT_ARGS ${2:-}"; shift 2 ;;
-        -d|--dest)   DEST_OVERRIDE="${2:-}"; shift 2 ;;
+        --set)       rp_require_option_value "$1" "$#" "${2-}"; VARIANT_ARGS="$VARIANT_ARGS $2"; shift 2 ;;
+        --variants)  rp_require_option_value "$1" "$#" "${2-}"; VARIANT_ARGS="$VARIANT_ARGS $2"; shift 2 ;;
+        --variant)   rp_require_option_value "$1" "$#" "${2-}"; VARIANT_ARGS="$VARIANT_ARGS $2"; shift 2 ;;
+        -d|--dest)   rp_require_option_value "$1" "$#" "${2-}"; DEST_OVERRIDE="$2"; shift 2 ;;
         --clean)     CLEAN=1; shift ;;
         --rebuild)   CLEAN=1; SKIP_UPDATE=1; shift ;;
         --skip-update) SKIP_UPDATE=1; shift ;;
         --force)     FORCE=1; shift ;;
         --dry-run)   DRY_RUN=1; shift ;;
         --cron)      CRON=1; shift ;;
-        --art)       ART_OVERRIDE="${2:-}"; shift 2 ;;
-        --demo-art)  DEMO_ART_OVERRIDE="${2:-}"; shift 2 ;;
+        --art)       rp_require_option_value "$1" "$#" "${2-}"; ART_OVERRIDE="$2"; shift 2 ;;
+        --demo-art)  rp_require_option_value "$1" "$#" "${2-}"; DEMO_ART_OVERRIDE="$2"; shift 2 ;;
         --ffs)       FS_OVERRIDE=ffs; shift ;;
         --pfs)       FS_OVERRIDE=pfs; shift ;;
         --no-detox)  DETOX_OVERRIDE=no; shift ;;
         --detox)     DETOX_OVERRIDE=yes; shift ;;
         --debug)     DEBUG=1; shift ;;
+        --status)    rp_print_status; exit 0 ;;
+        --test-notify) rp_test_notify; exit $? ;;
         -h|--help)   usage; exit 0 ;;
-        *) echo "Unknown option: $1 (try --help)" >&2; exit 1 ;;
+        *) echo "Unknown option: $1 (try --help)" >&2; exit 4 ;;
     esac
 done
 
@@ -109,6 +113,18 @@ if [ "$CRON" -eq 1 ]; then
 fi
 
 rp_print_config_warnings
+
+# Refuse to run with a mix of old and new scripts - an out-of-date one can do
+# real damage (an older extract.sh recreated Users/<you>/Downloads/Amiga/...
+# inside retro_*).
+suite_bad="$(rp_suite_mismatches)"
+if [ -n "$suite_bad" ]; then
+    echo "ERROR: these scripts are not from the same version as lib.sh ($RP_SUITE_VERSION):" >&2
+    printf '%s\n' "$suite_bad" | sed 's/^/  /' >&2
+    echo "Copy the COMPLETE, current set of scripts into $SCRIPT_DIR, then run again." >&2
+    rp_notify "Amiga Retroplay: run refused" "Scripts from different versions found: $(printf '%s ' $suite_bad)- copy the complete current set."
+    exit "$RP_EXIT_CONFIG"
+fi
 
 # Every start.sh step run from here skips its interactive "view error log?"
 # prompt and appends to one shared retroerror.log for the whole run.
@@ -176,24 +192,50 @@ if [ -z "$FLOCK_BIN" ] && [ -t 0 ]; then
     unset _flock_reply
 fi
 
+# Lock record: who holds the lock, so a refused run can say what it's
+# waiting for.
+LOCK_INFO="$LOCK_FILE.info"
+LOCK_HOST="$(hostname 2>/dev/null || uname -n)"
+RUN_ID="$(date '+%Y%m%d-%H%M%S')-$$"
+lock_holder() { [ -f "$LOCK_INFO" ] && tr '\n' ' ' < "$LOCK_INFO" | sed 's/ $//'; }
+write_lock_info() {
+    printf 'pid=%s\nhost=%s\nstarted=%s\nrun_id=%s\ncommand=%s\n' \
+        "$$" "$LOCK_HOST" "$(rp_ts)" "$RUN_ID" "all.sh $ORIG_ARGS" | rp_atomic_write "$LOCK_INFO"
+}
+refuse_locked() {
+    echo "Another all.sh is already running - not starting a second one at the same time." >&2
+    [ -n "$(lock_holder)" ] && echo "  Held by: $(lock_holder)" >&2
+    exit "$RP_EXIT_CONFIG"
+}
+
 if [ -n "$FLOCK_BIN" ]; then
+    # flock releases automatically when the holder exits or dies, so a lock
+    # that can't be taken is always an ACTIVE run, never a stale one.
     exec 9>"$LOCK_FILE"
-    if ! "$FLOCK_BIN" -n 9; then
-        echo "Another all.sh is already running (lock file: $LOCK_FILE)." >&2
-        echo "Exiting rather than run a second instance at the same time." >&2
-        exit 1
-    fi
+    "$FLOCK_BIN" -n 9 || refuse_locked
+    write_lock_info
 else
-    echo "Warning: 'flock' not found - cannot guarantee only one instance of" >&2
-    echo "all.sh runs at a time." >&2
+    # No flock: an atomic mkdir lock instead. A lock left by a process that
+    # no longer exists ON THIS MACHINE is stale and taken over; a lock from
+    # another machine (shared drive) is never assumed stale.
+    LOCK_DIR="$LOCK_FILE.d"
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        lpid="$(sed -n 's/^pid=//p' "$LOCK_INFO" 2>/dev/null)"
+        lhost="$(sed -n 's/^host=//p' "$LOCK_INFO" 2>/dev/null)"
+        if [ "$lhost" = "$LOCK_HOST" ] && [ -n "$lpid" ] && ! kill -0 "$lpid" 2>/dev/null; then
+            echo "Removing a stale lock left by a run that no longer exists ($(lock_holder))."
+            rm -rf "$LOCK_DIR"
+            mkdir "$LOCK_DIR" 2>/dev/null || refuse_locked
+        else
+            refuse_locked
+        fi
+    fi
+    write_lock_info
+    echo "Note: 'flock' not found - using a simpler lock folder instead." >&2
     if [[ "$OS_TYPE" == "darwin" ]]; then
-        echo "Install it with: brew install util-linux" >&2
-        echo "(Homebrew installs flock keg-only there - this script finds it via" >&2
-        echo "'brew --prefix util-linux' automatically once installed, no PATH" >&2
-        echo "changes needed.)" >&2
+        echo "  For the most reliable locking: brew install util-linux" >&2
     else
-        echo "On Debian/Raspberry Pi OS this ships in util-linux and should" >&2
-        echo "already be present: sudo apt install util-linux" >&2
+        echo "  For the most reliable locking: sudo apt install util-linux" >&2
     fi
 fi
 
@@ -203,6 +245,16 @@ fi
 # Settings for this run
 # ============================================================================
 FS_FLAG="--${FS_OVERRIDE:-$RP_FILESYSTEM}"
+# Art orders must only name the three artwork sections.
+for _o in "${ART_OVERRIDE:-}" "${DEMO_ART_OVERRIDE:-}" "$RP_ART_ORDER" "$RP_DEMO_ART_ORDER"; do
+    [ -n "$_o" ] || continue
+    for _s in $(printf '%s' "$_o" | tr ',' ' '); do
+        case "$(printf '%s' "$_s" | tr '[:upper:]' '[:lower:]')" in
+            covers|screens|titles) ;;
+            *) rp_die "$RP_EXIT_CONFIG" "art order '$_o' contains '$_s' - use only Covers, Screens and Titles, e.g. Covers,Screens,Titles" ;;
+        esac
+    done
+done
 USE_DETOX="${DETOX_OVERRIDE:-$RP_USE_DETOX}"
 DETOX_FLAG=""; [ "$USE_DETOX" = "yes" ] || DETOX_FLAG="--no-detox"
 DEBUG_FLAG=""; [ "$DEBUG" -eq 1 ] && DEBUG_FLAG="--debug"
@@ -215,20 +267,38 @@ REPORT_TMP="$(mktemp "${TMPDIR:-/tmp}/retroplay_report.XXXXXX")"
 FAIL_REASON=""
 
 report() { printf '%s\n' "$*" >> "$REPORT_TMP"; }
-fail()   { FAIL_REASON="$*"; echo; echo "ERROR: $*" >&2; exit 1; }
+mark_success() { mkdir -p "$RP_STATE_DIR/last_success" 2>/dev/null; rp_ts | rp_atomic_write "$RP_STATE_DIR/last_success/$1"; }
+# fail_with <exit code> <message>; fail <message> = unexpected error (1).
+FAIL_CODE=1
+fail_with() { FAIL_CODE="$1"; shift; FAIL_REASON="$*"; echo; echo "ERROR: $*" >&2; exit "$FAIL_CODE"; }
+fail()      { fail_with 1 "$@"; }
 
 # ----- Resolve the variants -----
 V_TOK=(); V_DEST=(); V_KEY=(); V_EXCL=(); V_ART=(); V_NEW=(); V_MFLAGS=(); V_ACT=(); V_WHY=()
-for tok in ${VARIANT_ARGS:-$RP_VARIANTS}; do
+for tok in $(printf '%s' "${VARIANT_ARGS:-$RP_VARIANTS}" | tr ',' ' '); do
     tok="$(printf '%s' "$tok" | tr '[:upper:]' '[:lower:]')"
+    # A typo such as "agaa" would otherwise quietly build retro_agaa with
+    # fallback artwork only - reject anything that isn't a known variant or
+    # an existing iGame_<NAME> artwork folder.
+    case "$tok" in
+        aga|ecs|rtg|aga-laced|ecs-laced|default) ;;
+        *)
+            _found=""
+            for _d in "$SCRIPT_DIR"/[iI][gG][aA][mM][eE]_*; do
+                [ -d "$_d" ] || continue
+                [ "$(printf '%s' "${_d##*/}" | cut -d_ -f2- | tr '[:upper:]' '[:lower:]')" = "$tok" ] && _found=1
+            done
+            [ -n "$_found" ] || rp_die "$RP_EXIT_CONFIG" "unknown variant '$tok' - use aga, ecs, rtg, aga-laced, ecs-laced, or the name of an iGame_<NAME> artwork folder"
+            ;;
+    esac
     dup=0
     for t in "${V_TOK[@]+"${V_TOK[@]}"}"; do [ "$t" = "$tok" ] && dup=1; done
     [ "$dup" -eq 1 ] && continue
     V_TOK+=("$tok")
 done
-[ "${#V_TOK[@]}" -gt 0 ] || { echo "ERROR: no variants to build (check VARIANTS in retroplay.conf)." >&2; exit 1; }
+[ "${#V_TOK[@]}" -gt 0 ] || rp_die "$RP_EXIT_CONFIG" "no variants to build (check VARIANTS in retroplay.conf)."
 if [ -n "$DEST_OVERRIDE" ] && [ "${#V_TOK[@]}" -gt 1 ]; then
-    echo "ERROR: --dest can only be used when building a single variant." >&2; exit 1
+    rp_die "$RP_EXIT_CONFIG" "--dest can only be used when building a single variant."
 fi
 
 for i in "${!V_TOK[@]}"; do
@@ -257,6 +327,9 @@ fi
 
 finish() {
     local st=$? errs=0 result body
+    if [ "$DRY_RUN" -eq 0 ] && [ "$(sed -n 's/^pid=//p' "$LOCK_INFO" 2>/dev/null)" = "$$" ]; then
+        rm -f "$LOCK_INFO"; rm -rf "${LOCK_DIR:-/nonexistent-lock}"
+    fi
     rm -f "$REPORT_TMP.missing" 2>/dev/null
     if [ "$DRY_RUN" -eq 1 ]; then rm -f "$REPORT_TMP"; return; fi
     rm -rf -- "$WORK_ROOT" "$STAGE_ROOT"
@@ -264,8 +337,13 @@ finish() {
     case "$st" in
         0) result="Finished successfully" ;;
         2) result="Nothing to do - everything is up to date" ;;
-        *) result="FAILED${FAIL_REASON:+ - $FAIL_REASON}" ;;
+        5) result="Finished, but some archives couldn't be extracted (exit 5: they'll be retried)" ;;
+        *) result="FAILED (exit $st: $(rp_exit_meaning "$st"))${FAIL_REASON:+ - $FAIL_REASON}" ;;
     esac
+    # For the status view: the last run's result.
+    rp_state_init
+    printf 'code=%s\ntime=%s\nresult=%s\nreport=reports/%s.txt\n' "$st" "$(rp_ts)" "$result" "$RUN_TS" \
+        | rp_atomic_write "$RP_STATE_DIR/last_run"
     if [ "$st" -ne 2 ] || [ -s "$REPORT_TMP" ]; then
         mkdir -p "$REPORT_DIR"
         {
@@ -292,14 +370,23 @@ finish() {
     fi
     body="$(cat "$REPORT_DIR/$RUN_TS.txt" 2>/dev/null)"
     if [ "$st" -ne 0 ] && [ "$st" -ne 2 ]; then
-        rp_notify "Amiga Retroplay: run FAILED" "${body:-$result}"
+        rp_notify "Amiga Retroplay: $(rp_exit_meaning "$st")" "${body:-$result}"
     elif [ "$st" -eq 0 ] && [ "$RP_NOTIFY_ON_SUCCESS" = "yes" ]; then
         rp_notify "Amiga Retroplay: run finished" "$body"
     fi
     rm -f "$REPORT_TMP"
 }
 trap finish EXIT
-trap 'fail "interrupted"' INT TERM
+trap 'fail_with "$RP_EXIT_INTERRUPTED" "interrupted"' INT TERM
+
+# ----- Safety checks before touching anything -----
+if [ "$DRY_RUN" -eq 0 ]; then
+    rp_restore_state_if_lost
+    rp_check_output_root || fail_with "$RP_EXIT_CONFIG" "the output folder isn't available (drive not mounted?) - nothing was changed"
+    rp_backup_state
+else
+    rp_check_output_root dry || rp_die "$RP_EXIT_CONFIG" "the output folder isn't available (drive not mounted?)"
+fi
 
 # ============================================================================
 # 1. Check for updates
@@ -318,7 +405,8 @@ if [ "$SKIP_UPDATE" -eq 0 ]; then
         ./update.sh; ust=$?
         case "$ust" in
             0|2) ;;
-            3) fail "could not update from the Retroplay server (network or server problem)" ;;
+            3) fail_with "$RP_EXIT_REMOTE" "could not update from the Retroplay server (network or server problem) - will retry next run" ;;
+            4) fail_with "$RP_EXIT_CONFIG" "update.sh could not run (missing tool or bad setup - see above)" ;;
             *) fail "update.sh failed (exit $ust)" ;;
         esac
     fi
@@ -337,10 +425,17 @@ for i in "${!V_TOK[@]}"; do
         V_ACT[$i]=full; V_WHY[$i]="not built yet"
     elif [ "$state" = incomplete ]; then
         V_ACT[$i]=full; V_WHY[$i]="the last full build was interrupted - redoing it"
+    elif [ -n "$(rp_layout_problems "${V_DEST[$i]}")" ]; then
+        # e.g. a Users/<you>/Downloads/Amiga/... tree from the old path bug.
+        # Games in there never got artwork or sorting, so rebuild cleanly.
+        V_ACT[$i]=full
+        V_WHY[$i]="folders in the wrong place ($(rp_layout_problems "${V_DEST[$i]}" | tr '\n' ' ' | sed 's/ $//')) - rebuilding it correctly"
     elif [ "$q" -gt 0 ]; then
         V_ACT[$i]=update; V_WHY[$i]="$q new archive(s) queued"
     elif [ "$FORCE" -eq 1 ]; then
         V_ACT[$i]=gapfill; V_WHY[$i]="up to date - artwork gap-fill only"
+    elif rp_gapfill_due "${V_KEY[$i]}"; then
+        V_ACT[$i]=gapfill; V_WHY[$i]="up to date - artwork packs changed (or ${RP_GAPFILL_DAYS}-day check): filling in missing artwork"
     else
         V_ACT[$i]=none; V_WHY[$i]="up to date"
     fi
@@ -352,6 +447,21 @@ for i in "${!V_TOK[@]}"; do
         "${V_EXCL[$i]:+  (leaving out: ${V_EXCL[$i]})}"
 done
 echo
+
+# Saved batches with the wrong layout are only broken copies (the games are
+# in the archives and get rebuilt) - remove them so they can't be copied on.
+for i in "${!V_TOK[@]}"; do
+    for b in "${V_NEW[$i]}"/*; do
+        [ -d "$b" ] && [ -n "$(rp_layout_problems "$b")" ] || continue
+        if [ "$DRY_RUN" -eq 1 ]; then
+            echo "Would remove ${b#"$RP_OUTPUT_ROOT"/} (wrong folder layout)"
+        else
+            rm -rf -- "$b"
+            echo "Removed ${b#"$RP_OUTPUT_ROOT"/} - it had the wrong folder layout"
+            report "Removed ${b#"$RP_OUTPUT_ROOT"/} (wrong folder layout from the old path bug)"
+        fi
+    done
+done
 
 any_work=0
 for i in "${!V_TOK[@]}"; do [ "${V_ACT[$i]}" != none ] && any_work=1; done
@@ -396,6 +506,84 @@ rescue_extract_log() {
     fi
 }
 
+# Safety net: an extracted tree must only contain the archive folders at
+# its top level. Anything else (e.g. a whole absolute path such as
+# Users/<you>/Downloads/Amiga recreated inside it) means the extraction went
+# wrong - stop before it reaches a collection; the batch stays queued.
+check_layout() {
+    local bad
+    bad="$(rp_layout_problems "$1" | tr '\n' ' ')"
+    [ -z "$bad" ] || fail_with "$RP_EXIT_INTEGRITY" "unexpected folder(s) in the extracted files:$bad (expected only WHDLoad, HD_Loaders, JST) - nothing was installed"
+}
+
+# ----- Archives that fail to extract -----
+# Everything that DID extract is installed; failed archives stay queued and
+# are retried next run. After MAX_EXTRACT_ATTEMPTS failures an archive is
+# moved to old/corrupt-<date>/, so the next update downloads a fresh copy
+# (a corrupt download is the usual cause). The run exits 5 so you hear of it.
+INTEGRITY_ISSUES=0
+ATTEMPTS_FILE="$RP_STATE_DIR/extract_attempts.list"      # "<count><TAB><archive>"
+
+# run_extract <failure-accumulator> <extract.sh args...>  (from the current folder)
+run_extract() {
+    local acc="$1" tmp st; shift
+    tmp="$WORK_ROOT/.failed.$$.${RANDOM:-0}"
+    RP_EXTRACT_FAILED_LIST="$tmp" bash "$SCRIPT_DIR/extract.sh" "$@"; st=$?
+    [ -s "$tmp" ] && cat "$tmp" >> "$acc"
+    rm -f "$tmp"
+    case "$st" in
+        0|5) return 0 ;;
+        130) fail_with "$RP_EXIT_INTERRUPTED" "interrupted" ;;
+        *)   fail "the extractor stopped unexpectedly (exit $st)" ;;
+    esac
+}
+
+# match_failures <failure-list> <archive-list>: prints the archives (from the
+# second list, relative paths) that failed. Matched by path SUFFIX, so the
+# way a folder's path happens to be spelled can never cause a mismatch.
+match_failures() {
+    local p line d
+    [ -s "$1" ] || return 0
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        while IFS= read -r line; do
+            case "$line" in
+                DIR:*) d="${line#DIR:}"; case "$d/" in *"/${p%/*}/") printf '%s\n' "$p"; break ;; esac ;;
+                *"/$p") printf '%s\n' "$p"; break ;;
+            esac
+        done < "$1"
+    done < "$2"
+}
+
+clear_extract_failures() {   # <file of archives that extracted fine>
+    [ -s "$ATTEMPTS_FILE" ] && [ -s "$1" ] || return 0
+    awk -F'\t' 'NR == FNR { ok[$0] = 1; next } !($2 in ok)' "$1" "$ATTEMPTS_FILE" | rp_atomic_write "$ATTEMPTS_FILE"
+}
+
+# handle_failed <archive>: counts the attempt; gives up after the limit.
+handle_failed() {
+    local rel="$1" n q dest
+    rp_state_init
+    n="$(awk -F'\t' -v r="$rel" '$2 == r { print $1 }' "$ATTEMPTS_FILE" 2>/dev/null)"
+    n=$(( ${n:-0} + 1 ))
+    { awk -F'\t' -v r="$rel" '$2 != r' "$ATTEMPTS_FILE" 2>/dev/null; printf '%s\t%s\n' "$n" "$rel"; } | rp_atomic_write "$ATTEMPTS_FILE"
+    INTEGRITY_ISSUES=1
+    if [ "$n" -ge "$RP_MAX_EXTRACT_ATTEMPTS" ]; then
+        dest="$SCRIPT_DIR/old/corrupt-$(date '+%Y-%m-%d')/$rel"
+        mkdir -p "$(dirname "$dest")"
+        [ -f "$SCRIPT_DIR/$rel" ] && mv "$SCRIPT_DIR/$rel" "$dest"
+        for q in "$RP_STATE_DIR"/queue/*.list; do
+            [ -f "$q" ] || continue
+            grep -vxF "$rel" "$q" 2>/dev/null | rp_atomic_write "$q"
+            [ -s "$q" ] || rm -f "$q"
+        done
+        awk -F'\t' -v r="$rel" '$2 != r' "$ATTEMPTS_FILE" | rp_atomic_write "$ATTEMPTS_FILE"
+        report "GAVE UP on $rel after $n failed extraction attempts - moved to old/corrupt-$(date '+%Y-%m-%d')/ so the next update downloads a fresh copy"
+    else
+        report "FAILED to extract $rel (attempt $n of $RP_MAX_EXTRACT_ATTEMPTS) - still queued, will retry next run"
+    fi
+}
+
 # merge_variant <index> <folder> [extra merge.sh options...]
 merge_variant() {
     local i="$1" dir="$2"; shift 2
@@ -426,9 +614,9 @@ if [ "${#FULL[@]}" -gt 0 ]; then
     names=""; for i in "${FULL[@]}"; do names="$names ${V_KEY[$i]}"; done
     echo "===== Full build:$names ====="
     arch_kb="$(rp_du_kb HD_Loaders JST WHDLoad)"
-    [ "$arch_kb" -gt 0 ] || fail "no downloaded archives found yet (HD_Loaders/, JST/, WHDLoad/) - run once without --rebuild/--skip-update first"
+    [ "$arch_kb" -gt 0 ] || fail_with "$RP_EXIT_CONFIG" "no downloaded archives found yet (HD_Loaders/, JST/, WHDLoad/) - run once without --rebuild/--skip-update first"
     est_kb=$((arch_kb * RP_SPACE_FACTOR))
-    rp_require_space "$RP_OUTPUT_ROOT" "$est_kb" "extracting the archives" || fail "not enough disk space to extract the archives"
+    rp_require_space "$RP_OUTPUT_ROOT" "$est_kb" "extracting the archives" || fail_with "$RP_EXIT_CONFIG" "not enough disk space to extract the archives"
     for i in "${FULL[@]}"; do rp_mark_building "${V_KEY[$i]}" "${V_DEST[$i]}"; done
 
     # Tags some of these variants must leave out (e.g. AGA,CD32 for ECS).
@@ -448,14 +636,15 @@ if [ "${#FULL[@]}" -gt 0 ]; then
     COMMON="$WORK_ROOT/common"
     if [ -n "$ALL_EXCL" ]; then
         echo "--- Extracting archives without $ALL_EXCL (shared by all variants) ---"
-        bash ./extract.sh -u -d "$COMMON" --exclude-tags "$ALL_EXCL" $DEBUG_FLAG || fail "extraction failed"
+        run_extract "$WORK_ROOT/failed_fresh.list" -u -d "$COMMON" --exclude-tags "$ALL_EXCL" $DEBUG_FLAG
     else
         echo "--- Extracting all archives ---"
-        bash ./extract.sh -u -d "$COMMON" $DEBUG_FLAG || fail "extraction failed"
+        run_extract "$WORK_ROOT/failed_fresh.list" -u -d "$COMMON" $DEBUG_FLAG
     fi
     mkdir -p "$COMMON"
     echo "--- Sorting and checking filenames ---"
     sort_folder "$COMMON" || fail "sorting failed"
+    check_layout "$COMMON"
 
     # One "extra" part per distinct set of left-out tags that isn't "all of
     # them" (normally just one: the AGA/CD32 releases for AGA and RTG).
@@ -470,12 +659,13 @@ if [ "${#FULL[@]}" -gt 0 ]; then
         EXTRA_SET+=("$ex"); EXTRA_DIR+=("$WORK_ROOT/extra_$n")
         echo "--- Extracting the $ALL_EXCL archives${ex:+ (without $ex)} ---"
         if [ -n "$ex" ]; then
-            bash ./extract.sh -u -d "$WORK_ROOT/extra_$n" --only-tags "$ALL_EXCL" --exclude-tags "$ex" $DEBUG_FLAG || fail "extraction failed"
+            run_extract "$WORK_ROOT/failed_fresh.list" -u -d "$WORK_ROOT/extra_$n" --only-tags "$ALL_EXCL" --exclude-tags "$ex" $DEBUG_FLAG
         else
-            bash ./extract.sh -u -d "$WORK_ROOT/extra_$n" --only-tags "$ALL_EXCL" $DEBUG_FLAG || fail "extraction failed"
+            run_extract "$WORK_ROOT/failed_fresh.list" -u -d "$WORK_ROOT/extra_$n" --only-tags "$ALL_EXCL" $DEBUG_FLAG
         fi
         mkdir -p "$WORK_ROOT/extra_$n"
         sort_folder "$WORK_ROOT/extra_$n" || fail "sorting failed"
+        check_layout "$WORK_ROOT/extra_$n"
     done
 
     remaining="${#FULL[@]}"
@@ -490,7 +680,7 @@ if [ "${#FULL[@]}" -gt 0 ]; then
         [ "$remaining" -eq 0 ] && need_kb="$(rp_du_kb ${extra:+"$extra"})"   # last one moves instead of copying
         free_kb="$(rp_free_kb "$RP_OUTPUT_ROOT")"; old_kb="$(rp_du_kb "$dest")"
         if [ -n "$free_kb" ] && [ $((need_kb + RP_MIN_FREE_MB * 1024)) -gt $((free_kb + old_kb)) ]; then
-            fail "not enough disk space to install $key (needs about $((need_kb / 1024)) MB)"
+            fail_with "$RP_EXIT_CONFIG" "not enough disk space to install $key (needs about $((need_kb / 1024)) MB)"
         fi
         rm -rf -- "$dest"
         mkdir -p "$(dirname "$dest")"
@@ -504,12 +694,28 @@ if [ "${#FULL[@]}" -gt 0 ]; then
         merge_variant "$i" "$dest" --report-missing "$miss" || fail "adding artwork to $key failed"
         rp_mark_complete "$key" "$dest"
         rp_queue_clear "$key"
+        rp_gapfill_done "$key"          # a full build merged everything
+        mark_success "$key"
         games="$(rp_count_games "$dest")"; nomiss="$(save_missing_list "$i" "$miss")"
         line="$key: full build - $games games${V_EXCL[$i]:+ (without ${V_EXCL[$i]} releases)}, $nomiss without artwork"
         [ "$nomiss" -gt 0 ] && line="$line (list: reports/${RUN_TS}_${key}_no_artwork.txt)"
         report "$line"
     done
     rm -rf -- "$WORK_ROOT/common" "$WORK_ROOT"/extra_*
+
+    if [ -s "$WORK_ROOT/failed_fresh.list" ]; then
+        find -H HD_Loaders JST WHDLoad -type f \( -iname '*.lha' -o -iname '*.lzx' -o -iname '*.zip' \) 2>/dev/null \
+            | sed 's|^\./||' > "$WORK_ROOT/all_archives.list"
+        match_failures "$WORK_ROOT/failed_fresh.list" "$WORK_ROOT/all_archives.list" | sort -u > "$WORK_ROOT/fresh_failed.list"
+        while IFS= read -r rel; do
+            [ -n "$rel" ] || continue
+            for i in "${FULL[@]}"; do
+                q="$(rp_queue_file "${V_KEY[$i]}")"
+                grep -qxF "$rel" "$q" 2>/dev/null || { cat "$q" 2>/dev/null; printf '%s\n' "$rel"; } | rp_atomic_write "$q"
+            done
+            handle_failed "$rel"
+        done < "$WORK_ROOT/fresh_failed.list"
+    fi
 fi
 
 # ============================================================================
@@ -564,17 +770,46 @@ for g in ${G_SIG[@]+"${!G_SIG[@]}"}; do
 
     est_kb=$(( $(rp_du_kb "$src") * RP_SPACE_FACTOR ))
     rp_require_space "$RP_OUTPUT_ROOT" $((est_kb * (1 + 2 * nmembers))) "processing $narch new archive(s)" \
-        || fail "not enough disk space to process the new downloads"
+        || fail_with "$RP_EXIT_CONFIG" "not enough disk space to process the new downloads"
 
     echo "--- Extracting $narch new archive(s) ---"
-    (cd "$src" && bash "$SCRIPT_DIR/extract.sh" -u -d "$batch" $DEBUG_FLAG)
+    : > "$STAGE_ROOT/failed_$g.list"
+    (cd "$src" && RP_EXTRACT_FAILED_LIST="$STAGE_ROOT/failed_$g.list" bash "$SCRIPT_DIR/extract.sh" -u -d "$batch" $DEBUG_FLAG)
     xst=$?
     rescue_extract_log "$src"
-    [ "$xst" -eq 0 ] || fail "extracting the new archives failed"
+    case "$xst" in
+        0|5) ;;
+        130) fail_with "$RP_EXIT_INTERRUPTED" "interrupted" ;;
+        *)   fail "the extractor stopped unexpectedly (exit $xst)" ;;
+    esac
+    failed_rels="$STAGE_ROOT/failed_rels_$g.list"
+    match_failures "$STAGE_ROOT/failed_$g.list" "$list" | sort -u > "$failed_rels"
+    if [ -s "$failed_rels" ]; then
+        grep -vxF -f "$failed_rels" "$list" > "$STAGE_ROOT/ok_$g.list" || true
+        for i in $members; do       # failed archives stay queued for next time
+            grep -vxF -f "$failed_rels" "$STAGE_ROOT/processed_${V_KEY[$i]}.list" > "$STAGE_ROOT/processed_${V_KEY[$i]}.tmp" || true
+            mv "$STAGE_ROOT/processed_${V_KEY[$i]}.tmp" "$STAGE_ROOT/processed_${V_KEY[$i]}.list"
+        done
+        while IFS= read -r rel; do handle_failed "$rel"; done < "$failed_rels"
+    else
+        cp "$list" "$STAGE_ROOT/ok_$g.list"
+    fi
+    clear_extract_failures "$STAGE_ROOT/ok_$g.list"
+    nfailed="$(grep -c . "$failed_rels" 2>/dev/null)"; nfailed="${nfailed:-0}"
     mkdir -p "$batch"
     echo "--- Sorting and checking filenames ---"
     sort_folder "$batch" || fail "sorting the new archives failed"
+    mkdir -p "$batch"          # sort.sh removes empty folders
+    check_layout "$batch"
     bgames="$(rp_count_games "$batch")"
+    if [ ! -s "$STAGE_ROOT/ok_$g.list" ]; then
+        for i in $members; do
+            rp_queue_remove_processed "${V_KEY[$i]}" "$STAGE_ROOT/processed_${V_KEY[$i]}.list"
+            report "${V_KEY[$i]}: nothing installed - all $narch new archive(s) failed to extract (they will be retried)"
+        done
+        rm -rf -- "$src" "$batch"
+        continue
+    fi
 
     remaining="$nmembers"
     for i in $members; do
@@ -598,13 +833,19 @@ for g in ${G_SIG[@]+"${!G_SIG[@]}"}; do
         rp_prune_batches "${V_NEW[$i]}" "$RP_KEEP_NEW_BATCHES"
 
         # Fill in artwork for anything in the collection still missing it.
+        # (only when an artwork pack changed, or every GAPFILL_DAYS days)
         gapnote=""
-        merge_variant "$i" "$dest" --only-missing || gapnote=" (artwork gap-fill reported errors - see retroerror.log)"
+        if rp_gapfill_due "$key"; then
+            if merge_variant "$i" "$dest" --only-missing; then rp_gapfill_done "$key"
+            else gapnote=" (artwork gap-fill reported errors - see retroerror.log)"; fi
+        fi
+        mark_success "$key"
 
         rp_queue_remove_processed "$key" "$STAGE_ROOT/processed_$key.list"
         nomiss="$(save_missing_list "$i" "$miss")"
         line="$key: $bgames game(s) added/updated from $narch archive(s) - batch saved in ${V_NEW[$i]##*/}/$RUN_TS, $nomiss without artwork"
         [ "$nomiss" -gt 0 ] && line="$line (list: reports/${RUN_TS}_${key}_no_artwork.txt)"
+        [ "$nfailed" -gt 0 ] && line="$line; $nfailed archive(s) failed and stay queued"
         report "$line$gapnote"
     done
     rm -rf -- "$src"
@@ -617,8 +858,13 @@ for i in "${!V_TOK[@]}"; do
     [ "${V_ACT[$i]}" = gapfill ] || continue
     echo
     echo "===== ${V_KEY[$i]}: artwork gap-fill ====="
-    merge_variant "$i" "${V_DEST[$i]}" --only-missing || fail "artwork gap-fill for ${V_KEY[$i]} failed"
-    report "${V_KEY[$i]}: up to date - artwork gap-fill done"
+    miss="$REPORT_TMP.missing"; : > "$miss"
+    merge_variant "$i" "${V_DEST[$i]}" --only-missing --report-missing "$miss" || fail "artwork gap-fill for ${V_KEY[$i]} failed"
+    rp_gapfill_done "${V_KEY[$i]}"
+    mark_success "${V_KEY[$i]}"
+    report "${V_KEY[$i]}: up to date - artwork gap-fill done; $(save_missing_list "$i" "$miss") game(s) still without artwork"
 done
 
+# All possible work is done; report extraction failures with exit 5.
+[ "$INTEGRITY_ISSUES" -eq 1 ] && exit "$RP_EXIT_INTEGRITY"
 exit 0
