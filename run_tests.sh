@@ -50,10 +50,23 @@ chmod +x "$ROOT"/*.sh
 # contains the text in $MOCK/fail_pattern fails.
 cat > "$MOCK/lha" << 'EOF'
 #!/usr/bin/env bash
-arc=""; for a in "$@"; do case "$a" in *.lha|*.LHA|*.lzx|*.zip) arc="$a";; esac; done
+arc=""; for a in "$@"; do case "$a" in *.lha|*.LHA|*.lzx|*.zip|*.part) arc="$a";; esac; done
 [ -n "$arc" ] || exit 0
 # "lha t <archive>" = integrity test: fails only for archives marked CORRUPT
 if [ "${1:-}" = "t" ]; then grep -q CORRUPT "$arc" 2>/dev/null && exit 1; exit 0; fi
+case "${arc##*/}" in
+    [Ii][Gg]ame_*.lha|TinyLauncher.lha)
+        layout="$(sed -n 1p "$arc")"; pack="$(sed -n 2p "$arc")"; pack="${pack%.lha}"
+        case "$layout" in
+            # one wrapping folder named like the archive, holding the categories
+            A) mkdir -p "$pack/Games/A"; echo "$pack art" > "$pack/Games/A/iGame.iff" ;;
+            # category folders straight at the top
+            B) mkdir -p Games/A Demos/B; echo "$pack art" > Games/A/iGame.iff; echo d > Demos/B/iGame.iff ;;
+            BAD) mkdir -p RandomStuff; echo x > RandomStuff/file ;;
+            CORRUPT) exit 1 ;;
+        esac
+        exit 0 ;;
+esac
 stem="${arc##*/}"; stem="${stem%.*}"
 pat="$(cat "$(dirname "$0")/fail_pattern" 2>/dev/null)"
 [ -n "$pat" ] && case "$stem" in *"$pat"*) exit 1;; esac
@@ -71,7 +84,7 @@ ROOT_P="$(cd "$ROOT" && pwd -P)"   # physical path (e.g. macOS /var -> /private/
 cat > "$MOCK/wget" << EOF
 #!/usr/bin/env bash
 echo called >> "$MOCK/wget_calls"
-rel="\$(pwd -P)"; rel="\${rel#$ROOT_P/}"
+rel="\$(pwd -P)"; rel="\${rel#$ROOT_P/}"; rel="\${rel#downloads/}"
 [ -d "$SERVER/\$rel" ] || exit 0
 log=""; prev=""; for a in "\$@"; do case "\$prev" in -a|-o) log="\$a";; esac; prev="\$a"; done
 ( cd "$SERVER/\$rel" && find . -type f ) | while IFS= read -r f; do
@@ -97,14 +110,55 @@ if [ -e "$MOCK/.interrupted" ]; then rm -f "$MOCK/.interrupted"; exit 4; fi
 exit "\$(cat "$MOCK/wget_exit" 2>/dev/null || echo 0)"
 EOF
 # curl: records notifications; returns an empty listing for --dry-run.
+ARTSRC="$T/artsrc"; mkdir -p "$ARTSRC"
+# Mock artwork source using the real published names. Each "archive" is a
+# text file: line 1 = internal layout (A = one wrapping folder, B = category
+# folders at the top, BAD = unexpected, CORRUPT = fails its check), line 2 =
+# the archive name.
+art_archive() { printf '%s\n%s\n' "$2" "$1" > "$ARTSRC/$1"; }
+for sec in Covers Screens Titles; do
+    art_archive "IGame_${sec}_AGA_Laced.lha" A
+    art_archive "IGame_${sec}_AGA_LoRes.lha" B
+    art_archive "IGame_${sec}_ECS_Laced.lha" A
+    art_archive "IGame_${sec}_ECS_LoRes.lha" B
+    art_archive "IGame_${sec}_RTG.lha" A
+done
+art_archive TinyLauncher.lha B
+echo "notes" > "$ARTSRC/README.txt"
+echo "A" > "$ARTSRC/unrelated.lha"
+echo "zip" > "$ARTSRC/ignored.zip"
 cat > "$MOCK/curl" << EOF
 #!/usr/bin/env bash
 for a in "\$@"; do [ "\$a" = "-d" ] && { echo "notify \$*" >> "$MOCK/notifications"; exit 0; }; done
-exit 0
+url=""; out=""; prev=""
+for a in "\$@"; do
+    case "\$prev" in -o) out="\$a" ;; esac
+    case "\$a" in http*|ftp*) url="\$a" ;; esac
+    prev="\$a"
+done
+[ -n "\$url" ] || exit 0
+name="\${url##*/}"
+if [ -z "\$name" ]; then
+    echo "<html><body><pre>"
+    for f in "$ARTSRC"/*; do
+        b="\${f##*/}"
+        printf '<a href="%s">%s</a>  2026-09-21 18:42  %s\n' "\$b" "\$b" "\$(wc -c < "\$f" | tr -d ' ')"
+    done
+    echo "</pre></body></html>"
+    exit 0
+fi
+[ -f "$ARTSRC/\$name" ] || exit 22
+echo "download \$name" >> "$MOCK/art_downloads"
+if [ -n "\$out" ]; then cp "$ARTSRC/\$name" "\$out"; else cat "$ARTSRC/\$name"; fi
 EOF
 cat > "$MOCK/crontab" << EOF
 #!/usr/bin/env bash
-case "\$1" in -l) cat "$T/crontab.txt" 2>/dev/null ;; -) cat > "$T/crontab.txt" ;; esac
+# (read stdin fully before writing: the real crontab does too, and writing
+# straight to the file would truncate it while the other side still reads)
+case "\$1" in
+  -l) cat "$T/crontab.txt" 2>/dev/null ;;
+  -)  tmp="\$(mktemp)"; cat > "\$tmp"; mv "\$tmp" "$T/crontab.txt" ;;
+esac
 EOF
 printf '#!/bin/sh\n[ "$1" = "-a" ] && printf "C.UTF-8\\nC.utf8\\nen_US.ISO-8859-1\\nen_US.iso88591\\n"\nexit 0\n' > "$MOCK/locale"
 printf '#!/bin/sh\n[ "$1" = "-V" ] && echo "detox 3.0.1"\nexit 0\n' > "$MOCK/detox"
@@ -122,12 +176,12 @@ echo "Testing with bash $BASH_VERSION ($BASH)"
 # -------------------------------------------------------------- fixtures ---
 server_add() { setup mkdir -p "$SERVER/$(dirname "$1")"; echo "archive $1" > "$SERVER/$1" || setup false "write $1"; }
 art() {   # art <SET> <Section> <Game>
-    mkdir -p "$ROOT/iGame_$1/$2/Games/${3:0:1}/$3"
-    echo "$1-$3" > "$ROOT/iGame_$1/$2/Games/${3:0:1}/$3/iGame.iff"
-    echo "$1-$3-data" > "$ROOT/iGame_$1/$2/Games/${3:0:1}/$3/iGame.data"
+    mkdir -p "$ROOT/artwork/iGame_$1/$2/Games/${3:0:1}/$3"
+    echo "$1-$3" > "$ROOT/artwork/iGame_$1/$2/Games/${3:0:1}/$3/iGame.iff"
+    echo "$1-$3-data" > "$ROOT/artwork/iGame_$1/$2/Games/${3:0:1}/$3/iGame.data"
 }
 for s in AGA ECS RTG; do for g in Alpha Gamma_De Rise Rise_AGA Zool_AGA Beta; do art "$s" Covers "$g"; done; done
-mkdir -p "$ROOT/iGame_art"
+mkdir -p "$ROOT/artwork/iGame_art"
 cat > "$ROOT/retroplay.conf" << 'EOF'
 NTFY_TOPIC=retroplay-test
 KEEP_NEW_BATCHES=3
@@ -142,8 +196,8 @@ run() {   # run <logname> <command...>  (from ROOT; output to log; returns exit 
     return "$st"
 }
 calls_for() { grep -c "^$1\$" "$MOCK/extract_calls" 2>/dev/null || true; }
-art_in() { cat "$ROOT/$1"/iGame.iff "$ROOT/$1"/igame1.iff 2>/dev/null | head -1; }
-game() { find "$ROOT/$1" -type d -name "$2" 2>/dev/null | head -1; }
+art_in() { cat "$ROOT/build/$1"/iGame.iff "$ROOT/$1"/igame1.iff 2>/dev/null | head -1; }
+game() { find "$ROOT/build/$1" -type d -name "$2" 2>/dev/null | head -1; }
 
 # ================================================================= tests ===
 section "lib.sh: version-aware archive matching (the pruning rules)"
@@ -176,7 +230,7 @@ check "each variant got its own artwork" \
   '[ "$(art_in retro_aga/WHDLoad/Games/A/Alpha)" = AGA-Alpha ] && [ "$(art_in retro_ecs/WHDLoad/Games/A/Alpha)" = ECS-Alpha ] && [ "$(art_in retro_rtg/WHDLoad/Games/A/Alpha)" = RTG-Alpha ]'
 g="$(game retro_aga Gamma_De)"
 check "German release sorted into Languages/ BEFORE merge, and still got artwork" \
-  'case "$g" in */Languages/German/*) [ "$(art_in "${g#$ROOT/}")" = AGA-Gamma_De ];; *) false;; esac'
+  'case "$g" in */Languages/German/*) [ "$(art_in "${g#$ROOT/build/}")" = AGA-Gamma_De ];; *) false;; esac'
 check "all three builds marked complete" '[ -f "$ROOT/.retroplay/complete/retro_aga" ] && [ -f "$ROOT/.retroplay/complete/retro_ecs" ] && [ -f "$ROOT/.retroplay/complete/retro_rtg" ]'
 check "a run report was written" '[ -n "$(ls "$ROOT"/reports/*.txt 2>/dev/null)" ]'
 
@@ -187,13 +241,13 @@ server_add HD_Loaders/Games/H/Hdgame_v1.0.lha
 run update ./all.sh; st=$?
 check "all.sh exits 0" '[ "$st" -eq 0 ]'
 check "superseded Alpha_v1.0 quarantined in old/, not deleted" \
-  '[ -n "$(find "$ROOT/old" -name Alpha_v1.0.lha)" ] && [ ! -e "$ROOT/WHDLoad/Games/A/Alpha_v1.0.lha" ]'
+  '[ -n "$(find "$ROOT/downloads/old" -name Alpha_v1.0.lha)" ] && [ ! -e "$ROOT/downloads/WHDLoad/Games/A/Alpha_v1.0.lha" ]'
 check "new batch extracted once for all variants (2 archives, 2 extractions)" '[ "$(grep -c . "$MOCK/extract_calls")" -eq 2 ]'
 check "old version's files replaced, not left behind" \
-  '[ -f "$ROOT/retro_aga/WHDLoad/Games/A/Alpha/v1.1.txt" ] && [ ! -e "$ROOT/retro_aga/WHDLoad/Games/A/Alpha/v1.0.txt" ]'
+  '[ -f "$ROOT/build/retro_aga/WHDLoad/Games/A/Alpha/v1.1.txt" ] && [ ! -e "$ROOT/build/retro_aga/WHDLoad/Games/A/Alpha/v1.0.txt" ]'
 check "updated game still has its artwork" '[ "$(art_in retro_ecs/WHDLoad/Games/A/Alpha)" = ECS-Alpha ]'
 check "HD_Loaders-only content handled (no 'No WHDLoad directory' failure)" '[ -n "$(game retro_rtg Hdgame)" ]'
-check "dated batch folder kept in new_aga/" '[ "$(find "$ROOT/new_aga" -mindepth 1 -maxdepth 1 -type d | grep -c .)" -eq 1 ]'
+check "dated batch folder kept in new_aga/" '[ "$(find "$ROOT/build/new_aga" -mindepth 1 -maxdepth 1 -type d | grep -c .)" -eq 1 ]'
 check "queues emptied after success" '[ -z "$(ls "$ROOT/.retroplay/queue/" 2>/dev/null)" ]'
 
 section "3. AGA-only update is left out of ECS"
@@ -222,24 +276,24 @@ check "next run (nothing new on the server) still processes it" '[ "$st" -eq 0 ]
 check "and then clears the queue" '[ ! -e "$ROOT/.retroplay/queue/retro_aga.list" ]'
 
 section "6. An interrupted full build is redone, not mistaken for finished"
-echo "$ROOT/retro_rtg" > "$ROOT/.retroplay/building/retro_rtg"
-rm -rf "$ROOT/retro_rtg/WHDLoad/Games/B"
+echo "$ROOT/build/retro_rtg" > "$ROOT/.retroplay/building/retro_rtg"
+rm -rf "$ROOT/build/retro_rtg/WHDLoad/Games/B"
 run resume ./all.sh --skip-update; st=$?
 check "rtg rebuilt in full (exit 0)" '[ "$st" -eq 0 ] && [ -n "$(game retro_rtg Beta)" ]'
 check "marked complete again" '[ ! -e "$ROOT/.retroplay/building/retro_rtg" ] && [ -f "$ROOT/.retroplay/complete/retro_rtg" ]'
 
 section "7. --rebuild (via ecs.sh) skips the update and rebuilds only ECS"
 : > "$MOCK/wget_calls"
-touch "$ROOT/retro_ecs/SENTINEL" "$ROOT/retro_aga/SENTINEL"
+touch "$ROOT/build/retro_ecs/SENTINEL" "$ROOT/build/retro_aga/SENTINEL"
 run rebuild ./ecs.sh --rebuild; st=$?
 check "exit 0" '[ "$st" -eq 0 ]'
 check "update skipped (wget never called)" '[ ! -s "$MOCK/wget_calls" ]'
-check "retro_ecs rebuilt from scratch" '[ ! -e "$ROOT/retro_ecs/SENTINEL" ] && [ -n "$(game retro_ecs Alpha)" ]'
+check "retro_ecs rebuilt from scratch" '[ ! -e "$ROOT/build/retro_ecs/SENTINEL" ] && [ -n "$(game retro_ecs Alpha)" ]'
 check "retro_ecs still without AGA/CD32" '[ -z "$(game retro_ecs Zool_AGA)" ] && [ -z "$(game retro_ecs Rise_AGA_HD)" ]'
-check "retro_aga untouched" '[ -e "$ROOT/retro_aga/SENTINEL" ]'
+check "retro_aga untouched" '[ -e "$ROOT/build/retro_aga/SENTINEL" ]'
 : > "$MOCK/wget_calls"
 run rebuild_all ./all.sh --rebuild --variants aga; st=$?
-check "all.sh --rebuild works too, without updating" '[ "$st" -eq 0 ] && [ ! -s "$MOCK/wget_calls" ] && [ ! -e "$ROOT/retro_aga/SENTINEL" ]'
+check "all.sh --rebuild works too, without updating" '[ "$st" -eq 0 ] && [ ! -s "$MOCK/wget_calls" ] && [ ! -e "$ROOT/build/retro_aga/SENTINEL" ]'
 : > "$MOCK/wget_calls"
 ( cd "$ROOT" && printf '7\n' | ./start.sh --rtg ) > "$T/menu7.log" 2>&1; st=$?
 check "start.sh menu option 7 = rebuild without update" '[ "$st" -eq 0 ] && [ ! -s "$MOCK/wget_calls" ]'
@@ -294,20 +348,20 @@ for d in /usr/bin /bin; do
 done
 cp "$MOCK/locale" "$SYSBIN/locale"
 cronrun() {
-    rm -f "$ROOT/all_cron.log"
+    rm -f "$ROOT/logs/all_cron.log"
     ( cd "$ROOT" && env -i HOME="$T/home" TMPDIR="$TMPDIR" PATH="$SYSBIN" \
         bash ./all.sh --cron --skip-update --force --variants aga ) < /dev/null > /dev/null 2>&1
 }
 rm -f "$ROOT/.retroplay/user_path"
 cronrun; st=$?
 check "control: with nothing remembered, cron can't find the tools (exit 1)" \
-  '[ "$st" -eq 1 ] && grep -q "Still missing" "$ROOT/all_cron.log"'
-check "...and the log explains why and how to fix it" 'grep -q "unattended run" "$ROOT/all_cron.log"'
+  '[ "$st" -eq 1 ] && grep -q "Still missing" "$ROOT/logs/all_cron.log"'
+check "...and the log explains why and how to fix it" 'grep -q "unattended run" "$ROOT/logs/all_cron.log"'
 run installcron ./install_cron.sh; st=$?
 check "install_cron.sh installs the --cron entry and remembers this PATH" \
   '[ "$st" -eq 0 ] && grep -q -- "all.sh --cron" "$T/crontab.txt" && [ -s "$ROOT/.retroplay/user_path" ]'
 cronrun; st=$?
-check "the cron run now finds every tool and succeeds" '[ "$st" -eq 0 ] && ! grep -q "Still missing" "$ROOT/all_cron.log"'
+check "the cron run now finds every tool and succeeds" '[ "$st" -eq 0 ] && ! grep -q "Still missing" "$ROOT/logs/all_cron.log"'
 
 section "13. Temporary folders are always cleaned up"
 check "no extract_tmp.* left behind by any run above" '[ -z "$(find "$ROOT" -name "extract_tmp.*")" ]'
@@ -315,22 +369,22 @@ check "no sort.sh or quick.sh temp folders left" \
   '[ -z "$(find "$TMPDIR" -name "sort_compliance.*")" ] && [ ! -e "$ROOT/.temp_new_archives" ]'
 check "no engine work/staging folders left" '[ ! -e "$ROOT/.retroplay_work" ] && [ ! -e "$ROOT/.retroplay/stage" ]'
 echo SlowGame > "$MOCK/slow_pattern"
-mkdir -p "$ROOT/WHDLoad/Games/S"; echo x > "$ROOT/WHDLoad/Games/S/SlowGame_v1.0.lha"
-( cd "$ROOT" && exec bash ./extract.sh -u -d "$T/intr_out" ) < /dev/null > "$T/intr.log" 2>&1 &
+mkdir -p "$ROOT/downloads/WHDLoad/Games/S"; mkdir -p "$ROOT/downloads/WHDLoad/Games/S"; echo x > "$ROOT/downloads/WHDLoad/Games/S/SlowGame_v1.0.lha"
+( cd "$ROOT/downloads" && exec bash "$ROOT/extract.sh" -u -d "$T/intr_out" ) < /dev/null > "$T/intr.log" 2>&1 &
 xp=$!
 sleep 3
 kill -TERM "$xp" 2>/dev/null; wait "$xp" 2>/dev/null
 check "extract.sh stopped mid-extraction still removes its temp folder" \
-  '[ -z "$(find "$ROOT" -maxdepth 1 -name "extract_tmp.*")" ]'
-rm -f "$MOCK/slow_pattern" "$ROOT/WHDLoad/Games/S/SlowGame_v1.0.lha"
+  '[ -z "$(find "$ROOT/downloads" -maxdepth 1 -name "extract_tmp.*")" ]'
+rm -f "$MOCK/slow_pattern" "$ROOT/downloads/WHDLoad/Games/S/SlowGame_v1.0.lha"
 sh -c 'exit 0' & deadpid=$!; wait "$deadpid"
-mkdir -p "$ROOT/extract_tmp.dead" "$ROOT/extract_tmp.legacy" "$ROOT/extract_tmp.live"
-echo "$deadpid" > "$ROOT/extract_tmp.dead/.owner_pid"; echo "$$" > "$ROOT/extract_tmp.live/.owner_pid"
-run sweep bash ./extract.sh -u -d "$T/sweep_out"
+mkdir -p "$ROOT/downloads/extract_tmp.dead" "$ROOT/downloads/extract_tmp.legacy" "$ROOT/downloads/extract_tmp.live"
+echo "$deadpid" > "$ROOT/downloads/extract_tmp.dead/.owner_pid"; echo "$$" > "$ROOT/downloads/extract_tmp.live/.owner_pid"
+run sweep sh -c "cd downloads && bash ../extract.sh -u -d \"$T/sweep_out\""
 check "leftovers from killed runs are swept up on the next run" \
-  '[ ! -e "$ROOT/extract_tmp.dead" ] && [ ! -e "$ROOT/extract_tmp.legacy" ]'
-check "a temp folder whose run is still going is left alone" '[ -d "$ROOT/extract_tmp.live" ]'
-rm -rf "$ROOT/extract_tmp.live"
+  '[ ! -e "$ROOT/downloads/extract_tmp.dead" ] && [ ! -e "$ROOT/downloads/extract_tmp.legacy" ]'
+check "a temp folder whose run is still going is left alone" '[ -d "$ROOT/downloads/extract_tmp.live" ]'
+rm -rf "$ROOT/downloads/extract_tmp.live"
 
 
 section "14. Folder layout stays retro_x/WHDLoad/... when paths are spelled differently"
@@ -344,12 +398,12 @@ layout_ok() {   # only WHDLoad / HD_Loaders / JST at the top of $1
 }
 ( cd "$T/linkedroot" && ./all.sh --rebuild --variants aga ) < /dev/null > "$T/linked_full.log" 2>&1; st=$?
 check "full build via a differently-spelled path succeeds" '[ "$st" -eq 0 ]'
-check "retro_aga holds only WHDLoad/HD_Loaders/JST at the top" 'layout_ok "$ROOT/retro_aga"'
+check "retro_aga holds only WHDLoad/HD_Loaders/JST at the top" 'layout_ok "$ROOT/build/retro_aga"'
 check "games are in retro_aga/WHDLoad/..., not under a copied absolute path" \
-  '[ -d "$ROOT/retro_aga/WHDLoad/Games/A/Alpha" ] && ! (cd "$ROOT/retro_aga" && find . | grep -qF "${T#/}")'
+  '[ -d "$ROOT/build/retro_aga/WHDLoad/Games/A/Alpha" ] && ! (cd "$ROOT/build/retro_aga" && find . | grep -qF "${T#/}")'
 server_add WHDLoad/Games/E/Epsilon_v1.0.lha
 ( cd "$T/linkedroot" && ./all.sh --variants aga ) < /dev/null > "$T/linked_inc.log" 2>&1; st=$?
-latest="$(ls -1d "$ROOT"/new_aga/*/ 2>/dev/null | sort | tail -1)"
+latest="$(ls -1d "$ROOT"/build/new_aga/*/ 2>/dev/null | sort | tail -1)"
 check "update via that path: new_aga batch has the right layout too" \
   '[ "$st" -eq 0 ] && layout_ok "${latest%/}" && [ -d "${latest}WHDLoad/Games/E/Epsilon" ]'
 mkdir -p "$T/ext/WHDLoad/Games/A" "$T/proj2"; echo x > "$T/ext/WHDLoad/Games/A/Alpha_v1.0.lha"
@@ -357,23 +411,23 @@ cp "$ROOT/extract.sh" "$ROOT/lib.sh" "$T/proj2/"; ln -s "$T/ext/WHDLoad" "$T/pro
 ( cd "$T/proj2" && bash ./extract.sh -u -d "$T/ext_out" ) < /dev/null > "$T/ext.log" 2>&1
 check "WHDLoad symlinked to another drive extracts into dest/WHDLoad/..." \
   'layout_ok "$T/ext_out" && [ -d "$T/ext_out/WHDLoad/Games/A/Alpha" ]'
-mkdir -p "$ROOT/retro_ecs/Users/someone"
+mkdir -p "$ROOT/build/retro_ecs/Users/someone"
 run doctor_layout ./doctor.sh; st=$?
 check "doctor.sh spots a folder in the wrong place and explains the fix" \
   '[ "$st" -eq 1 ] && grep -q "retro_ecs/Users" "$T/doctor_layout.log" && grep -q "just run ./all.sh" "$T/doctor_layout.log"'
-rm -rf "$ROOT/retro_ecs/Users"
+rm -rf "$ROOT/build/retro_ecs/Users"
 
 
 section "15. iGame_art and other packs match a game folder anywhere inside them"
 M="$T/anyart"; mkdir -p "$M"; cp "$ROOT/merge.sh" "$ROOT/lib.sh" "$M/"
-mkart() { mkdir -p "$M/$1"; echo "$2" > "$M/$1/iGame.iff"; }
+mkart() { mkdir -p "$M/artwork/$1"; echo "$2" > "$M/artwork/$1/iGame.iff"; }
 mkart "iGame_art/Misc/Some/Deep/Omega" "art-Omega"                 # no section in its path
 mkart "iGame_art/Odd/Titles/X/Lambda" "art-Lambda-title"           # section revealed by the path
 mkart "iGame_art/Covers/Games/M/Mu" "art-Mu-standard"              # standard location...
 mkart "iGame_art/Misc/Mu" "art-Mu-stray"                           # ...beats a stray duplicate
 mkart "iGame_AGA/Extras/Zeta" "aga-Zeta-nonstandard"               # AGA must NOT be searched this way
 mkart "iGame_CD32/foo/bar/Kappa" "cd32-Kappa"                      # custom pack, any depth
-mkdir -p "$M/iGame_AGA/Covers/Games/A/Anchor"; echo "aga-Anchor" > "$M/iGame_AGA/Covers/Games/A/Anchor/iGame.iff"
+mkdir -p "$M/artwork/iGame_AGA/Covers/Games/A/Anchor"; echo "aga-Anchor" > "$M/artwork/iGame_AGA/Covers/Games/A/Anchor/iGame.iff"
 for g in Omega Lambda Mu Zeta Kappa Anchor; do
     mkdir -p "$M/retro/WHDLoad/Games/${g:0:1}/$g"; touch "$M/retro/WHDLoad/Games/${g:0:1}/$g.info"; done
 ( cd "$M" && bash merge.sh --aga --art Covers,Screens,Titles -d retro ) > "$T/anyart.log" 2>&1
@@ -392,17 +446,17 @@ check "STRUCTURED_ART_SETS in retroplay.conf can switch this off per pack" \
 
 
 section "16. Leftover Users/... folders are healed automatically"
-mkdir -p "$ROOT/retro_aga/Users/Dwight/Downloads/Amiga/WHDLoad/Games/A/Alpha"
-mkdir -p "$ROOT/new_aga/2026-01-01_000000/Users/Dwight/Downloads/Amiga/WHDLoad"
+mkdir -p "$ROOT/build/retro_aga/Users/Dwight/Downloads/Amiga/WHDLoad/Games/A/Alpha"
+mkdir -p "$ROOT/build/new_aga/2026-01-01_000000/Users/Dwight/Downloads/Amiga/WHDLoad"
 run heal_dry ./all.sh --skip-update --variants aga --dry-run; st=$?
 check "dry run explains it will rebuild, and which batch it would remove" \
-  'grep -q "wrong place (Users)" "$T/heal_dry.log" && grep -q "Would remove new_aga/2026-01-01_000000" "$T/heal_dry.log"'
+  'grep -q "wrong place (Users)" "$T/heal_dry.log" && grep -q "Would remove build/new_aga/2026-01-01_000000" "$T/heal_dry.log"'
 run heal ./all.sh --skip-update --variants aga; st=$?
 check "the run rebuilds retro_aga (exit 0)" '[ "$st" -eq 0 ]'
-check "retro_aga now holds only WHDLoad/HD_Loaders/JST" '[ -z "$(rp_layout_problems "$ROOT/retro_aga")" ]'
+check "retro_aga now holds only WHDLoad/HD_Loaders/JST" '[ -z "$(rp_layout_problems "$ROOT/build/retro_aga")" ]'
 check "games are back in place WITH artwork and sorted" \
   '[ "$(art_in retro_aga/WHDLoad/Games/A/Alpha)" = AGA-Alpha ] && [ -n "$(game retro_aga/WHDLoad/AGA Zool_AGA)" ]'
-check "the broken new_aga batch was removed" '[ ! -e "$ROOT/new_aga/2026-01-01_000000" ]'
+check "the broken new_aga batch was removed" '[ ! -e "$ROOT/build/new_aga/2026-01-01_000000" ]'
 
 section "17. A mix of old and new scripts is refused"
 cp "$ROOT/extract.sh" "$T/extract.sh.good"
@@ -435,7 +489,7 @@ check "the corrupt one stays queued, the good one doesn't" \
 run partial2 ./all.sh --variants aga --skip-update
 run partial3 ./all.sh --variants aga --skip-update; st=$?
 check "after 3 failed attempts it's moved to old/corrupt-<date>/ and dropped from the queue" \
-  '[ "$st" -eq 5 ] && [ -n "$(find "$ROOT/old" -path "*corrupt-*" -name BadGame_v1.0.lha)" ] && ! grep -qs BadGame "$ROOT/.retroplay/queue/retro_aga.list"'
+  '[ "$st" -eq 5 ] && [ -n "$(find "$ROOT/downloads/old" -path "*corrupt-*" -name BadGame_v1.0.lha)" ] && ! grep -qs BadGame "$ROOT/.retroplay/queue/retro_aga.list"'
 check "the report says what happened" 'grep -q "GAVE UP on WHDLoad/Games/B/BadGame_v1.0.lha" "$T/partial3.log"'
 rm -f "$MOCK/fail_pattern"
 run partial4 ./all.sh --variants aga; st=$?
@@ -445,7 +499,7 @@ section "20. Re-published and partially downloaded files"
 echo "republished content" > "$SERVER/WHDLoad/Games/G/GoodGame_v1.0.lha"
 run republish ./all.sh --variants aga; st=$?
 check "a file re-published under the same name is downloaded AND processed" \
-  '[ "$st" -eq 0 ] && grep -q "GoodGame_v1.0.lha" "$ROOT/update.log" && [ -n "$(find "$ROOT/new_aga" -type d -name GoodGame)" ]'
+  '[ "$st" -eq 0 ] && grep -q "GoodGame_v1.0.lha" "$ROOT/logs/update.log" && [ -n "$(find "$ROOT/build/new_aga" -type d -name GoodGame)" ]'
 echo PartGame > "$MOCK/partial_pattern"
 server_add WHDLoad/Games/P/PartGame_v1.0.lha
 run partdl ./all.sh --variants aga; st=$?
@@ -457,7 +511,7 @@ check "next run re-downloads it in full and installs it" '[ "$st" -eq 0 ] && [ -
 
 section "21. A refused second run says who holds the lock"
 if [ -n "$FLOCK" ]; then
-    echo SlowGame > "$MOCK/slow_pattern"; echo x > "$ROOT/WHDLoad/Games/S/SlowGame_v1.0.lha"
+    echo SlowGame > "$MOCK/slow_pattern"; mkdir -p "$ROOT/downloads/WHDLoad/Games/S"; echo x > "$ROOT/downloads/WHDLoad/Games/S/SlowGame_v1.0.lha"
     ( cd "$ROOT" && ./all.sh --rebuild --variants aga ) < /dev/null > "$T/holder.log" 2>&1 & hp=$!
     sleep 3
     run locked2 ./all.sh --skip-update; st=$?
@@ -465,7 +519,7 @@ if [ -n "$FLOCK" ]; then
     check "second run refused (exit 4) and names the holder's PID and command" \
       '[ "$st" -eq 4 ] && grep -q "Held by: pid=$hp" "$T/locked2.log" && grep -q "command=all.sh --rebuild --variants aga" "$T/locked2.log"'
     check "the lock record is removed when the holder finishes" '[ ! -e "$ROOT/.all.lock.info" ]'
-    rm -f "$MOCK/slow_pattern" "$ROOT/WHDLoad/Games/S/SlowGame_v1.0.lha"
+    rm -f "$MOCK/slow_pattern" "$ROOT/downloads/WHDLoad/Games/S/SlowGame_v1.0.lha"
 else
     echo "  (skipped: flock not installed)"
 fi
@@ -475,7 +529,7 @@ section "22. Output drive not mounted: refuse instead of rebuilding onto the SD 
 USB="$T/usb"; setup mkdir -p "$USB"
 cp "$ROOT/retroplay.conf" "$T/conf.bak"; echo "OUTPUT_ROOT=\"$USB\"" >> "$ROOT/retroplay.conf"
 run usb1 ./all.sh --skip-update --variants aga; st=$?
-check "first use: builds on the drive and marks it" '[ "$st" -eq 0 ] && [ -s "$USB/.retroplay_output" ] && [ -d "$USB/retro_aga/WHDLoad" ]'
+check "first use: builds on the drive and marks it" '[ "$st" -eq 0 ] && [ -s "$USB/.retroplay_output" ] && [ -d "$USB/build/retro_aga/WHDLoad" ]'
 mv "$USB" "$T/usb_unplugged"; mkdir -p "$USB"          # empty mount point = drive not mounted
 run usb2 ./all.sh --skip-update --variants aga; st=$?
 check "drive 'unplugged': refused (exit 4) and nothing written to the empty mount point" \
@@ -503,10 +557,10 @@ section "24. Artwork gap-fill runs only when artwork changed (or weekly)"
 run gap0 ./all.sh --skip-update --variants ecs; st=$?
 check "nothing changed: nothing to do (exit 2)" '[ "$st" -eq 2 ]'
 sleep 1
-setup mkdir -p "$ROOT/iGame_ECS/Covers/Games/Q/QueuedGame"; echo ECS-Queued > "$ROOT/iGame_ECS/Covers/Games/Q/QueuedGame/iGame.iff"
+setup mkdir -p "$ROOT/artwork/iGame_ECS/Covers/Games/E/Epsilon"; echo ECS-Epsilon > "$ROOT/artwork/iGame_ECS/Covers/Games/E/Epsilon/iGame.iff"
 run gap1 ./all.sh --skip-update --variants ecs; st=$?
 check "an artwork pack changed: gap-fill runs by itself and adds the new artwork" \
-  '[ "$st" -eq 0 ] && grep -q "artwork packs changed" "$T/gap1.log" && [ "$(art_in retro_ecs/WHDLoad/Games/Q/QueuedGame)" = ECS-Queued ]'
+  '[ "$st" -eq 0 ] && grep -q "artwork packs changed" "$T/gap1.log" && [ "$(art_in retro_ecs/WHDLoad/Games/E/Epsilon)" = ECS-Epsilon ]'
 run gap2 ./all.sh --skip-update --variants ecs; st=$?
 check "...and not again until something changes (exit 2)" '[ "$st" -eq 2 ]'
 
@@ -514,14 +568,14 @@ section "25. Corrupt downloads are fetched again in the same run"
 echo VerifyGame > "$MOCK/corrupt_once"; server_add WHDLoad/Games/V/VerifyGame_v1.0.lha
 run verify ./all.sh --variants aga; st=$?
 check "detected, re-downloaded and installed in one run" \
-  '[ "$st" -eq 0 ] && grep -q "CORRUPT download, fetching it again: WHDLoad/Games/V/VerifyGame_v1.0.lha" "$ROOT/update.log" && grep -q "re-downloaded OK" "$ROOT/update.log" && [ -n "$(game retro_aga VerifyGame)" ]'
+  '[ "$st" -eq 0 ] && grep -q "CORRUPT download, fetching it again: WHDLoad/Games/V/VerifyGame_v1.0.lha" "$ROOT/logs/update.log" && grep -q "re-downloaded OK" "$ROOT/logs/update.log" && [ -n "$(game retro_aga VerifyGame)" ]'
 rm -f "$MOCK/corrupt_once"
 
 section "26. An unreadable wget log is reported, not silently ignored"
 touch "$MOCK/nolog"; server_add WHDLoad/Games/N/NoLogGame_v1.0.lha
 run nolog ./all.sh --variants aga; st=$?
 check "warning logged, and the new file is still processed" \
-  '[ "$st" -eq 0 ] && grep -q "download log" "$ROOT/update.log" && [ -n "$(game retro_aga NoLogGame)" ]'
+  '[ "$st" -eq 0 ] && grep -q "download log" "$ROOT/logs/update.log" && [ -n "$(game retro_aga NoLogGame)" ]'
 rm -f "$MOCK/nolog"
 
 section "27. Status view and test notification"
@@ -581,6 +635,194 @@ check "retroplay.conf created with the default variants" 'grep -qx "VARIANTS=\"a
 calls_before="$(wc -l < "$SM/apt_calls")"
 setup_run setup2
 check "running it again changes nothing (no new installs)" '[ "$(wc -l < "$SM/apt_calls")" -eq "$calls_before" ] && grep -q "retroplay.conf already exists" "$T/setup2.log"'
+
+
+section "29. Artwork: the published archives, mapped into the right folders"
+acfg() { grep -v "^$1=" "$ROOT/retroplay.conf" > "$ROOT/.c.tmp"; printf '%s=%s\n' "$1" "$2" >> "$ROOT/.c.tmp"; mv "$ROOT/.c.tmp" "$ROOT/retroplay.conf"; }
+acfg ARTWORK_SOURCE_URL '"http://mock/WHDLoad_Images"'
+acfg ARTWORK_LOCAL_CHANGE_POLICY '"keep-local"'
+rm -rf "$ROOT/artwork/iGame_AGA" "$ROOT/artwork/iGame_ECS" "$ROOT/artwork/iGame_RTG" "$ROOT/artwork/TinyLauncher"
+: > "$MOCK/art_downloads"
+run artplan ./artwork_sync.sh --plan --all-artwork; st=$?
+check "plan lists only the published IGame_*/TinyLauncher archives" \
+  '[ "$st" -eq 0 ] && grep -q "IGame_Covers_AGA_Laced.lha" "$T/artplan.log" && grep -q "TinyLauncher.lha" "$T/artplan.log" && ! grep -q "unrelated.lha" "$T/artplan.log" && ! grep -q "ignored.zip" "$T/artplan.log"'
+check "plan changes nothing and downloads nothing" '[ ! -e "$ROOT/artwork/iGame_AGA" ] && ! grep -q "download IGame" "$MOCK/art_downloads"'
+run artaga ./artwork_sync.sh --sync --for aga --yes; st=$?
+check "--for aga fetches only the three AGA LoRes archives" \
+  '[ "$st" -eq 0 ] && [ "$(grep -c "download IGame_.*_AGA_LoRes" "$MOCK/art_downloads")" -eq 3 ] && ! grep -q "AGA_Laced" "$MOCK/art_downloads" && ! grep -q "_RTG" "$MOCK/art_downloads"'
+check "...installed as artwork/iGame_AGA/lores/<Section>/<category>/..." \
+  '[ -f "$ROOT/artwork/iGame_AGA/lores/Covers/Games/A/iGame.iff" ] && [ -f "$ROOT/artwork/iGame_AGA/lores/Screens/Games/A/iGame.iff" ] && [ -f "$ROOT/artwork/iGame_AGA/lores/Titles/Games/A/iGame.iff" ]'
+run artlaced ./artwork_sync.sh --sync --for aga-laced --for rtg --yes; st=$?
+check "laced and RTG go to their own folders" \
+  '[ "$st" -eq 0 ] && [ -f "$ROOT/artwork/iGame_AGA/laced/Covers/Games/A/iGame.iff" ] && [ -f "$ROOT/artwork/iGame_RTG/Covers/Games/A/iGame.iff" ] && [ ! -e "$ROOT/artwork/iGame_RTG/lores" ]'
+check "archives are cached in downloads/artwork_archive, not in the artwork folders" \
+  '[ -f "$ROOT/downloads/artwork_archive/IGame_Covers_AGA_LoRes.lha" ] && [ -z "$(find "$ROOT/artwork" -name "*.lha" | head -1)" ]'
+: > "$MOCK/art_downloads"
+run artagain ./artwork_sync.sh --sync --for aga --yes; st=$?
+check "nothing new upstream: no downloads, exit 2" '[ "$st" -eq 2 ] && [ ! -s "$MOCK/art_downloads" ]'
+run artall ./artwork_sync.sh --sync --all-artwork --yes
+check "--all-artwork installs every flavour, including TinyLauncher" \
+  '[ -f "$ROOT/artwork/iGame_ECS/laced/Titles/Games/A/iGame.iff" ] && [ -f "$ROOT/artwork/iGame_ECS/lores/Covers/Games/A/iGame.iff" ] && [ -d "$ROOT/artwork/TinyLauncher" ]'
+
+section "30. Artwork: updates, refusals, local changes and rollback"
+printf 'A\nIGame_Covers_AGA_LoRes.lha\nnewer\n' > "$ARTSRC/IGame_Covers_AGA_LoRes.lha"
+run artupd ./artwork_sync.sh --sync --for aga --yes; st=$?
+check "a newer archive installs, keeping the old folder as a backup" \
+  '[ "$st" -eq 0 ] && [ -n "$(find "$ROOT/.retroplay/artwork/backups/iGame_AGA_lores_Covers" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)" ]'
+cp "$ROOT/artwork/iGame_ECS/lores/Covers/Games/A/iGame.iff" "$T/ecs_before.iff"
+cp "$ROOT/downloads/artwork_archive/IGame_Covers_ECS_LoRes.lha" "$T/ecs_cache_before.lha"
+printf 'CORRUPT\nIGame_Covers_ECS_LoRes.lha\nbroken\n' > "$ARTSRC/IGame_Covers_ECS_LoRes.lha"
+run artbad ./artwork_sync.sh --sync --for ecs --yes; st=$?
+check "a corrupt download is refused and the installed artwork is untouched" \
+  '[ "$st" -ne 0 ] && cmp -s "$T/ecs_before.iff" "$ROOT/artwork/iGame_ECS/lores/Covers/Games/A/iGame.iff"'
+check "...and the good cached archive is kept, not replaced by the corrupt one" \
+  'cmp -s "$T/ecs_cache_before.lha" "$ROOT/downloads/artwork_archive/IGame_Covers_ECS_LoRes.lha"'
+printf 'BAD\nIGame_Covers_ECS_LoRes.lha\nlayout\n' > "$ARTSRC/IGame_Covers_ECS_LoRes.lha"
+run artbadlayout ./artwork_sync.sh --sync --for ecs --yes; st=$?
+check "an unexpected layout is refused, not guessed at" \
+  '[ "$st" -ne 0 ] && cmp -s "$T/ecs_before.iff" "$ROOT/artwork/iGame_ECS/lores/Covers/Games/A/iGame.iff" && grep -q "unexpected layout" "$T/artbadlayout.log"'
+echo "my own note" > "$ROOT/artwork/iGame_RTG/Covers/MY_NOTES.txt"
+printf 'A\nIGame_Covers_RTG.lha\nnewer\n' > "$ARTSRC/IGame_Covers_RTG.lha"
+run artlocal ./artwork_sync.sh --sync --for rtg --yes
+check "a folder you changed yourself is left alone (keep-local)" \
+  '[ -f "$ROOT/artwork/iGame_RTG/Covers/MY_NOTES.txt" ] && grep -q "left alone" "$T/artlocal.log"'
+run artroll ./artwork_sync.sh --rollback iGame_AGA/lores/Covers --yes; st=$?
+check "rollback restores the previous version of one part" \
+  '[ "$st" -eq 0 ] && [ -f "$ROOT/artwork/iGame_AGA/lores/Covers/Games/A/iGame.iff" ]'
+run artverify ./artwork_sync.sh --verify --all-artwork
+check "verify reports and changes nothing" 'grep -q "Artwork check" "$T/artverify.log" && [ -f "$ROOT/artwork/iGame_RTG/Covers/Games/A/iGame.iff" ]'
+
+section "31. Scheduled run: artwork first, one lock, safe failure policies"
+acfg ARTWORK_SYNC '"auto"'
+printf 'B\nIGame_Covers_AGA_LoRes.lha\nfixed for the cron test\n' > "$ARTSRC/IGame_Covers_AGA_LoRes.lha"
+rm -f "$ROOT/.retroplay/artwork_last_check"; : > "$ROOT/logs/all_cron.log"
+run cronart ./all.sh --cron --skip-update --variants aga; st=$?
+check "the cron run completes - one lock, no deadlock" '[ "$st" -eq 0 ] || [ "$st" -eq 2 ]'
+check "artwork is checked before the collection pipeline" \
+  '[ "$(grep -n "\[Artwork\]" "$ROOT/logs/all_cron.log" | head -1 | cut -d: -f1)" -lt "$(grep -n "Plan" "$ROOT/logs/all_cron.log" | head -1 | cut -d: -f1)" ]'
+rm -f "$ROOT/.retroplay/artwork_last_check"
+printf 'CORRUPT\nIGame_Screens_AGA_LoRes.lha\nbroken\n' > "$ARTSRC/IGame_Screens_AGA_LoRes.lha"
+acfg ARTWORK_FAILURE_POLICY '"warn-and-continue"'
+run cronwarn ./all.sh --cron --skip-update --variants aga; st=$?
+check "artwork failure (warn-and-continue): the collection sync still runs" '[ "$st" -eq 0 ] || [ "$st" -eq 2 ]'
+check "...and the previous artwork is kept" '[ -f "$ROOT/artwork/iGame_AGA/lores/Screens/Games/A/iGame.iff" ]'
+rm -f "$ROOT/.retroplay/artwork_last_check"
+acfg ARTWORK_FAILURE_POLICY '"fail"'
+run cronfail ./all.sh --cron --skip-update --variants aga; st=$?
+check "artwork failure (fail): stops before touching the collection (exit 5)" \
+  '[ "$st" -eq 5 ] && grep -q "queues are untouched" "$ROOT/logs/all_cron.log"'
+acfg ARTWORK_SYNC '"no"'
+
+
+section "32. Tidy folder layout, log retention and the scripts/ folder"
+check "everything lives in artwork/, build/, downloads/, logs/ and reports/" \
+  '[ -d "$ROOT/artwork" ] && [ -d "$ROOT/build/retro_aga" ] && [ -d "$ROOT/downloads/WHDLoad" ] && [ -f "$ROOT/logs/update.log" ] && [ -n "$(ls "$ROOT/reports" 2>/dev/null)" ]'
+check "nothing is left loose beside the scripts" \
+  '[ ! -e "$ROOT/WHDLoad" ] && [ ! -e "$ROOT/retro_aga" ] && [ ! -e "$ROOT/update.log" ] && [ ! -e "$ROOT/iGame_AGA" ]'
+check "artwork archives are cached under downloads/artwork_archive" \
+  '[ -d "$ROOT/downloads/artwork_archive" ] && [ -z "$(find "$ROOT/artwork" -name "*.lha" | head -1)" ]'
+# migration from the old flat layout
+OLD="$T/oldlayout"; setup mkdir -p "$OLD"
+cp "$REPO"/*.sh "$REPO"/retroplay.conf.example "$OLD"/; chmod +x "$OLD"/*.sh
+setup mkdir -p "$OLD/iGame_AGA/Covers" "$OLD/TinyLauncher" "$OLD/WHDLoad/Games/A" "$OLD/retro_aga/WHDLoad" "$OLD/new_aga" "$OLD/artwork_archive"
+echo old > "$OLD/iGame_AGA/Covers/marker"; echo old > "$OLD/retro_aga/WHDLoad/marker"; : > "$OLD/update.log"
+( cd "$OLD" && ./all.sh --skip-update --variants aga ) < /dev/null > "$T/migrate.log" 2>&1
+check "an old flat folder is tidied up automatically, keeping the contents" \
+  '[ -f "$OLD/artwork/iGame_AGA/Covers/marker" ] && [ -f "$OLD/build/retro_aga/WHDLoad/marker" ] && [ -d "$OLD/downloads/WHDLoad/Games/A" ] && [ -d "$OLD/downloads/artwork_archive" ] && [ -f "$OLD/logs/update.log" ]'
+check "and it says so once" 'grep -q "Tidied the folder layout" "$T/migrate.log"'
+# log retention
+acfg LOG_RETENTION_DAYS 2
+: > "$ROOT/logs/ancient.log"; touch -t 202001010000 "$ROOT/logs/ancient.log"
+: > "$ROOT/logs/today.log"
+run logprune ./all.sh --skip-update --variants aga
+check "logs older than LOG_RETENTION_DAYS are deleted, recent ones kept" \
+  '[ ! -e "$ROOT/logs/ancient.log" ] && [ -f "$ROOT/logs/today.log" ]'
+acfg LOG_RETENTION_DAYS 0
+: > "$ROOT/logs/ancient2.log"; touch -t 202001010000 "$ROOT/logs/ancient2.log"
+run lognoprune ./all.sh --skip-update --variants aga
+check "LOG_RETENTION_DAYS=0 keeps logs for ever" '[ -f "$ROOT/logs/ancient2.log" ]'
+rm -f "$ROOT/logs/ancient2.log"; acfg LOG_RETENTION_DAYS 1
+# scripts/ subfolder
+SUB="$T/subfolder"; setup mkdir -p "$SUB/scripts"
+cp "$REPO"/*.sh "$REPO"/retroplay.conf.example "$SUB/scripts"/; chmod +x "$SUB/scripts"/*.sh
+setup mkdir -p "$SUB/downloads/WHDLoad/Games/A"
+( cd "$SUB" && ./scripts/all.sh --skip-update --variants aga ) < /dev/null > "$T/subfolder.log" 2>&1
+check "the scripts also work from a scripts/ subfolder, using the folder above" \
+  '[ -d "$SUB/artwork" ] && [ -d "$SUB/logs" ] && [ ! -d "$SUB/scripts/artwork" ] && [ ! -d "$SUB/scripts/logs" ]'
+
+
+section "33. Scheduling the nightly run"
+run sched_show ./install_cron.sh --show; st=$?
+check "--show reports the installed entry" '[ "$st" -eq 0 ] && grep -q "nightly run is installed" "$T/sched_show.log"'
+run sched_dry ./install_cron.sh --time 04:30 --dry-run; st=$?
+check "--dry-run prints the new entry and changes nothing" \
+  '[ "$st" -eq 0 ] && grep -q "30 4 \* \* \*" "$T/sched_dry.log" && ! grep -q "30 4 " "$T/crontab.txt"'
+run sched_time ./install_cron.sh --time 4:30; st=$?
+check "--time installs at that hour (single-digit hours accepted)" \
+  '[ "$st" -eq 0 ] && grep -q "^30 4 \* \* \*" "$T/crontab.txt" && [ "$(grep -c retroplay-all-sh "$T/crontab.txt")" -eq 1 ]'
+run sched_bad ./install_cron.sh --time 25:00; st=$?
+check "a silly time is refused (exit 4), leaving the entry alone" \
+  '[ "$st" -eq 4 ] && grep -q "^30 4 " "$T/crontab.txt"'
+echo "0 5 * * * echo someone elses job" >> "$T/crontab.txt"
+run sched_off ./install_cron.sh --disable --yes; st=$?
+check "--disable removes only our entry" \
+  '[ "$st" -eq 0 ] && ! grep -q retroplay-all-sh "$T/crontab.txt" && grep -q "someone elses job" "$T/crontab.txt"'
+run sched_off2 ./install_cron.sh --disable --yes; st=$?
+check "--disable again says there is nothing to remove (exit 2)" '[ "$st" -eq 2 ]'
+run sched_back ./install_cron.sh --yes
+check "installing again restores it at the default time" 'grep -q "^0 2 \* \* \*" "$T/crontab.txt"'
+
+
+section "34. Artwork: every flavour is fetched, and merge reads the real layout"
+# put the source back to a good state (earlier sections deliberately broke some)
+for sec in Covers Screens Titles; do
+    art_archive "IGame_${sec}_AGA_Laced.lha" A; art_archive "IGame_${sec}_AGA_LoRes.lha" B
+    art_archive "IGame_${sec}_ECS_Laced.lha" A; art_archive "IGame_${sec}_ECS_LoRes.lha" B
+    art_archive "IGame_${sec}_RTG.lha" A
+done
+art_archive TinyLauncher.lha B
+rm -rf "$ROOT/.retroplay/artwork/manifests"
+: > "$MOCK/art_downloads"
+rm -rf "$ROOT/artwork/iGame_AGA" "$ROOT/artwork/iGame_ECS" "$ROOT/artwork/iGame_RTG" "$ROOT/artwork/TinyLauncher"
+run artdefault ./artwork_sync.sh --sync --yes; st=$?
+check "with no --for, both flavours AND TinyLauncher are fetched" \
+  '[ "$st" -eq 0 ] && [ "$(grep "_Laced" "$MOCK/art_downloads" | sort -u | grep -c .)" -eq 6 ] && [ "$(grep "_LoRes" "$MOCK/art_downloads" | sort -u | grep -c .)" -eq 6 ] && grep -q "download TinyLauncher.lha" "$MOCK/art_downloads"'
+check "the Laced folders are created alongside lores" \
+  '[ -f "$ROOT/artwork/iGame_AGA/laced/Covers/Games/A/iGame.iff" ] && [ -f "$ROOT/artwork/iGame_ECS/laced/Titles/Games/A/iGame.iff" ] && [ -d "$ROOT/artwork/iGame_AGA/lores" ]'
+check "archives are cached in downloads/artwork_archive" \
+  '[ -f "$ROOT/downloads/artwork_archive/IGame_Covers_AGA_Laced.lha" ] && [ ! -d "$ROOT/downloads/artwork_archives" ]'
+run artplan2 ./artwork_sync.sh --plan; st=$?
+check "--artwork-plan covers the Laced archives too" 'grep -q "IGame_Titles_ECS_Laced.lha" "$T/artplan2.log"'
+# merge against the real structure: only real games, right flavour, fallbacks
+MG="$T/mergereal"; setup mkdir -p "$MG"
+cp "$ROOT/merge.sh" "$ROOT/lib.sh" "$MG/"
+for fl in lores laced; do for sec in Covers Screens Titles; do
+    setup mkdir -p "$MG/artwork/iGame_AGA/$fl/$sec/Games/S/Superfrog"
+    echo "AGA-$fl-$sec" > "$MG/artwork/iGame_AGA/$fl/$sec/Games/S/Superfrog/iGame.iff"
+done; done
+setup mkdir -p "$MG/artwork/iGame_RTG/Covers/Games/Z/Zool"; echo RTG-Zool > "$MG/artwork/iGame_RTG/Covers/Games/Z/Zool/iGame.iff"
+setup mkdir -p "$MG/artwork/iGame_art/Apidya"; echo ART-Apidya > "$MG/artwork/iGame_art/Apidya/iGame.iff"
+for g in Superfrog Zool Apidya Nothing; do
+    L="$(printf '%s' "$g" | cut -c1)"
+    setup mkdir -p "$MG/build/retro_aga/WHDLoad/Games/$L/$g/data/save"
+    touch "$MG/build/retro_aga/WHDLoad/Games/$L/$g.info"
+done
+( cd "$MG" && bash merge.sh --aga -d build/retro_aga --report-missing missing.txt ) > "$T/mergereal.log" 2>&1
+check "only real games are counted - not category, letter or in-game folders" \
+  'grep -q "Found 4 WHDLoad subdirectories" "$T/mergereal.log"'
+check "AGA build uses the lores artwork" '[ "$(cat "$MG/build/retro_aga/WHDLoad/Games/S/Superfrog/iGame.iff")" = "AGA-lores-Covers" ]'
+check "fallbacks still work (RTG pack, then the art pack)" \
+  '[ -f "$MG/build/retro_aga/WHDLoad/Games/Z/Zool/iGame.iff" ] && [ "$(cat "$MG/build/retro_aga/WHDLoad/Games/A/Apidya/iGame.iff")" = ART-Apidya ]'
+check "only the game with no artwork anywhere is reported missing" \
+  '[ "$(grep -c . "$MG/missing.txt")" -eq 1 ] && grep -q Nothing "$MG/missing.txt"'
+find "$MG/build/retro_aga" -name 'iGame*.iff' -delete    # merge never overwrites existing artwork
+( cd "$MG" && bash merge.sh --aga-laced -d build/retro_aga > /dev/null 2>&1 )
+check "--aga-laced uses the laced artwork" '[ "$(cat "$MG/build/retro_aga/WHDLoad/Games/S/Superfrog/iGame.iff")" = "AGA-laced-Covers" ]'
+
+section "35. Saved backups can be cleared at the end of a hands-on run"
+run nobk ./all.sh --skip-update --variants aga; st=$?
+check "an unattended run never asks and keeps the backups" \
+  '{ [ "$st" -eq 0 ] || [ "$st" -eq 2 ]; } && ! grep -q "Delete them?" "$T/nobk.log" && [ -d "$ROOT/.retroplay_backups" ]'
 
 # ================================================================ summary ===
 echo

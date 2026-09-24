@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 # retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
+#
+# Purpose: Extracts archives in parallel.  Options: -d/--dest DIR -u (unattended)
+#            --exclude-tags LIST --only-tags LIST --debug --help
+# Run 'extract.sh --help' for the authoritative, current list.
+#
 
 # Amiga Retroplay Archive Extractor (OS-adaptive, encoding-robust)
 # Version: 1.4.0-bash32-compatible
@@ -37,7 +42,10 @@ fi
 
 # OS detection
 if [ -f /etc/os-release ]; then
-    source /etc/os-release
+    # Read the two fields we need instead of sourcing the file (which would
+    # run whatever it contains).
+    ID="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"'"'"'\"' | head -1)"
+    ID_LIKE="$(sed -n 's/^ID_LIKE=//p' /etc/os-release | tr -d '"'"'"'\"' | head -1)"
     OS_TYPE="linux"
     OS_NAME="$PRETTY_NAME"
 elif command -v uname >/dev/null; then
@@ -181,12 +189,21 @@ echo -e "Destination: ${YELLOW}${DEST}${NC}"
 echo -e "Encoding: ${YELLOW}ASCII first, ISO-8859-1 second, system locale last${NC}"
 echo -e "${BOLD}========================================================${NC}"
 
+DEST_CREATED_THIS_RUN=0
 if [ ! -d "$DEST" ]; then
     echo -e "${YELLOW}Creating destination directory: $DEST${NC}"
-    mkdir -p "$DEST" || { echo -e "${RED}Failed to create directory: $DEST${NC}"; exit 1; }
+    mkdir -p "$DEST" || { echo -e "${RED}Failed to create directory: $DEST${NC}"; exit 4; }
+    DEST_CREATED_THIS_RUN=1
 fi
 
-chmod -R u+w "$DEST" 2>/dev/null || { echo -e "${RED}Warning: could not set write permissions on $DEST${NC}"; }
+# Only make writable what THIS run created: a blanket "chmod -R u+w" would
+# rewrite permissions across an existing collection.
+if [ "${DEST_CREATED_THIS_RUN:-0}" -eq 1 ]; then
+    chmod -R u+w "$DEST" 2>/dev/null || echo -e "${RED}Warning: could not set write permissions on $DEST${NC}"
+elif [ ! -w "$DEST" ]; then
+    echo -e "${RED}ERROR: $DEST is not writable.${NC}" >&2
+    exit 4
+fi
 
 # Prompts to auto-install a missing tool via the platform's package manager.
 # Returns 0 if the tool is available afterwards (already present, or the
@@ -320,6 +337,18 @@ find_roots=()
 for _root in HD_Loaders JST WHDLoad; do
     [ -d "$_root" ] && find_roots+=("$_root")
 done
+# Not started from a folder holding the archives (e.g. run by hand from the
+# main folder)? Then work in the downloads folder instead.
+if [ "${#find_roots[@]}" -eq 0 ] && [ -d "${RP_DOWNLOAD_ROOT:-/nonexistent}" ]; then
+    for _root in HD_Loaders JST WHDLoad; do
+        [ -d "$RP_DOWNLOAD_ROOT/$_root" ] && find_roots+=("$_root")
+    done
+    if [ "${#find_roots[@]}" -gt 0 ]; then
+        cd "$RP_DOWNLOAD_ROOT" || exit 4
+        SRCROOT="$(pwd)"
+        echo "Reading archives from ${RP_DOWNLOAD_ROOT##*/}/"
+    fi
+fi
 [ "${#find_roots[@]}" -eq 0 ] && find_roots=(".")
 
 # Bash-3.2-safe replacement for `mapfile`

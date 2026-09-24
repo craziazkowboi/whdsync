@@ -25,6 +25,13 @@ jobs:
         run: brew install bash util-linux
       - name: Show bash version used
         run: ${{ matrix.shell }} --version | head -1
+      - name: ShellCheck
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y shellcheck
+          # Errors fail the build; style warnings are advisory.
+          shellcheck -S error -x *.sh tests/*.sh
+          shellcheck -S warning -x *.sh tests/*.sh || echo "(warnings above are advisory)"
       - name: Syntax check every script
         run: for f in *.sh tests/*.sh; do ${{ matrix.shell }} -n "$f" || exit 1; done
       - name: Run the test suite

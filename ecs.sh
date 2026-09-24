@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
-# Builds or updates the ECS variant (retro_ecs). Extra options are passed
-# through to start.sh, for example:
-#   ./ecs.sh --rebuild   rebuild from the downloaded archives, no update check
-#   ./ecs.sh --clean     check for updates, then rebuild from scratch
-#   ./all.sh --ecs --dry-run   preview what would happen
-# Art order, detox and filesystem defaults come from retroplay.conf.
+# Purpose: build or update the ECS variant (retro_ecs) - a thin wrapper around start.sh.
+# Inputs:  any start.sh option, e.g. --rebuild, --clean, --skip-update
+# Outputs: whatever start.sh --sync does for this one variant
+# Safety:  no logic of its own; all safety rules live in all.sh/start.sh
+# Called by: people, and by cron only through all.sh --cron
 set -e
-cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
-exec ./start.sh --auto --ecs "$@"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$SCRIPT_DIR/start.sh" --sync --ecs "$@"

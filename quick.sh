@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 # retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
+#
+# Purpose: Processes only what was downloaded last time into a preview folder.
+#   Options: --aga --ecs --rtg --aga-laced --ecs-laced --set NAME -d/--dest DIR
+#            --art LIST --demo-art LIST --skip-update --no-detox --help
+# Run 'quick.sh --help' for the authoritative, current list.
+#
 set -o pipefail
 
 # Amiga Retroplay Quick Update & Process Script
@@ -18,7 +24,6 @@ set -o pipefail
 # is just a directory creation): download -> stage -> extract -> merge
 # artwork -> sort. See the "Step N of 5" markers below for each one.
 
-version="1.0.2"
 
 # Color codes
 if [ -t 1 ]; then
@@ -38,7 +43,7 @@ cd "$SCRIPT_DIR" || { echo "ERROR: cannot cd to script directory: $SCRIPT_DIR" >
 . "$SCRIPT_DIR/lib.sh"
 rp_load_config
 NEWDIR="$SCRIPT_DIR/new"
-UPDATE_LOG="$SCRIPT_DIR/update.log"
+UPDATE_LOG="$RP_LOG_ROOT/update.log"
 DEST_OPT=""      # holds just the path, if the user gave one
 MODE_OPT=""      # holds --ecs / --aga / --rtg, if the user gave one (forwarded to merge.sh)
 SET_OPT=""       # holds --set NAME, if the user gave one (forwarded to merge.sh)
@@ -64,7 +69,7 @@ list_igame_sets() {
 }
 
 print_usage() {
-  echo -e "${BOLD}Amiga Retroplay Quick Processor v${version}${NC}"
+  echo -e "${BOLD}Amiga Retroplay Quick Processor v${RP_SUITE_VERSION}${NC}"
   echo
   echo -e "${BOLD}Usage:${NC} $0 [--ecs|--aga|--rtg|--ecs-laced|--aga-laced|--set NAME] [-d DEST | --dest DEST] [-h|--help]"
   echo
@@ -191,7 +196,7 @@ if [ -n "$DEST_OPT" ]; then
 fi
 
 echo -e "${BOLD}========================================${NC}"
-echo -e "${BOLD}Amiga Retroplay Quick Processor v${version}${NC}"
+echo -e "${BOLD}Amiga Retroplay Quick Processor v${RP_SUITE_VERSION}${NC}"
 echo -e "${BOLD}========================================${NC}"
 echo
 
@@ -267,11 +272,11 @@ trap 'exit 130' INT TERM
 # Parse update.log and copy new archives while preserving directory structure
 while IFS= read -r line; do
   filepath=$(echo "$line" | sed 's/^[0-9-]* [0-9:]* //')
-  if [ -f "$filepath" ]; then
-    relpath="${filepath#./}"
+  relpath="${filepath#./}"
+  if [ -f "$RP_DOWNLOAD_ROOT/$relpath" ]; then
     destpath="$temp_extract_dir/$relpath"
     mkdir -p "$(dirname "$destpath")"
-    cp -f "$filepath" "$destpath" 2>/dev/null || {
+    cp -f "$RP_DOWNLOAD_ROOT/$relpath" "$destpath" 2>/dev/null || {
       echo -e "${YELLOW}Warning: Could not copy $filepath${NC}"
     }
   fi
@@ -377,7 +382,7 @@ echo
 # Clean up any 0-byte logs from this run. update.log is handled separately
 # since it's a useful standalone record (what was downloaded), not an
 # error log - only deleted if genuinely empty, never touched otherwise.
-[ -e "$SCRIPT_DIR/update.log" ] && [ ! -s "$SCRIPT_DIR/update.log" ] && rm -f -- "$SCRIPT_DIR/update.log"
+[ -e "$UPDATE_LOG" ] && [ ! -s "$UPDATE_LOG" ] && rm -f -- "$UPDATE_LOG"
 for _logf in extract_errors.log merge_errors.log sort.log amiga_filename_issues.log; do
     [ -e "$SCRIPT_DIR/$_logf" ] && [ ! -s "$SCRIPT_DIR/$_logf" ] && rm -f -- "$SCRIPT_DIR/$_logf"
 done

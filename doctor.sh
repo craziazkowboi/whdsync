@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 # retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
+#
+# Purpose: Checks the whole setup and explains how to fix anything wrong.
+#   Changes nothing.  Options: --help.  Exit: 0 = fine, 1 = problems found.
+# Run 'doctor.sh --help' for the authoritative, current list.
+#
 # Amiga Retroplay - setup check ("doctor")
 #
 # Checks everything the scripts need and reports what to fix, in plain terms.
@@ -110,16 +115,25 @@ good "variants: $RP_VARIANTS   filesystem: $RP_FILESYSTEM   output folder: $RP_O
 
 head_ "Artwork"
 found_sets=""
-for d in "$SCRIPT_DIR"/[iI][gG][aA][mM][eE]_*; do
+for d in "$RP_ARTWORK_ROOT"/[iI][gG][aA][mM][eE]_*; do
     [ -d "$d" ] || continue
     n="${d##*/}"; secs=""
-    for s in Covers Screens Titles; do [ -d "$d/$s" ] || [ -d "$d/${s%s}" ] && secs="$secs $s"; done
+    # Sections may be directly inside (iGame_RTG/Covers) or under a flavour
+    # folder (iGame_AGA/lores/Covers, iGame_AGA/laced/Covers).
+    for s in Covers Screens Titles; do
+        for base in "$d" "$d/lores" "$d/laced"; do
+            if [ -d "$base/$s" ] || [ -d "$base/${s%s}" ]; then
+                case " $secs " in *" $s "*) ;; *) secs="$secs $s" ;; esac
+            fi
+        done
+    done
+    for fl in lores laced; do [ -d "$d/$fl" ] && secs="$secs ($fl)"; done
     found_sets="$found_sets ${n#*_}"
     setkey="$(printf '%s' "${n#*_}" | tr '[:lower:]' '[:upper:]')"
     case " $(printf '%s' "$RP_STRUCTURED_ART_SETS" | tr '[:lower:]' '[:upper:]') " in
         *" $setkey "*)
             if [ -n "$secs" ]; then good "$n:$secs"
-            else warn "$n has no Covers/Screens/Titles folders - it won't be used" "This pack is only matched by the standard layout (STRUCTURED_ART_SETS)"; fi ;;
+            else warn "$n has no Covers/Screens/Titles folders - it won't be used" "Get the artwork with: ./start.sh --artwork-sync"; fi ;;
         *)
             cnt="$(find "$d" -type f -iname 'igame.iff' 2>/dev/null | grep -c . || true)"
             if [ "$cnt" -gt 0 ]; then good "$n: $cnt artwork folder(s), matched at any depth"
@@ -134,6 +148,24 @@ for v in $RP_VARIANTS; do
 done
 [ -d "$SCRIPT_DIR/TinyLauncher" ] && good "TinyLauncher (last-resort screenshots)"
 
+head_ "Artwork packs (downloaded)"
+if [ -x "$SCRIPT_DIR/artwork_sync.sh" ]; then
+    _n_inst=0; _n_missing=""
+    for _v in $RP_ARTWORK_PACKS; do
+        case "$(printf '%s' "$_v" | tr '[:upper:]' '[:lower:]')" in
+            aga|ecs) _p="$RP_ARTWORK_ROOT/iGame_$(printf '%s' "$_v" | tr '[:lower:]' '[:upper:]')/lores" ;;
+            *)       _p="$RP_ARTWORK_ROOT/iGame_$(printf '%s' "$_v" | tr '[:lower:]' '[:upper:]')" ;;
+        esac
+        if [ -d "$_p" ]; then _n_inst=$((_n_inst + 1)); else _n_missing="$_n_missing $_v"; fi
+    done
+    [ "$_n_inst" -gt 0 ] && good "$_n_inst of the configured packs are installed ($RP_ARTWORK_PACKS)"
+    [ -n "$_n_missing" ] && warn "no artwork yet for:$_n_missing" "Fix: ./start.sh --artwork-sync   (or ./start.sh --artwork-plan to see what it would fetch)"
+    [ -d "$RP_ARTWORK_CACHE" ] && good "archive cache: downloads/artwork_archive ($(( $(rp_du_kb "$RP_ARTWORK_CACHE") / 1024 )) MB)"
+    good "source: $RP_ARTWORK_SOURCE_URL (checked at most every ${RP_ARTWORK_CHECK_INTERVAL_HOURS}h when ARTWORK_SYNC=auto; currently $RP_ARTWORK_SYNC)"
+else
+    warn "artwork_sync.sh is missing - artwork can't be downloaded automatically"
+fi
+
 head_ "Disk space"
 # (Never create the output folder here: if it's on a USB drive that isn't
 # mounted, that would create it on the SD card instead.)
@@ -147,7 +179,9 @@ case "$(df -P "$RP_OUTPUT_ROOT" 2>/dev/null | awk 'NR==2 {print $1}')" in
 esac
 free_kb="$(rp_free_kb "$RP_OUTPUT_ROOT")"; arch_kb="$(rp_du_kb HD_Loaders JST WHDLoad)"
 if [ -n "$free_kb" ]; then
-    good "$((free_kb / 1024)) MB free; downloaded archives use $((arch_kb / 1024)) MB"
+    good "$((free_kb / 1024)) MB free; downloads use $((arch_kb / 1024)) MB"
+    if [ "${RP_LOG_RETENTION_DAYS:-1}" -gt 0 ]; then good "logs are deleted after $RP_LOG_RETENTION_DAYS day(s) (LOG_RETENTION_DAYS)"
+    else good "logs are kept for ever (LOG_RETENTION_DAYS=0)"; fi
     need=$((arch_kb * RP_SPACE_FACTOR * 2 / 1024))
     if [ "$arch_kb" -gt 0 ] && [ $((free_kb / 1024)) -lt "$need" ]; then
         warn "a full rebuild may need about $need MB free" "Point OUTPUT_ROOT at a bigger drive (a USB SSD is also much faster than an SD card)"
@@ -170,11 +204,11 @@ done
 # Collections or batches with anything but WHDLoad/HD_Loaders/JST at the top
 # (e.g. a Users/... folder from the path bug fixed in this version).
 bad_layout=""
-for d in "$RP_OUTPUT_ROOT"/retro_* "$RP_OUTPUT_ROOT"/new_*/*; do
+for d in "$RP_BUILD_ROOT"/retro_* "$RP_BUILD_ROOT"/new_*/*; do
     [ -d "$d" ] || continue
     e="$(rp_layout_problems "$d" | head -1)"
     [ -n "$e" ] && bad_layout="$bad_layout
-      ${d#"$RP_OUTPUT_ROOT"/}/$e"
+      ${d#"$RP_BUILD_ROOT"/}/$e"
 done
 if [ -n "$bad_layout" ]; then
     prob "folders in the wrong place (should only hold WHDLoad, HD_Loaders, JST):$bad_layout" \

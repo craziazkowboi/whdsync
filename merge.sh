@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 # retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
+#
+# Purpose: Adds iGame/TinyLauncher artwork to a collection.
+#   Options: --aga --ecs --rtg --aga-laced --ecs-laced --set NAME --custom
+#            -d/--dest DIR --art LIST --demo-art LIST --only-missing
+#            --report-missing FILE --a314 --debug --help
+# Run 'merge.sh --help' for the authoritative, current list.
+#
 
 # Amiga Retroplay - Artwork Merger
 #
@@ -69,8 +76,10 @@ ONLY_MISSING=0   # --only-missing: skip any target that already has an
                  # iGame.iff-family file AND a .data file - used for a
                  # cheap "fill gaps" pass over an existing collection
                  # rather than a full re-merge of everything.
-GAME_ART_PRIORITY="Screens,Covers,Titles"       # default order for non-demos
-DEMO_ART_PRIORITY="Titles,Screens,Covers"  # default order for demos
+# Defaults come from retroplay.conf (ART_ORDER / DEMO_ART_ORDER) so running
+# merge.sh by hand matches what the engine does; --art overrides them.
+GAME_ART_PRIORITY="${RP_ART_ORDER:-Covers,Screens,Titles}"
+DEMO_ART_PRIORITY="${RP_DEMO_ART_ORDER:-Titles,Screens,Covers}"  # default order for demos
 DEMO_ART_OVERRIDE=0                        # set to 1 if --demo-art is used
 
 
@@ -116,7 +125,7 @@ rp_load_config
 STRUCTURED_SETS=" $(printf '%s' "$RP_STRUCTURED_ART_SETS" | tr '[:lower:]' '[:upper:]') "
 
 TINYLAUNCHER_SRC="$SCRIPT_DIR/TinyLauncher"
-DEFAULT_DEST="$SCRIPT_DIR/retro"
+DEFAULT_DEST="$RP_BUILD_ROOT/retro"
 ART_SRC=""
 SET_OPT=""
 DEST=""
@@ -131,7 +140,7 @@ declare -a IGAME_SET_NAMES=()   # display names, in discovery order
 declare -A IGAME_SET_DIR=()     # NAME (uppercased) -> full directory path
 
 shopt -s nullglob
-for _igdir in "$SCRIPT_DIR"/[Ii][Gg]ame_*/; do
+for _igdir in "$RP_ARTWORK_ROOT"/[Ii][Gg]ame_*/; do
     _igdir="${_igdir%/}"
     [ -d "$_igdir" ] || continue
     _igbase="$(basename "$_igdir")"
@@ -174,7 +183,8 @@ show_artwork_menu() {
     echo "=========================================="
 
     if [ "${#IGAME_SET_NAMES[@]}" -eq 0 ]; then
-        echo "No iGame_* artwork directories found in: $SCRIPT_DIR"
+        echo "No iGame_* artwork folders found in: $RP_ARTWORK_ROOT"
+        echo "Get the artwork with: ./start.sh --artwork-sync"
         echo "=========================================="
         exit 1
     fi
@@ -248,6 +258,7 @@ while [ $# -gt 0 ]; do
             echo "Amiga Retroplay iGame Artwork Merger"
             echo "Version: 1.8.0-fallback-chain (Priority-ordered merge, dynamic artwork sets, tier fallback)"
             echo "Usage: $(basename "$0") [--custom] [--ecs|--aga|--rtg|--ecs-laced|--aga-laced|--set NAME] [-d DEST] [--art ORDER] [--debug]"
+  echo "  -h, --help            Show this help and exit."
             echo
             echo "Artwork sets:"
             echo "  Any directory named iGame_<NAME> next to this script is a usable artwork"
@@ -315,7 +326,8 @@ elif [ -n "$SET_OPT" ]; then
     fi
 else
     if ! default_art_set; then
-        echo "ERROR: No iGame_* artwork directories found under: $SCRIPT_DIR"
+        echo "ERROR: No iGame_* artwork folders found under: $RP_ARTWORK_ROOT"
+        echo "Get the artwork with: ./start.sh --artwork-sync   (or --artwork-plan to see what it would fetch)"
         exit 1
     fi
 fi
@@ -392,6 +404,27 @@ if [ -z "${IGAME_SET_DIR[ART]+_}" ]; then
     fi
     unset _art_resolved
 fi
+
+# The artwork packs from the source are per section (Covers/Screens/Titles)
+# and per flavour, so iGame_AGA and iGame_ECS hold "laced/" and "lores/"
+# subfolders. Map the sets onto them:
+#     --aga        -> iGame_AGA/lores      --aga-laced -> iGame_AGA/laced
+#     --ecs        -> iGame_ECS/lores      --ecs-laced -> iGame_ECS/laced
+#     --rtg        -> iGame_RTG            (no flavours)
+# A pack still laid out the old flat way keeps working: if there is no
+# laced/ or lores/ subfolder, the folder itself is used as before.
+for _base in AGA ECS; do
+    _dir="${IGAME_SET_DIR[$_base]:-}"
+    [ -n "$_dir" ] || continue
+    if [ -d "$_dir/laced" ]; then
+        IGAME_SET_DIR["${_base}_LACED"]="$_dir/laced"
+        case " ${IGAME_SET_NAMES[*]} " in *" ${_base}_Laced "*) ;; *) IGAME_SET_NAMES+=("${_base}_Laced") ;; esac
+    fi
+    if [ -d "$_dir/lores" ]; then
+        IGAME_SET_DIR["$_base"]="$_dir/lores"
+    fi
+done
+unset _base _dir
 
 # Append any other discovered iGame_* sets not already in the chain, so a
 # fresh iGame_MyPack directory is still tried as a last resort even though
@@ -520,7 +553,8 @@ if [ ! -d "$DEST/WHDLoad" ]; then
         exit 0
     fi
     echo "ERROR: destination folder not found: $DEST"
-    exit 1
+    echo "(Build it first, e.g. ./start.sh --sync --aga, or pass -d <folder>.)"
+    exit 4
 fi
 
 CORES=""
@@ -602,9 +636,26 @@ echo
 
 whdload_path="$DEST/WHDLoad"
 whdload_dirs=()
-while IFS= read -r -d '' dir; do
+# A game is a folder with its matching "<name>.info" icon beside it - the
+# WHDLoad convention. That skips the category folders (Games, Demos, ...),
+# the letter folders (A, B, C ...) and any variant/language folders, which
+# used to be counted as games and reported as "no artwork" in their
+# thousands. Folders INSIDE a game (data, save, ...) are skipped too: once a
+# game is found, nothing below it is treated as another game.
+#
+# Depth 8 covers the deepest real case: WHDLoad/Languages/German/Games/G/Game.
+_prev=""
+while IFS= read -r dir; do
+    [ -e "${dir}.info" ] || continue
+    if [ -n "$_prev" ]; then
+        case "$dir/" in
+            "$_prev"/*) continue ;;      # inside a game already matched
+        esac
+    fi
     whdload_dirs+=( "$dir" )
-done < <(find "$whdload_path" -mindepth 1 -maxdepth 4 -type d -print0 2>/dev/null)
+    _prev="$dir"
+done < <(find "$whdload_path" -mindepth 1 -maxdepth 8 -type d 2>/dev/null | LC_ALL=C sort)
+unset _prev
 
 total_dirs="${#whdload_dirs[@]}"
 [ "$total_dirs" -eq 0 ] && { echo "ERROR: No game subdirectories found under WHDLoad."; exit 1; }

@@ -19,9 +19,18 @@ if [ -z "${SCRIPT_DIR:-}" ]; then
     return 1 2>/dev/null || exit 1
 fi
 
-RP_STATE_DIR="$SCRIPT_DIR/.retroplay"
-RP_CONF_FILE="$SCRIPT_DIR/retroplay.conf"
-DEP_TRACK_FILE="$SCRIPT_DIR/.retroplay_installed_deps.log"
+# The scripts may sit in the main folder, or tidied away in a "scripts"
+# subfolder. Everything else (artwork/, build/, downloads/, logs/, state) is
+# kept beside the scripts, or one level up when they are in scripts/.
+if [ "${SCRIPT_DIR##*/}" = "scripts" ] && [ -d "${SCRIPT_DIR%/scripts}" ]; then
+    RP_BASE_DIR="${SCRIPT_DIR%/scripts}"
+else
+    RP_BASE_DIR="$SCRIPT_DIR"
+fi
+
+RP_STATE_DIR="$RP_BASE_DIR/.retroplay"
+RP_CONF_FILE="$RP_BASE_DIR/retroplay.conf"
+DEP_TRACK_FILE="$RP_BASE_DIR/.retroplay_installed_deps.log"
 
 # ============================================================================
 # 1. Configuration
@@ -52,6 +61,22 @@ rp_load_config() {
     RP_DOWNLOAD_RETRIES="3"
     RP_GAPFILL_DAYS="7"
     RP_VERIFY_DOWNLOADS="auto"
+    RP_ARTWORK_SYNC="ask"
+    RP_ARTWORK_SOURCE_URL="https://ftp2.grandis.nu/turran/FTP/Collection/Various/WHDLoad_Images"
+    RP_ARTWORK_ARCHIVE_DIR="artwork_archive"
+    RP_ARTWORK_STATE_ROOT=""
+    RP_ARTWORK_PACKS="AGA ECS RTG"
+    RP_ARTWORK_OPTIONAL_PACKS="AGA_Laced ECS_Laced art TinyLauncher"
+    RP_ARTWORK_KEEP_BACKUPS="2"
+    RP_ARTWORK_LOCAL_CHANGE_POLICY="ask"
+    RP_ARTWORK_VERIFY_DOWNLOADS="yes"
+    RP_ARTWORK_FAILURE_POLICY="warn-and-continue"
+    RP_ARTWORK_CHECK_INTERVAL_HOURS="24"
+    RP_ARTWORK_DIR="artwork"      # holds iGame_*/ TinyLauncher/ archives/
+    RP_BUILD_DIR="build"          # holds retro_*/ and new_*/ (under OUTPUT_ROOT)
+    RP_DOWNLOAD_DIR="downloads"   # holds WHDLoad/ HD_Loaders/ JST/ old/
+    RP_LOG_DIR="logs"
+    RP_LOG_RETENTION_DAYS="1"     # delete logs older than this; 0 = keep forever
     RP_CONFIG_WARNINGS=""
 
     [ -f "$RP_CONF_FILE" ] || { rp_finish_config; return 0; }
@@ -77,7 +102,11 @@ rp_load_config() {
             VARIANTS|OUTPUT_ROOT|ART_ORDER|DEMO_ART_ORDER|FILESYSTEM|USE_DETOX|\
             MIN_FREE_MB|SPACE_FACTOR|KEEP_NEW_BATCHES|OLD_ARCHIVE_DAYS|LOG_MAX_MB|\
             LOG_KEEP|NTFY_TOPIC|NTFY_SERVER|NOTIFY_EMAIL|NOTIFY_ON_SUCCESS|STRUCTURED_ART_SETS|\
-            MAX_EXTRACT_ATTEMPTS|DOWNLOAD_RETRIES|GAPFILL_DAYS|VERIFY_DOWNLOADS)
+            MAX_EXTRACT_ATTEMPTS|DOWNLOAD_RETRIES|GAPFILL_DAYS|VERIFY_DOWNLOADS|\
+            ARTWORK_SYNC|ARTWORK_SOURCE_URL|ARTWORK_ARCHIVE_DIR|ARTWORK_STATE_ROOT|ARTWORK_PACKS|\
+            ARTWORK_OPTIONAL_PACKS|ARTWORK_KEEP_BACKUPS|ARTWORK_LOCAL_CHANGE_POLICY|\
+            ARTWORK_VERIFY_DOWNLOADS|ARTWORK_FAILURE_POLICY|ARTWORK_CHECK_INTERVAL_HOURS|\
+            ARTWORK_DIR|BUILD_DIR|DOWNLOAD_DIR|LOG_DIR|LOG_RETENTION_DAYS)
                 printf -v "RP_$key" '%s' "$val" ;;
             ART_ORDER_[A-Z0-9_]*|EXCLUDE_TAGS_[A-Z0-9_]*)
                 printf -v "RP_$key" '%s' "$val" ;;
@@ -91,7 +120,7 @@ rp_load_config() {
 
 rp_finish_config() {
     local n ref
-    for n in MIN_FREE_MB SPACE_FACTOR KEEP_NEW_BATCHES OLD_ARCHIVE_DAYS LOG_MAX_MB LOG_KEEP MAX_EXTRACT_ATTEMPTS DOWNLOAD_RETRIES GAPFILL_DAYS; do
+    for n in MIN_FREE_MB SPACE_FACTOR KEEP_NEW_BATCHES OLD_ARCHIVE_DAYS LOG_MAX_MB LOG_KEEP MAX_EXTRACT_ATTEMPTS DOWNLOAD_RETRIES GAPFILL_DAYS LOG_RETENTION_DAYS; do
         ref="RP_$n"
         case "${!ref}" in
             ''|*[!0-9]*)
@@ -103,6 +132,24 @@ rp_finish_config() {
     : "${RP_MIN_FREE_MB:=1024}" "${RP_SPACE_FACTOR:=3}" "${RP_KEEP_NEW_BATCHES:=14}"
     : "${RP_OLD_ARCHIVE_DAYS:=30}" "${RP_LOG_MAX_MB:=5}" "${RP_LOG_KEEP:=4}"
     : "${RP_MAX_EXTRACT_ATTEMPTS:=3}" "${RP_DOWNLOAD_RETRIES:=3}" "${RP_GAPFILL_DAYS:=7}"
+    : "${RP_ARTWORK_KEEP_BACKUPS:=2}" "${RP_ARTWORK_CHECK_INTERVAL_HOURS:=24}" "${RP_LOG_RETENTION_DAYS:=1}"
+    # Artwork settings: check the words, and the pack names for anything unsafe.
+    case "$RP_ARTWORK_SYNC" in ask|auto|yes|no) ;; *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}ARTWORK_SYNC must be ask, auto, yes or no - using ask
+"; RP_ARTWORK_SYNC=ask ;; esac
+    case "$RP_ARTWORK_LOCAL_CHANGE_POLICY" in ask|keep-local|backup-and-replace|fail) ;; *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}ARTWORK_LOCAL_CHANGE_POLICY must be ask, keep-local, backup-and-replace or fail - using keep-local
+"; RP_ARTWORK_LOCAL_CHANGE_POLICY=keep-local ;; esac
+    case "$RP_ARTWORK_FAILURE_POLICY" in warn-and-continue|fail) ;; *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}ARTWORK_FAILURE_POLICY must be warn-and-continue or fail - using warn-and-continue
+"; RP_ARTWORK_FAILURE_POLICY=warn-and-continue ;; esac
+    case "$RP_ARTWORK_VERIFY_DOWNLOADS" in yes|no) ;; *) RP_ARTWORK_VERIFY_DOWNLOADS=yes ;; esac
+    case "$RP_ARTWORK_SOURCE_URL" in http://*|https://*|ftp://*) ;; *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}ARTWORK_SOURCE_URL must start with http://, https:// or ftp://
+" ;; esac
+    for _p in $RP_ARTWORK_PACKS $RP_ARTWORK_OPTIONAL_PACKS; do
+        case "$_p" in
+            */*|*..*|.*|*[!A-Za-z0-9_-]*) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}artwork pack name '$_p' contains characters that aren't allowed - ignoring it
+" ;;
+        esac
+    done
+    unset _p
     [ "$RP_GAPFILL_DAYS" -ge 1 ] 2>/dev/null || RP_GAPFILL_DAYS=1
     case "$(printf '%s' "$RP_VERIFY_DOWNLOADS" | tr '[:upper:]' '[:lower:]')" in
         yes|no|auto) RP_VERIFY_DOWNLOADS="$(printf '%s' "$RP_VERIFY_DOWNLOADS" | tr '[:upper:]' '[:lower:]')" ;;
@@ -121,10 +168,22 @@ rp_finish_config() {
     # e.g. a USB SSD mount point.
     case "$RP_OUTPUT_ROOT" in
         /*) ;;
-        .|"") RP_OUTPUT_ROOT="$SCRIPT_DIR" ;;
-        *) RP_OUTPUT_ROOT="$SCRIPT_DIR/$RP_OUTPUT_ROOT" ;;
+        .|"") RP_OUTPUT_ROOT="$RP_BASE_DIR" ;;
+        *) RP_OUTPUT_ROOT="$RP_BASE_DIR/$RP_OUTPUT_ROOT" ;;
     esac
     RP_OUTPUT_ROOT="${RP_OUTPUT_ROOT%/}"
+    # Folders the tool works in. Each may be given as an absolute path;
+    # otherwise artwork/downloads/logs sit beside the scripts and the builds
+    # under OUTPUT_ROOT (so they land on the big drive).
+    case "$RP_ARTWORK_DIR"  in /*) RP_ARTWORK_ROOT="$RP_ARTWORK_DIR" ;;  *) RP_ARTWORK_ROOT="$RP_BASE_DIR/${RP_ARTWORK_DIR:-artwork}" ;; esac
+    case "$RP_DOWNLOAD_DIR" in /*) RP_DOWNLOAD_ROOT="$RP_DOWNLOAD_DIR" ;; *) RP_DOWNLOAD_ROOT="$RP_BASE_DIR/${RP_DOWNLOAD_DIR:-downloads}" ;; esac
+    case "$RP_LOG_DIR"      in /*) RP_LOG_ROOT="$RP_LOG_DIR" ;;          *) RP_LOG_ROOT="$RP_BASE_DIR/${RP_LOG_DIR:-logs}" ;; esac
+    case "$RP_BUILD_DIR"    in /*) RP_BUILD_ROOT="$RP_BUILD_DIR" ;;      *) RP_BUILD_ROOT="$RP_OUTPUT_ROOT/${RP_BUILD_DIR:-build}" ;; esac
+    RP_ARTWORK_ROOT="${RP_ARTWORK_ROOT%/}"; RP_DOWNLOAD_ROOT="${RP_DOWNLOAD_ROOT%/}"
+    RP_LOG_ROOT="${RP_LOG_ROOT%/}"; RP_BUILD_ROOT="${RP_BUILD_ROOT%/}"
+    RP_REPORT_ROOT="$RP_BASE_DIR/reports"
+    # Downloaded artwork archives live with the other downloads.
+    RP_ARTWORK_CACHE="$RP_DOWNLOAD_ROOT/artwork_archive"
 }
 
 rp_yesno() {
@@ -265,7 +324,7 @@ rp_adopt_configured_variants() {
     local v s
     for v in $RP_VARIANTS; do
         s="$(rp_variant_suffix "$v")"
-        rp_adopt_legacy "retro_$s" "$RP_OUTPUT_ROOT/retro_$s"
+        rp_adopt_legacy "retro_$s" "$RP_BUILD_ROOT/retro_$s"
     done
 }
 
@@ -586,6 +645,23 @@ RP_EXIT_INTEGRITY=5     # extraction / validation / integrity failure
 RP_EXIT_INTERRUPTED=130 # stopped by Ctrl-C or a signal
 
 rp_is_interactive() { [ -t 0 ] && [ -t 1 ]; }
+
+# Consistent output styling. Colour only on a terminal, never in a log.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    RP_C_HEAD=$'\033[1m'; RP_C_OK=$'\033[32m'; RP_C_WARN=$'\033[33m'; RP_C_ERR=$'\033[31m'; RP_C_DIM=$'\033[2m'; RP_C_OFF=$'\033[0m'
+else
+    RP_C_HEAD=""; RP_C_OK=""; RP_C_WARN=""; RP_C_ERR=""; RP_C_DIM=""; RP_C_OFF=""
+fi
+
+# rp_heading <text>       - a titled section
+# rp_step <n> <of> <text> - "[2/6] Checking for updates" with the time
+# rp_done <text>          - a finished step
+rp_heading() { printf '\n%s== %s ==%s\n' "$RP_C_HEAD" "$*" "$RP_C_OFF"; }
+rp_step() {
+    local n="$1" of="$2"; shift 2
+    printf '\n%s[%s/%s]%s %s %s(%s)%s\n' "$RP_C_HEAD" "$n" "$of" "$RP_C_OFF" "$*" "$RP_C_DIM" "$(date '+%H:%M:%S')" "$RP_C_OFF"
+}
+rp_done() { printf '      %s%s%s %s\n' "$RP_C_OK" "done" "$RP_C_OFF" "$*"; }
 rp_ts()    { date '+%Y-%m-%d %H:%M:%S'; }
 rp_log()   { printf '[%s] %s\n' "$(rp_ts)" "$*"; }
 rp_warn()  { printf 'WARNING: %s\n' "$*" >&2; }
@@ -683,7 +759,7 @@ rp_print_status() {
         echo "  Last run:      none recorded yet"
     fi
     for v in $(printf '%s' "$RP_VARIANTS" | tr ',' ' '); do
-        key="retro_$(rp_variant_suffix "$v")"; dest="$RP_OUTPUT_ROOT/$key"
+        key="retro_$(rp_variant_suffix "$v")"; dest="$RP_BUILD_ROOT/$key"
         q="$(rp_queue_count "$key")"
         case "$(rp_build_state "$key" "$dest")" in
             fresh)      st="not built yet" ;;
@@ -712,7 +788,7 @@ rp_print_status() {
     else
         echo "  Notifications: off (set NTFY_TOPIC or NOTIFY_EMAIL in retroplay.conf)"
     fi
-    last="$(ls -1 "$SCRIPT_DIR"/reports/*.txt 2>/dev/null | grep -v '_no_artwork' | sort | tail -1)"
+    last="$(ls -1 "$RP_REPORT_ROOT"/*.txt 2>/dev/null | grep -v '_no_artwork' | sort | tail -1)"
     [ -n "$last" ] && echo "  Last report:   reports/${last##*/}"
     return 0
 }
@@ -835,11 +911,11 @@ rp_check_output_root() {
 
 # Rolling backups of the small state folder (queues, build markers, ...),
 # so losing it doesn't mean losing what's queued. The newest 7 are kept.
-RP_BACKUP_DIR="$SCRIPT_DIR/.retroplay_backups"
+RP_BACKUP_DIR="$RP_BASE_DIR/.retroplay_backups"
 rp_backup_state() {
     [ -d "$RP_STATE_DIR" ] || return 0
     mkdir -p "$RP_BACKUP_DIR" 2>/dev/null || return 0
-    tar -czf "$RP_BACKUP_DIR/.state-new.tgz" --exclude='.retroplay/stage' -C "$SCRIPT_DIR" .retroplay 2>/dev/null \
+    tar -czf "$RP_BACKUP_DIR/.state-new.tgz" --exclude='.retroplay/stage' -C "$RP_BASE_DIR" .retroplay 2>/dev/null \
         && mv -f "$RP_BACKUP_DIR/.state-new.tgz" "$RP_BACKUP_DIR/state-$(date '+%Y%m%d-%H%M%S').tgz"
     rm -f "$RP_BACKUP_DIR/.state-new.tgz"
     ls -1 "$RP_BACKUP_DIR"/state-*.tgz 2>/dev/null | sort -r | awk 'NR > 7' | while IFS= read -r old; do rm -f "$old"; done
@@ -854,7 +930,7 @@ rp_restore_state_if_lost() {
     [ -d "$RP_STATE_DIR/complete" ] && return 0
     latest="$(ls -1 "$RP_BACKUP_DIR"/state-*.tgz 2>/dev/null | sort | tail -1)"
     [ -n "$latest" ] || return 0
-    if tar -xzf "$latest" -C "$SCRIPT_DIR" 2>/dev/null; then
+    if tar -xzf "$latest" -C "$RP_BASE_DIR" 2>/dev/null; then
         echo "The state folder (.retroplay) was missing - restored it from ${latest##*/}."
         echo "(To deliberately start from scratch, delete both .retroplay and .retroplay_backups.)"
     fi
@@ -867,7 +943,7 @@ rp_gapfill_due() {   # <key>
     local stamp="$RP_STATE_DIR/gapfill/$1" d
     [ -f "$stamp" ] || return 0
     [ -n "$(find "$stamp" -mtime +"$(( RP_GAPFILL_DAYS - 1 ))" 2>/dev/null)" ] && return 0
-    for d in "$SCRIPT_DIR"/[iI][gG][aA][mM][eE]_* "$SCRIPT_DIR/TinyLauncher"; do
+    for d in "$RP_ARTWORK_ROOT"/[iI][gG][aA][mM][eE]_* "$RP_ARTWORK_ROOT/TinyLauncher"; do
         [ -d "$d" ] || continue
         [ -n "$(find "$d" -newer "$stamp" 2>/dev/null | head -1)" ] && return 0
     done
@@ -890,8 +966,11 @@ rp_exit_meaning() {
 
 # rp_test_archive <file>: integrity test with the format's own tool. A tool
 # that isn't installed means "can't test" - treated as OK, never as corrupt.
+# rp_test_archive <file> [name to judge the format by]
+# The second argument matters for a download still named "<name>.lha.part":
+# without it the format would be unknown and the file would go untested.
 rp_test_archive() {
-    case "$1" in
+    case "${2:-$1}" in
         *.lha|*.LHA|*.lzh|*.LZH)
             command -v lha >/dev/null 2>&1 || return 0
             lha t "$1" >/dev/null 2>&1 ;;
@@ -905,3 +984,160 @@ rp_test_archive() {
         *) return 0 ;;
     esac
 }
+
+# =============================================================================
+# 14. Downloads, checksums, fingerprints (used by the artwork engine)
+# =============================================================================
+rp_info() { printf '%s\n' "$*"; }
+rp_print_usage_error() {   # <script> <message>
+    printf 'ERROR: %s\n' "$2" >&2
+    printf "Try '%s --help'.\n" "$1" >&2
+    return "$RP_EXIT_CONFIG"
+}
+
+# rp_sha256 <file>: prints the checksum, or nothing if no tool is available
+# (callers must treat "no checksum" as reduced verification, not failure).
+rp_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" 2>/dev/null | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+    fi
+}
+rp_have_sha256() { command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1; }
+
+# rp_fetch <url> <output file>: download to the given path (curl or wget).
+rp_fetch() {
+    # On a terminal, show the transfer meter; in a log, stay quiet (the
+    # caller prints one line per file instead).
+    if command -v curl >/dev/null 2>&1; then
+        if [ -t 1 ]; then curl -fL --progress-bar -m 1800 -o "$2" "$1"
+        else curl -fsSL -m 1800 -o "$2" "$1"; fi
+    elif command -v wget >/dev/null 2>&1; then
+        if [ -t 1 ]; then wget -T 1800 --progress=bar:force -O "$2" "$1"
+        else wget -q -T 1800 -O "$2" "$1"; fi
+    else return 1; fi
+}
+
+# rp_fetch_listing <url>: print a directory listing page (HTML or FTP style).
+rp_fetch_listing() {
+    if command -v curl >/dev/null 2>&1; then curl -fsSL -m 120 "$1"
+    elif command -v wget >/dev/null 2>&1; then wget -q -T 120 -O - "$1"
+    else return 1; fi
+}
+
+# rp_dir_fingerprint <folder>: a stable fingerprint of a folder's contents
+# (relative paths and sizes). Used to notice user changes to artwork.
+rp_dir_fingerprint() {
+    [ -d "$1" ] || return 1
+    # One batched listing rather than a process per file: an artwork pack can
+    # hold tens of thousands of files, and the per-file version took minutes
+    # (far worse on a Pi). "ls -ldn" gives size and name for every entry.
+    ( cd "$1" && find . \( -type f -o -type l \) -exec ls -ldn {} + 2>/dev/null \
+        | awk '{ size = $5; name = $9; for (i = 10; i <= NF; i++) name = name " " $i; print size "\t" name }' \
+        | LC_ALL=C sort ) \
+        | { if rp_have_sha256; then rp_sha256 /dev/stdin; else cksum | awk '{print $1"-"$2}'; fi; }
+}
+
+# rp_same_filesystem <path a> <path b>: 0 if both are on one filesystem, so a
+# rename is atomic. Missing paths are checked via their nearest parent.
+rp_same_filesystem() {
+    local a="$1" b="$2"
+    while [ ! -e "$a" ] && [ "$a" != "/" ]; do a="$(dirname "$a")"; done
+    while [ ! -e "$b" ] && [ "$b" != "/" ]; do b="$(dirname "$b")"; done
+    [ "$(df -P "$a" 2>/dev/null | awk 'NR==2 {print $1}')" = "$(df -P "$b" 2>/dev/null | awk 'NR==2 {print $1}')" ]
+}
+
+# rp_replace_tree <candidate> <live> <backup folder>
+# Puts <candidate> in place of <live>, keeping the old one as a backup first.
+# Same filesystem: renames (atomic). Different filesystem: copies the
+# candidate in first, and only then swaps - the live folder is never removed
+# before its replacement is complete.
+rp_replace_tree() {
+    local cand="$1" live="$2" backup="$3" tmp
+    mkdir -p "$(dirname "$live")" || return 1
+    if [ -e "$live" ]; then
+        mkdir -p "$(dirname "$backup")" || return 1
+        if rp_same_filesystem "$live" "$backup"; then mv "$live" "$backup" || return 1
+        else cp -a "$live" "$backup" || return 1; rm -rf "$live" || return 1; fi
+    fi
+    if rp_same_filesystem "$cand" "$live"; then
+        mv "$cand" "$live" || return 1
+    else
+        tmp="$live.incoming.$$"
+        rm -rf "$tmp"
+        cp -a "$cand" "$tmp" || { rm -rf "$tmp"; return 1; }
+        mv "$tmp" "$live" || { rm -rf "$tmp"; return 1; }
+    fi
+    return 0
+}
+
+# rp_file_age <file>: "3 hours ago" style age, for status displays.
+rp_file_age() {
+    [ -f "$1" ] || { echo "never"; return; }
+    if [ -n "$(find "$1" -mmin +1440 2>/dev/null)" ]; then echo "more than a day ago"
+    elif [ -n "$(find "$1" -mmin +60 2>/dev/null)" ]; then echo "within the last day"
+    else echo "within the last hour"; fi
+}
+
+# =============================================================================
+# 15. One-time move to the tidier folder layout
+# =============================================================================
+# Older versions kept everything beside the scripts: iGame_*/ , retro_*/ ,
+# WHDLoad/ , *.log. This moves each of those into artwork/ , build/ ,
+# downloads/ and logs/ exactly once. Anything already in place is left alone,
+# and nothing is ever overwritten - a move only happens when the new location
+# is free, so an interrupted migration simply continues next time.
+rp_migrate_layout() {
+    local moved=0 d name
+    mkdir -p "$RP_ARTWORK_ROOT" "$RP_LOG_ROOT" "$RP_DOWNLOAD_ROOT" 2>/dev/null
+    for d in "$RP_BASE_DIR"/[iI][gG][aA][mM][eE]_* "$RP_BASE_DIR/TinyLauncher"; do
+        [ -d "$d" ] || continue
+        name="${d##*/}"
+        [ -e "$RP_ARTWORK_ROOT/$name" ] || { mv "$d" "$RP_ARTWORK_ROOT/$name" && moved=1; }
+    done
+    mkdir -p "$RP_DOWNLOAD_ROOT" 2>/dev/null
+    for d in "$RP_BASE_DIR/artwork_archives" "$RP_BASE_DIR/artwork_archive" \
+             "$RP_ARTWORK_ROOT/archives" "$RP_DOWNLOAD_ROOT/artwork_archives"; do
+        [ -d "$d" ] || continue
+        [ -e "$RP_ARTWORK_CACHE" ] || { mv "$d" "$RP_ARTWORK_CACHE" && moved=1; }
+    done
+    for name in WHDLoad HD_Loaders JST old; do
+        [ -d "$RP_BASE_DIR/$name" ] || continue
+        [ -e "$RP_DOWNLOAD_ROOT/$name" ] || { mv "$RP_BASE_DIR/$name" "$RP_DOWNLOAD_ROOT/$name" && moved=1; }
+    done
+    for d in "$RP_BASE_DIR"/*.log; do
+        [ -f "$d" ] || continue
+        name="${d##*/}"
+        [ -e "$RP_LOG_ROOT/$name" ] || { mv "$d" "$RP_LOG_ROOT/$name" && moved=1; }
+    done
+    mkdir -p "$RP_BUILD_ROOT" 2>/dev/null
+    for d in "$RP_OUTPUT_ROOT"/retro_* "$RP_OUTPUT_ROOT"/new_*; do
+        [ -d "$d" ] || continue
+        name="${d##*/}"
+        case "$name" in retro_\*|new_\*) continue ;; esac
+        [ -e "$RP_BUILD_ROOT/$name" ] || { mv "$d" "$RP_BUILD_ROOT/$name" && moved=1; }
+    done
+    # Build markers record where each collection lives - point them at build/.
+    if [ "$moved" -eq 1 ] && [ -d "$RP_STATE_DIR/complete" ]; then
+        for d in "$RP_STATE_DIR"/complete/*; do
+            [ -f "$d" ] || continue
+            name="$(cat "$d" 2>/dev/null)"
+            case "$name" in
+                "$RP_BUILD_ROOT"/*) ;;
+                */retro_*) printf '%s\n' "$RP_BUILD_ROOT/${name##*/}" | rp_atomic_write "$d" ;;
+            esac
+        done
+    fi
+    [ "$moved" -eq 1 ] && rp_info "Tidied the folder layout: artwork/, build/, downloads/ and logs/."
+    return 0
+}
+
+# Deletes logs older than LOG_RETENTION_DAYS (0 = keep them for ever).
+# Only the logs folder is touched; reports and state are left alone.
+rp_prune_logs() {
+    [ "${RP_LOG_RETENTION_DAYS:-1}" -gt 0 ] 2>/dev/null || return 0
+    [ -d "$RP_LOG_ROOT" ] || return 0
+    find "$RP_LOG_ROOT" -type f \( -name '*.log' -o -name '*.log.[0-9]' \) \
+        -mtime +"$(( RP_LOG_RETENTION_DAYS - 1 ))" -exec rm -f {} + 2>/dev/null
+    return 0
+}
+

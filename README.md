@@ -1,269 +1,318 @@
-# whdsync
+# whdsync — an Amiga WHDLoad collection that keeps itself up to date
 
-> ⚠️ **Before copying anything onto a PFS Amiga partition:** set its filename size to 107, or PFS's default limit can corrupt the partition when it meets the long filenames some Retroplay archives extract to.
->
-> ```
-> setfnsize <drive:> 107
-> ```
->
-> `setfnsize` ships in the PFS package on [Aminet](https://aminet.net/). Run it once per partition, on the Amiga, before your first sync.
+Downloads the Retroplay WHDLoad archives, extracts them, adds iGame artwork, sorts everything the way an Amiga expects, and builds a ready-to-copy collection for each machine you own — AGA, ECS and RTG.
 
-Bash scripts that download the Retroplay WHDLoad packs, extract them, add iGame/TinyLauncher artwork, sort them into variant and language folders, and keep everything up to date — unattended, nightly, on something as small as a Raspberry Pi Zero 2W, as well as on macOS and Linux.
+Then it does the same again every night, by itself, and tells you only when something needs you.
 
-## Quick start
-
-```bash
-chmod +x *.sh
-./setup.sh               # installs everything, asks 3 questions, offers the nightly run
-./all.sh                 # first run: downloads and builds retro_aga, retro_ecs, retro_rtg
-./start.sh --status      # any time: last run, what's queued, drive, schedule
+```
+downloads/            →  extract  →  artwork  →  sort  →  build/retro_aga/
+(Retroplay archives)                                      build/retro_ecs/
+                                                          build/retro_rtg/
 ```
 
-`setup.sh` installs the tools (via apt or Homebrew), downloads and compiles `unlzx` from Aminet, enables the locales Linux needs, creates `retroplay.conf`, offers the nightly run and finishes with `doctor.sh`. It's safe to run again at any time — each step only does what's missing. `--yes` answers every question with its default; `--dry-run` shows what it would do.
+- **Runs on** a Raspberry Pi (including a Pi Zero 2 W) or a Mac. Linux and macOS, nothing else needed.
+- **Safe by design.** It never deletes a collection until its replacement is ready, never overwrites artwork you changed yourself, and stops rather than guessing.
+- **Tested.** 157 automated tests plus 201 option checks, run on Linux and macOS.
 
-## Notes
+---
 
-- Scripts move and rename files as part of normal operation. Keep a backup of your WHDLoad tree before first use.
-- **Always update the scripts as a complete set.** Each one carries a `retroplay-suite:` version stamp, and `all.sh` refuses to run on a mix of versions (naming the out-of-date files), because an old script mixed with new ones can damage a collection. `./doctor.sh` checks this too.
-- Every script can be run from any directory — each one switches to its own folder first. The archive folders (`WHDLoad`, `HD_Loaders`, `JST`) may be symlinks to another drive.
-- Temporary folders (`extract_tmp.*` and friends) are removed whenever a script finishes, fails or is stopped. Leftovers from a crash or power cut are swept up at the start of the next run (a folder whose run is still going is never touched).
-- Bash 3.2+ everywhere, except `merge.sh`, which needs Bash 4+. On macOS it relaunches itself under Homebrew's bash automatically (`brew install bash`).
-- This README only describes the scripts; it contains no third-party content.
+## Contents
 
-## Prerequisites
+- [What you need](#what-you-need)
+- [Install it](#install-it)
+- [Your first run](#your-first-run)
+- [Everyday use](#everyday-use)
+- [Where everything lives](#where-everything-lives)
+- [Artwork](#artwork)
+- [The nightly run](#the-nightly-run)
+- [Settings](#settings)
+- [When something goes wrong](#when-something-goes-wrong)
+- [Uninstalling](#uninstalling)
+- [How it keeps your collection safe](#how-it-keeps-your-collection-safe)
+- [Command reference](#command-reference)
+- [For developers](#for-developers)
 
-- **wget** (downloads), **lha**, **unlzx**, **7z**, **unar** (extraction).
-- **flock** (recommended) — stops two runs overlapping. Part of `util-linux`; on macOS Homebrew installs it keg-only and the scripts find it automatically.
-- **detox** (optional) — only if you set `USE_DETOX=yes`.
-- **curl** or **wget**, and/or **mail** — only for notifications.
-- Linux locales `C.UTF-8` and `en_US.ISO-8859-1`.
+---
 
-Run `./doctor.sh` to check all of this at once. Scripts offer to install missing tools via `apt`/`brew` when run interactively. `unlzx` has no package and must be built from [source on Aminet](https://aminet.net/package/util/arc/unlzx).
+## What you need
 
-Everything the scripts install is recorded, and only recorded if the package manager confirms it **wasn't** already installed — so `uninstall_deps.sh` can later remove exactly that and nothing you already had.
+| | |
+|---|---|
+| **A computer** | Raspberry Pi OS / Debian / Ubuntu, or macOS |
+| **Disk space** | Roughly 3× the size of the collection you want. A full set of three variants needs a few hundred GB — start with one variant if you're unsure |
+| **Time** | The first run downloads a lot. Leave it overnight |
+| **Tools** | `wget`, `lha`, `7z`, `unar`, `unlzx` — **the setup script installs all of these for you** |
 
-## Settings: `retroplay.conf`
+On a Raspberry Pi, putting the collection on a **USB SSD** rather than the SD card makes an enormous difference to speed, and saves the card a lot of wear. Setup asks where you want it.
 
-Copy `retroplay.conf.example` to `retroplay.conf` and edit it. Every setting is optional; command-line options override it. The file is read as plain `KEY=VALUE` lines (never executed), and `doctor.sh` warns about typos.
+---
+
+## Install it
+
+### 1. Get the files
+
+```bash
+git clone https://github.com/<your-account>/whdsync.git
+cd whdsync
+chmod +x *.sh
+```
+
+No git? Download the ZIP from the GitHub page, unzip it, and `cd` into the folder.
+
+### 2. Choose where it lives
+
+Put the folder anywhere you have space — for example `/home/pi/whdsync` or `~/Amiga/whdsync`. Everything the tool creates (downloads, artwork, finished collections, logs) goes **inside that folder**, unless you point the collection at another drive during setup.
+
+macOS note: avoid iCloud-synced folders such as Desktop and Documents. Something like `~/Amiga/whdsync` is ideal.
+
+### 3. Run the setup
+
+```bash
+./setup.sh
+```
+
+It will:
+
+1. install the tools it needs (`apt` on Linux, Homebrew on macOS);
+2. download and compile `unlzx`, which has no package anywhere;
+3. add the two text encodings Linux needs for Amiga filenames;
+4. ask three questions — which machines you build for, where the collection should go, and whether you want failure notifications;
+5. offer to set up the nightly update;
+6. finish by checking everything.
+
+It's safe to run again at any time: every step checks first and only does what's missing. `./setup.sh --yes` takes every default without asking; `./setup.sh --dry-run` shows what it would do and changes nothing.
+
+---
+
+## Your first run
+
+```bash
+./start.sh --plan      # optional: shows what WOULD happen, changes nothing
+./all.sh               # the real thing
+```
+
+What to expect, in order:
+
+| Step | What happens | How long |
+|---|---|---|
+| 1 | Checks your setup and that the drive is there | seconds |
+| 2 | Downloads the artwork packs | minutes |
+| 3 | Mirrors the Retroplay archives | **hours** on a first run |
+| 4 | Works out what needs building | seconds |
+| 5 | Extracts, adds artwork, sorts and installs each variant | **hours** on a Pi |
+
+Each step announces itself with the time, and long jobs show a progress bar, so you can always tell it's working. A readable report is written to `reports/`, and a summary appears at the end.
+
+**You can stop it at any time with Ctrl-C.** Nothing is left half-installed: an interrupted build is redone next time, and everything already downloaded is kept.
+
+When it finishes, your collections are in `build/retro_aga/`, `build/retro_ecs/` and `build/retro_rtg/`. Copy the one you want to your Amiga's drive, or point your A314 or network share at it.
+
+---
+
+## Everyday use
+
+```bash
+./start.sh                 # menu, if you'd rather not remember options
+./start.sh --status        # what happened last night, what's waiting
+./all.sh                   # update and rebuild everything
+./aga.sh                   # just the AGA collection (also ecs.sh, rtg.sh)
+./start.sh --plan          # what a run would do; changes nothing
+./doctor.sh                # check the setup, and be told how to fix anything wrong
+```
+
+After the first run, a nightly update usually takes a few minutes: only newly published games are downloaded and added.
+
+**New games appear in two places:** merged into your collection, and copied on their own into `build/new_aga/<date>/`, so you can send just the new ones to your Amiga instead of recopying everything.
+
+---
+
+## Where everything lives
+
+```
+whdsync/
+├── artwork/          the iGame artwork packs
+│   ├── iGame_AGA/{laced,lores}/{Covers,Screens,Titles}/...
+│   ├── iGame_ECS/{laced,lores}/...
+│   ├── iGame_RTG/{Covers,Screens,Titles}/...
+│   └── TinyLauncher/
+├── build/            your finished collections — this is what you copy to the Amiga
+│   ├── retro_aga/  retro_ecs/  retro_rtg/
+│   └── new_aga/<date>/          only the games added that night
+├── downloads/        the Retroplay mirror — the raw archives
+│   ├── WHDLoad/  HD_Loaders/  JST/
+│   ├── artwork_archive/         downloaded artwork archives
+│   └── old/                     superseded archives, kept for a while
+├── logs/             deleted automatically after LOG_RETENTION_DAYS
+├── reports/          one readable summary per run
+├── retroplay.conf    your settings
+└── the scripts
+```
+
+`build/` can live on another drive — set `OUTPUT_ROOT` during setup or in `retroplay.conf`. The scripts can also be tidied into a `scripts/` subfolder if you prefer; everything else then sits alongside it.
+
+---
+
+## Artwork
+
+Artwork comes from the Turran FTP mirror and is installed where the merge step expects it.
+
+```bash
+./start.sh --artwork-status     # what's installed, and whether it's current
+./start.sh --artwork-plan       # what an update would do — changes nothing
+./start.sh --artwork-sync       # fetch and install everything
+./start.sh --artwork-sync --for aga     # only what an AGA build needs
+./start.sh --artwork-verify     # check what's installed
+./start.sh --artwork-rollback iGame_AGA/lores/Covers    # undo one update
+```
+
+| Published archive | Installed as |
+|---|---|
+| `IGame_Covers_RTG.lha` | `artwork/iGame_RTG/Covers/…` |
+| `IGame_Screens_AGA_Laced.lha` | `artwork/iGame_AGA/laced/Screens/…` |
+| `IGame_Titles_ECS_LoRes.lha` | `artwork/iGame_ECS/lores/Titles/…` |
+| `TinyLauncher.lha` | `artwork/TinyLauncher/…` |
+
+A plain `--aga` or `--ecs` build uses the **LoRes** artwork; `--aga-laced` and `--ecs-laced` use the **Laced** artwork; `--rtg` uses the RTG packs.
+
+**Your own artwork is safe.** If you change a folder, or drop in a pack this tool didn't install, it is never overwritten automatically — see `ARTWORK_LOCAL_CHANGE_POLICY`. Put your own images in `artwork/iGame_art/` in whatever structure you like; they're used whenever a game has no artwork in the main packs.
+
+If a game still has none, the merge step falls back in order — for an RTG build: RTG → AGA Laced → AGA → your own art → ECS Laced → ECS → TinyLauncher.
+
+---
+
+## The nightly run
+
+```bash
+./start.sh --schedule                 # every night at 02:00
+./start.sh --schedule --time 04:30    # at a time that suits you
+./start.sh --schedule --show          # what's scheduled now
+./start.sh --schedule --disable       # stop it
+```
+
+The nightly run is silent unless something needs you. To hear about failures, set `NTFY_TOPIC` (a free [ntfy.sh](https://ntfy.sh) topic) or `NOTIFY_EMAIL` in `retroplay.conf`, then check it works:
+
+```bash
+./start.sh --test-notify
+```
+
+Output from each night goes to `logs/all_cron.log`, and a summary to `reports/`. To include artwork updates in the nightly run, set `ARTWORK_SYNC="auto"`.
+
+---
+
+## Settings
+
+Settings live in `retroplay.conf` beside the scripts. Copy `retroplay.conf.example` if you don't have one; every setting is commented there. The ones people change most:
 
 | Setting | Default | What it does |
 |---|---|---|
-| `VARIANTS` | `aga ecs rtg` | Which variants `all.sh` builds (`aga-laced`, `ecs-laced`, or any `iGame_NAME` set also work). |
-| `OUTPUT_ROOT` | `.` | Where `retro_*`, `new_*` and working files go — e.g. a USB SSD, which is far faster than an SD card. |
-| `ART_ORDER`, `ART_ORDER_<VARIANT>` | `Covers,Screens,Titles` | Artwork priority (per variant if needed). |
-| `DEMO_ART_ORDER` | `Titles,Screens,Covers` | Artwork priority for demos. |
-| `MAX_EXTRACT_ATTEMPTS` | `3` | Failed extractions of one archive before it is moved to `old/corrupt-<date>/` and re-downloaded. |
-| `DOWNLOAD_RETRIES` | `3` | Attempts at each download pass before giving up (exit 3). |
-| `GAPFILL_DAYS` | `7` | The artwork gap-fill runs when an artwork pack changes, or after this many days. |
-| `VERIFY_DOWNLOADS` | `auto` | Test new downloads straight away (`yes`/`no`/`auto` = batches of up to 100 files). |
-| `STRUCTURED_ART_SETS` | `AGA ECS RTG` | Artwork packs matched only by the standard layout; all others are also searched at any depth. |
-| `EXCLUDE_TAGS_<VARIANT>` | ECS variants: `AGA,CD32` | Releases a variant leaves out (see below). |
-| `FILESYSTEM` | `pfs` | Filename limits: `pfs` (107 characters) or `ffs` (30). |
-| `USE_DETOX` | `no` | Clean filenames with detox before sorting. |
-| `MIN_FREE_MB`, `SPACE_FACTOR` | `1024`, `3` | Free space to always keep, and how much bigger extracted files are than the archives. |
-| `KEEP_NEW_BATCHES` | `14` | Dated `new_*` batch folders to keep per variant. |
-| `OLD_ARCHIVE_DAYS` | `30` | Days to keep superseded archives in `old/`. |
-| `LOG_MAX_MB`, `LOG_KEEP` | `5`, `4` | Rotation of the nightly `all_cron.log`. |
-| `NTFY_TOPIC`, `NTFY_SERVER`, `NOTIFY_EMAIL`, `NOTIFY_ON_SUCCESS` | off | Notifications when a run fails (or succeeds). |
+| `VARIANTS` | `aga ecs rtg` | Which collections to build |
+| `OUTPUT_ROOT` | `.` | Where `build/` goes — point this at a USB SSD |
+| `ART_ORDER` | `Covers,Screens,Titles` | Which artwork iGame shows first |
+| `FILESYSTEM` | `pfs` | Use `ffs` for the 30-character filename limit |
+| `ARTWORK_SYNC` | `ask` | `auto` also updates artwork in the nightly run |
+| `LOG_RETENTION_DAYS` | `1` | Delete logs after this many days; `0` keeps them for ever |
+| `NTFY_TOPIC` | *(empty)* | Get told when a run fails |
 
-## Artwork directory layout
+See what's in force with `./start.sh --status`, and the full list in `retroplay.conf.example`.
 
-Create this next to the scripts for each artwork set (at least `iGame_AGA`, `iGame_ECS`, `iGame_RTG`):
+---
 
-```
-iGame_AGA/
-├── Covers/
-│   ├── Games/<A-Z, 0-9>/<GameName>/iGame.iff (+ matching .data file)
-│   ├── Demos/<A-Z, 0-9>/<GameName>/iGame.iff
-│   └── Magazines/<A-Z, 0-9>/<GameName>/iGame.iff
-├── Screens/   (same layout)
-└── Titles/    (same layout)
-```
+## When something goes wrong
 
-`<GameName>` must match the extracted game folder's name. Singular folder names (`Game`, `Cover`) also work. Any `iGame_<NAME>` folder is picked up automatically and usable as `--set NAME`. A generic `iGame_art` is a catch-all fallback, and `TinyLauncher/<Game|Demo|Magazine|Beta>/<GameName>_SCR<n>.iff` a last resort.
-
-**`iGame_AGA`, `iGame_ECS` and `iGame_RTG` must use the layout above. Every other pack — `iGame_art`, the `_Laced` packs, your own — can be organised however you like:** a folder named after the game, holding an `iGame.iff`, is found at any depth. The layout above is still checked first, so a pack that follows it works exactly as before. A match somewhere under a `Covers`, `Screens` or `Titles` folder keeps that section's priority; one with no section in its path is tried after that pack's sections. Which packs are standard-layout-only is set by `STRUCTURED_ART_SETS` in `retroplay.conf`.
-
-## What gets built
-
-| Folder | Contents |
-|---|---|
-| `retro_aga`, `retro_ecs`, `retro_rtg` (and `retro_aga_laced`, `retro_ecs_laced`, `retro_<name>`) | The full collection for each variant. |
-| `new_<variant>/<date_time>/` | Just the games added or updated in each run — handy for copying only what changed to the Amiga. The newest `KEEP_NEW_BATCHES` are kept. |
-| `old/<date>/` | Superseded archives, kept `OLD_ARCHIVE_DAYS` days in case one was wrongly retired. |
-| `reports/` | A summary of every run, plus lists of games that got no artwork. |
-
-**ECS leaves out AGA and CD32 releases.** An ECS machine can't run them, so archives whose name has an `AGA` or `CD32` field (e.g. `Game_v1.1_AGA_HD.lha`, but not a game merely called *Agamemnon*) are never extracted into `retro_ecs` or `retro_ecs_laced`. `retro_aga` and `retro_rtg` get everything. Change this with `EXCLUDE_TAGS_ECS` in `retroplay.conf`.
-
-## How a run works (and why it's safe to interrupt)
-
-`all.sh` is the engine; `start.sh --auto` and `aga.sh`/`ecs.sh`/`rtg.sh` run through it for a single variant.
-
-1. **Update.** `update.sh` mirrors the Retroplay FTP packs and **queues** every new archive for each finished variant. An archive stays queued until that variant has actually absorbed it, so a run that fails or is interrupted part-way is simply picked up by the next one.
-2. **Plan.** Each variant is either *not built yet*, *interrupted* (a full build that never finished — it's redone, never mistaken for a finished one), *has queued archives*, or *up to date*.
-3. **Full builds** extract and sort every archive **once**, then copy the result per variant; only the artwork differs.
-4. **Updates** stage just the queued archives, extract and sort them once, add each variant's artwork, then install them. A game in the batch **replaces** its old folder, so files from older versions don't linger. A dated copy goes into `new_<variant>/`, and a quick artwork gap-fill runs over the whole collection.
-5. **Report** in `reports/`, and a notification if something failed.
-
-**Corrupt or failed archives never block the rest.** Everything that extracts is installed; an archive that fails stays queued and is retried next run. After `MAX_EXTRACT_ATTEMPTS` failures (default 3) it is moved to `old/corrupt-<date>/`, so the next update downloads a fresh copy. The run exits 5 and the report names it.
-
-**A USB drive that isn't mounted is never mistaken for an empty one.** The output folder gets a marker file on first use; if it's missing later (drive not mounted, so the mount point is just an empty folder on the SD card), the run stops with exit 4 and changes nothing, instead of rebuilding everything onto the SD card.
-
-**The state folder is backed up** (`.retroplay_backups/`, newest 7) at the start of every run. If `.retroplay` is ever lost, it's restored automatically, so queued downloads aren't lost. To deliberately start from scratch, delete both folders.
-
-**New downloads are tested straight away** (`lha t`, `unzip -t`, `lsar -t` for .lzx when available). A corrupt download is deleted and fetched again in the same run.
-
-**Artwork gap-fill runs only when it can help:** when an artwork pack has changed (so new artwork reaches an up-to-date collection by itself), after `GAPFILL_DAYS` days, or with `--force`.
-
-**Downloads are retried** (`DOWNLOAD_RETRIES`, default 3, with growing pauses). A file the server re-publishes under the same name is picked up and processed, and a file left half-downloaded by an interrupted transfer is never processed as if complete: it is re-downloaded in full on the next run.
-
-Free disk space is checked before extracting and before each copy, and an existing collection is only removed once its replacement is ready to install. Every extraction is also checked to contain only `WHDLoad`, `HD_Loaders` and `JST` at the top; anything else stops the run before it reaches a collection. If a `retro_*` folder ever holds anything else at the top (such as a `Users/…` tree left by an older version), the next run rebuilds that variant from your archives, and `new_*` batches with the wrong layout are removed.
-
-## Script reference
-
-| Script | Purpose |
-|---|---|
-| `all.sh` | The pipeline engine — builds/updates every variant in `VARIANTS`. |
-| `start.sh` | Menu and individual steps (update, extract, merge, sort, quick). |
-| `aga.sh` / `ecs.sh` / `rtg.sh` | One variant, via `start.sh --auto`. |
-| `update.sh` | Downloads, queues, and retires superseded archives. |
-| `extract.sh` | Parallel, memory-aware archive extractor. |
-| `merge.sh` | Adds artwork to game folders. |
-| `sort.sh` | Variant/language sorting and Amiga filename checks. |
-| `quick.sh` | Preview new downloads in `new/` without touching the collection. |
-| `setup.sh` | One-step install and setup (safe to repeat). |
-| `doctor.sh` | Checks the whole setup and explains fixes. |
-| `install_cron.sh` | Nightly 2am run. |
-| `uninstall_deps.sh` | Removes only the tools these scripts installed. |
-| `lib.sh` | Shared helpers (not run directly). |
-
-### all.sh
-
-```
-./all.sh [--aga] [--ecs] [--rtg] [--aga-laced] [--ecs-laced] [--set NAME] [--variants "a b"]
-         [--rebuild | --clean] [--skip-update] [--force] [--dry-run] [--cron] [--dest PATH]
-         [--art ORDER] [--demo-art ORDER] [--ffs | --pfs] [--no-detox | --detox] [--debug]
-```
-
-- No variant options: builds `VARIANTS` from `retroplay.conf`. Lists may use spaces or commas (`--variants aga,ecs`); an unknown variant name is rejected rather than building a folder with the wrong artwork.
-- `--rebuild` — rebuild from the archives already downloaded, **without checking for updates**.
-- `--clean` — check for updates, then rebuild from scratch.
-- `--skip-update` — don't download; process whatever is queued.
-- `--force` — also run the artwork gap-fill on variants that are up to date.
-- `--dry-run` — show the plan, what's queued, the space needed, and an estimate from the server of what would be downloaded. Changes nothing.
-- `--status` — last run, each variant's state, queued downloads, output drive, schedule. Also `./start.sh --status`, and a summary heads the menu.
-- `--test-notify` — send a test ntfy/email notification and say whether it worked.
-- `--cron` — for cron: full `PATH` (cron's default misses `/usr/local/bin` and Homebrew), log rotation, output to `all_cron.log`.
-- `--dest PATH` — custom output folder (single variant only).
-- Exit codes: `0` work done, `2` nothing to do, `3` network/server problem (try again later), `4` setup or option problem (e.g. a missing tool, another run in progress, not enough disk space), `5` some archives couldn't be extracted (everything else was installed), `130` interrupted, `1` any other failure.
-
-### start.sh
-
-With no options it shows a menu:
-
-```
-  1) Auto (update, extract, merge, sort, clean)
-  2) Update only
-  3) Extract only
-  4) Merge artwork
-  5) Sort languages
-  6) Quick (process new files)
-  7) Rebuild from downloaded archives (no update check)
-  8) Check setup (doctor)
-  9) Show full status
- 10) Send a test notification
-  0) Exit
-```
-
-Options: `--auto`, `--rebuild`, `--update`, `--extract`, `--merge`, `--sort`, `--quick`, `--doctor`, `--ecs`/`--aga`/`--rtg`/`--ecs-laced`/`--aga-laced`, `--set NAME`, `--ffs`/`--pfs`, `--dest PATH`, `--art ORDER`, `--demo-art ORDER`, `--no-detox`/`--detox`, `--clean`, `--skip-update`, `--force`, `--skipchk`, `--skip-variant-sort`, `--only-missing`, `--report-missing FILE`, `--debug`, `--exit`, `-h`. All are case-insensitive.
-
-### aga.sh / ecs.sh / rtg.sh
+**Start here:**
 
 ```bash
-./ecs.sh              # update, then build or update retro_ecs
-./ecs.sh --rebuild    # rebuild retro_ecs from the downloaded archives, no update check
-./ecs.sh --clean      # update, then rebuild retro_ecs from scratch
+./doctor.sh
 ```
 
-Any `start.sh` option can be added.
+It checks the whole setup and, for anything wrong, tells you the command that fixes it.
 
-### update.sh
-
-Mirrors `HD_Loaders/Games`, `JST/Games`, `WHDLoad/Magazines`, `WHDLoad/Demos` and `WHDLoad/Games`, logs new files to `update.log`, and queues them.
-
-**Retiring old versions.** An existing archive is only treated as an older version of a new one when the two names are **identical apart from the `_vX.Y` field**, and its version is **strictly lower**. Versions compare number by number, so `1.10` > `1.9` > `1.1`. So `_AGA`, `_CD32`, `_HD` and `_68040` releases of the same game are separate files and never touch each other. Retired archives go to `old/<date>/`, not the bin. If the server keeps offering one that was retired, it's exempted from then on rather than downloaded and retired every night.
-
-- `--dry-run` — ask the server what would be downloaded (a name-based estimate), without downloading.
-- Exit codes: `0` new files, `2` nothing new, `3` network/server error.
-
-### extract.sh
-
-Extracts `.lha`/`.lzx`/`.zip` from `HD_Loaders/`, `JST/` and `WHDLoad/` in parallel. It caps parallelism by available memory (a single job on a 512MB Pi Zero 2W) and falls back through ASCII, ISO-8859-1 and system locales for awkward filenames.
-
-Options: `-d, --dest PATH`, `-u, --unattended`, `--exclude-tags LIST`, `--only-tags LIST` (filter by name fields, e.g. `AGA,CD32`), `--debug`, `-h`.
-
-### merge.sh
-
-For each game folder under `DEST/WHDLoad`, copies the best artwork found along a fallback chain:
-
-| Selection | Fallback chain |
+| Message | What it means |
 |---|---|
-| `--rtg` | RTG → AGA_Laced → AGA → iGame_art → ECS_Laced → ECS → TinyLauncher → *(any other set)* |
-| `--aga` | AGA → iGame_art → ECS → TinyLauncher → *(other)* |
-| `--aga-laced` | AGA_Laced → AGA → iGame_art → ECS → TinyLauncher → *(other)* |
-| `--ecs` | ECS → iGame_art → TinyLauncher → *(other)* |
-| `--ecs-laced` | ECS_Laced → ECS → iGame_art → TinyLauncher → *(other)* |
-| `--set NAME` | the chosen set → iGame_art → TinyLauncher → *(other)* |
+| "the output folder isn't available (drive not mounted?)" | Your USB drive isn't mounted. Nothing was changed — plug it in and run again |
+| "some archives couldn't be extracted" (exit 5) | A damaged download. Everything else was installed; it retries by itself, and after three attempts fetches a fresh copy |
+| "network or server problem" (exit 3) | The server was unreachable. It tries again next run |
+| "scripts are not from the same version" | Some files weren't updated. Copy the whole set across |
+| A game has no artwork | The packs genuinely lack it. `./start.sh --artwork-plan` shows whether newer artwork exists |
 
-Games already sorted into variant/language folders are found at any depth.
+**Exit codes**, if you script around it: `0` done, `2` nothing to do, `3` network, `4` setup problem, `5` some archives failed, `130` interrupted.
 
-Options: `--custom`, `--ecs`/`--aga`/`--rtg`/`--ecs-laced`/`--aga-laced`, `--set NAME`, `-d, --dest PATH`, `--art ORDER`, `--demo-art ORDER`, `--a314`, `--only-missing`, `--report-missing FILE`, `--debug`, `-h`.
+Logs are in `logs/`, the last run's summary in `reports/`.
 
-### sort.sh
+---
 
-Moves games tagged CD32/AGA/NTSC/MT32/CDTV into `WHDLoad/<Variant>/` and language releases into `WHDLoad/Languages/<Language>/`. It also checks every filename against Amiga limits (forbidden characters, FFS/PFS length), fixing what it safely can and logging the rest to `amiga_filename_issues.log`.
+## Uninstalling
 
-Options: `-d, --dest PATH`, `--ffs`, `--pfs`, `--skipchk`, `--no-detox`, `--skip-variant-sort`, `-h`.
-
-### quick.sh
-
-Previews only the newest downloads (from `update.log`) in a separate `new/` folder, without touching your collection. ECS previews leave out AGA/CD32 releases too.
-
-Options: `--ecs`/`--aga`/`--rtg`/`--ecs-laced`/`--aga-laced`/`--set NAME`, `--art`, `--demo-art`, `--no-detox`, `-d`/`--dest`, `--skip-update`, `-h`.
-
-### install_cron.sh
-
-Installs `0 2 * * * cd "<script dir>" && ./all.sh --cron` — every night at 2am. Re-running it replaces the old entry, including ones from older versions.
-
-**Run it from the terminal where your tools work.** cron starts jobs with a minimal `PATH` (usually just `/usr/bin:/bin`), which is why a tool such as `unlzx` can work everywhere in your terminal yet be "not found" in the nightly run. `install_cron.sh` remembers your terminal's `PATH`, and every script adds it back when running unattended; any interactive run of a script refreshes it too. `./doctor.sh` checks that the nightly run will find everything.
-
-### uninstall_deps.sh
-
-Removes only what these scripts installed (tracked in `.retroplay_installed_deps.log`), with per-item confirmation. `--yes` skips the prompts, `--dry-run` only lists.
-
-### doctor.sh
-
-Checks bash, tools, locales, `retroplay.conf`, artwork folders, disk space, build and queue state, and the nightly job, with a fix for each problem. Also `./start.sh --doctor` or menu option 8.
-
-## Tests
+**Stop the nightly run, keep everything else:**
 
 ```bash
-tests/run_tests.sh        # end-to-end scenarios; add -v to see each script's output
-tests/option_matrix.sh    # every option of every script, and combinations (slower)
-MATRIX_SECTIONS="1 2" tests/option_matrix.sh   # just some sections (1-6)
+./start.sh --schedule --disable
 ```
 
-The runner also works if copied to the project root. The option matrix fails on any unexpected exit code, hang, or shell error (unbound variable, bad substitution, etc.) in any output.
-
-End-to-end tests against a mock Retroplay server with mock tools — no network needed. They cover full builds, updates, version retirement, ECS exclusion, failure recovery, interrupted builds, `--rebuild`, `--dry-run`, disk-space refusal, running from another folder, overlapping runs, cron's minimal `PATH`, and temp-folder cleanup (including when a run is stopped part-way). GitHub Actions runs them on Ubuntu and on macOS with the stock bash 3.2 (`.github/workflows/tests.yml`).
-
-## Typical usage
+**Remove the tools it installed for you** — and only those; anything you already had is left alone:
 
 ```bash
-./all.sh                  # the nightly job, by hand
-./all.sh --dry-run        # what would happen?
-./all.sh --rebuild        # rebuild everything from the downloaded archives
-./ecs.sh --rebuild        # ...or just one variant
-./install_cron.sh         # nightly at 2am
-./uninstall_deps.sh --dry-run
+./uninstall_deps.sh --dry-run    # see what would go
+./uninstall_deps.sh              # do it
 ```
+
+**Remove everything:** disable the schedule, run `./uninstall_deps.sh`, then delete the folder. Your collections are just files in `build/` — copy them somewhere first if you want to keep them.
+
+---
+
+## How it keeps your collection safe
+
+Every one of these has an automated test that fails if the protection is removed:
+
+- **Your collection is never removed before its replacement is ready**, and free space is checked before each stage.
+- **An unmounted drive is refused**, rather than quietly rebuilding hundreds of GB onto your SD card.
+- **A damaged archive never blocks the rest.** It's retried, then re-downloaded, and always reported by name.
+- **Interrupted downloads are never treated as complete**, and an interrupted build is redone rather than left half-installed.
+- **Artwork you changed is never overwritten**, and the previous version is kept so an update can be rolled back.
+- **Two runs can't overlap**, and a refused run says which one holds the lock.
+- **Your queue of pending downloads is backed up** every run, and restored if it's ever lost.
+- **Filenames are made Amiga-safe** (PFS or FFS limits) before anything reaches your Amiga.
+
+---
+
+## Command reference
+
+| Command | What it does |
+|---|---|
+| `./setup.sh` | Install and set up everything (safe to repeat) |
+| `./all.sh` | Update and build every configured variant |
+| `./aga.sh` `./ecs.sh` `./rtg.sh` | Build one variant |
+| `./start.sh` | Menu |
+| `./start.sh --status` | Last run, what's queued, drive, schedule |
+| `./start.sh --plan` | What a run would do; changes nothing |
+| `./start.sh --artwork-*` | `status`, `plan`, `sync`, `verify`, `rollback` |
+| `./start.sh --schedule` | Set up, show or disable the nightly run |
+| `./start.sh --test-notify` | Check notifications work |
+| `./doctor.sh` | Check the setup and explain any fixes |
+| `./uninstall_deps.sh` | Remove tools this tool installed |
+
+Every script supports `--help`. Useful extras: `--rebuild` (rebuild from archives already downloaded, no server check), `--skip-update`, `--force` (also fill in missing artwork), `--dry-run`.
+
+---
+
+## For developers
+
+```bash
+tests/run_tests.sh                    # 157 end-to-end tests, no network needed
+tests/option_matrix.sh                # every option of every script
+MATRIX_SECTIONS="1 2" tests/option_matrix.sh    # just some sections
+```
+
+Both run offline against mock tools and a mock server, so a full run takes minutes and touches nothing outside its temporary folder. GitHub Actions runs them on Ubuntu and macOS (bash 3.2), plus ShellCheck.
+
+The layout: `all.sh` is the engine; `start.sh` is the front end; `update.sh`, `extract.sh`, `merge.sh`, `sort.sh` and `artwork_sync.sh` each do one job; `lib.sh` holds everything shared. All scripts carry a version stamp and refuse to run as a mixed set.
+
+Contributions welcome — please keep the tests passing, add one for whatever you change, and stick to bash 3.2 (macOS ships it) outside `merge.sh`.
+
+---
+
+## Thanks
+
+To Retroplay for the WHDLoad archives, to the iGame artwork packs and their maintainers, and to the EAB community.
+
+This tool downloads publicly published archives. Make sure you're entitled to the games you use.

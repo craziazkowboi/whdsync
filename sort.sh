@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 # retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
+#
+# Purpose: Sorts games by variant and language, and makes filenames Amiga-safe.
+#   Options: -d/--dest DIR --ffs --pfs --skipchk --skip-variant-sort
+#            --detox/--no-detox --custom --help
+# Run 'sort.sh --help' for the authoritative, current list.
+#
 
 # Amiga Retroplay Archive Organizer & Sorter - Ultimate Edition
 # Compatible: macOS, Linux, Debian 12/13, Amiga A314
@@ -29,7 +35,6 @@
 
 set -euo pipefail
 
-version="3.0.0-ultimate"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -42,7 +47,7 @@ fi
 . "$SCRIPT_DIR/lib.sh"
 rp_load_config
 
-DEFAULT_DEST="${DEST:-$SCRIPT_DIR/retro}"
+DEFAULT_DEST="${DEST:-$RP_BUILD_ROOT/retro}"
 DEST_OVERRIDE=""
 DEST="$DEFAULT_DEST"
 OS_TYPE="$(uname -s)"
@@ -86,7 +91,7 @@ RUN_VARIANT_LANG_SORT=true
 
 print_sort_help() {
     echo "Amiga Retroplay Archive Organizer & Sorter - Ultimate Edition"
-    echo "Version: $version"
+    echo "Version: ${RP_SUITE_VERSION}"
     echo ""
     echo "Usage: $(basename "$0") [OPTIONS]"
     echo ""

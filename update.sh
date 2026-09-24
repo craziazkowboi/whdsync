@@ -1,5 +1,10 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
+#
+# Purpose: Mirrors the Retroplay archives into downloads/, queues what is new,
+#   retires superseded versions and tests new downloads.  Options: --dry-run --help
+# Run 'update.sh --help' for the authoritative, current list.
+#
 
 # Amiga Retroplay - Update Script
 #
@@ -44,6 +49,7 @@ for _arg in "$@"; do
         --dry-run) DRY_RUN=1 ;;
         -h|--help)
             echo "Usage: $(basename "$0") [--dry-run]"
+echo "  -h, --help   Show this help and exit."
             echo "  Mirrors the Retroplay WHDLoad packs from the FTP server, logs new"
             echo "  files to update.log and queues them for processing."
             echo "  --dry-run  Ask the server what WOULD be downloaded, without downloading."
@@ -98,21 +104,26 @@ required_art_dirs=(
   "TinyLauncher"
 )
 
-missing_art=0
-for d in "${required_art_dirs[@]}"; do
-  if [ ! -d "./$d" ]; then
-    missing_art=1
-    break
-  fi
+# Artwork check. The packs live in the artwork folder, as
+#   iGame_AGA/{laced,lores}/<Section>/...   iGame_RTG/<Section>/...
+# so a pack counts as present when any of those holds a Section folder.
+missing_art=""
+for d in AGA ECS RTG; do
+    found=""
+    for p in "$RP_ARTWORK_ROOT/iGame_$d"/Covers "$RP_ARTWORK_ROOT/iGame_$d"/Screens "$RP_ARTWORK_ROOT/iGame_$d"/Titles \
+             "$RP_ARTWORK_ROOT/iGame_$d"/lores/* "$RP_ARTWORK_ROOT/iGame_$d"/laced/*; do
+        [ -d "$p" ] && found=1 && break
+    done
+    [ -n "$found" ] || missing_art="$missing_art iGame_$d"
 done
 
-if [ "$missing_art" -ne 0 ]; then
-  echo "One or more iGame/TinyLauncher artwork directories (iGame_art, iGame_ECS, iGame_RTG, iGame_AGA, TinyLauncher) are missing in the directory where this script is run."
-  echo "iGame artwork packs can be downloaded from:"
-  echo "  https://eab.abime.net/showthread.php?t=106096"
+if [ -n "$missing_art" ]; then
+  echo "No artwork found yet for:$missing_art"
+  echo "Get it with:  ./start.sh --artwork-sync        (all of it)"
+  echo "         or:  ./start.sh --artwork-sync --for aga   (just one build)"
+  echo "Source:       $RP_ARTWORK_SOURCE_URL"
+  echo "See what it would do first:  ./start.sh --artwork-plan"
   echo
-  # Uncomment the next line if you want to force setting up artwork before running:
-  # exit 1
 fi
 
 dirs=(
@@ -187,11 +198,17 @@ fi
 
 # Folders built by older versions of these scripts are adopted now, so
 # anything downloaded below gets queued for them too.
+rp_migrate_layout
+# Everything below works inside the downloads folder, so paths recorded in
+# update.log and in the queues stay WHDLoad/... exactly as before.
+mkdir -p "$RP_DOWNLOAD_ROOT" || exit 4
+cd "$RP_DOWNLOAD_ROOT" || exit 4
 rp_restore_state_if_lost
 rp_adopt_configured_variants
 
 SECONDS=0
-logfile="update.log"
+mkdir -p "$RP_LOG_ROOT" 2>/dev/null
+logfile="$RP_LOG_ROOT/update.log"
 : > "$logfile"
 failed_dirs=()
 total_new_files=0   # grand total across every directory, printed in the final summary
@@ -233,7 +250,7 @@ do
     # the before/after listing) is what tells us which files are new OR were
     # re-published under the same name - and which ones actually completed.
     # Transient failures are retried with a growing pause.
-    dl_log="$SCRIPT_DIR/.wget_download.log"
+    dl_log="$RP_LOG_ROOT/.wget_download.log"
     : > "$dl_log"
     attempt=1
     while :; do

@@ -202,7 +202,22 @@ else
     fi
 fi
 
-# ---------------------------------------------------------------- 6. nightly
+# ---------------------------------------------------------------- 6. artwork
+step "6. Artwork packs"
+if [ -x "$SCRIPT_DIR/artwork_sync.sh" ]; then
+    _have=0
+    for _v in $RP_ARTWORK_PACKS; do [ -d "$RP_ARTWORK_ROOT/iGame_$(printf '%s' "$_v" | tr '[:lower:]' '[:upper:]')" ] && _have=1; done
+    if [ "$_have" -eq 1 ]; then ok "artwork already present in ${RP_ARTWORK_ROOT##*/}/"
+    elif [ "$DRY" -eq 1 ]; then echo "  + ./artwork_sync.sh --sync --all-artwork"
+    elif yes_to "Download the artwork packs now (a few hundred MB)?" "y"; then
+        if ./artwork_sync.sh --sync --all-artwork --yes; then ok "artwork installed"
+        else note "artwork could not be downloaded now - try later: ./start.sh --artwork-sync"; fi
+    else
+        ok "skipped - fetch it any time with ./start.sh --artwork-sync"
+    fi
+fi
+
+# ---------------------------------------------------------------- 7. nightly
 step "6. Nightly update"
 if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -q "retroplay-all-sh"; then
     ok "nightly run already installed"
@@ -224,7 +239,7 @@ else
 fi
 
 # ----------------------------------------------------------------- 7. check
-step "7. Checking everything"
+step "8. Checking everything"
 if [ "$DRY" -eq 1 ]; then echo "  + ./doctor.sh"; exit 0; fi
 ./doctor.sh; dst=$?
 echo

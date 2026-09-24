@@ -28,6 +28,27 @@ STRUCTURED_ART_SETS="AGA ECS RTG"
 # EXCLUDE_TAGS_ECS="AGA,CD32"
 # EXCLUDE_TAGS_ECS_LACED="AGA,CD32"
 
+# ---- Artwork packs (iGame_*, TinyLauncher) -------------------------------
+# Fetch artwork during a normal run: no | ask (by hand only) | auto | yes
+ARTWORK_SYNC="ask"
+ARTWORK_SOURCE_URL="https://ftp2.grandis.nu/turran/FTP/Collection/Various/WHDLoad_Images"
+# Variants whose artwork is kept up to date by default (each fetches the
+# three sections: Covers, Screens, Titles). Use aga-laced / ecs-laced for the
+# Laced flavour; plain aga/ecs use LoRes.
+ARTWORK_PACKS="AGA ECS RTG"
+# Others, on request only: ./start.sh --artwork-sync --set art
+ARTWORK_OPTIONAL_PACKS="AGA_Laced ECS_Laced art TinyLauncher"
+# If you've changed an artwork folder yourself:
+#   ask (keeps yours when unattended) | keep-local | backup-and-replace | fail
+ARTWORK_LOCAL_CHANGE_POLICY="ask"
+# If artwork can't be updated: warn-and-continue (keep old art, carry on) | fail
+ARTWORK_FAILURE_POLICY="warn-and-continue"
+ARTWORK_KEEP_BACKUPS=2
+ARTWORK_CHECK_INTERVAL_HOURS=24
+ARTWORK_VERIFY_DOWNLOADS="yes"
+# Where downloaded artwork archives are cached (not inside the live folders).
+ARTWORK_ARCHIVE_DIR="artwork_archive"
+
 # Amiga filename limits: pfs (107 characters) or ffs (30 characters).
 # For PFS, run  setfnsize <drive:> 107  on the Amiga first.
 FILESYSTEM="pfs"
@@ -58,6 +79,16 @@ KEEP_NEW_BATCHES=14
 
 # Days to keep superseded archives in old/ before deleting them.
 OLD_ARCHIVE_DAYS=30
+
+# Delete logs older than this many days; 0 keeps them for ever.
+LOG_RETENTION_DAYS=1
+
+# Folder names (or absolute paths). artwork/downloads/logs sit beside the
+# scripts; the builds go under OUTPUT_ROOT.
+ARTWORK_DIR="artwork"
+BUILD_DIR="build"
+DOWNLOAD_DIR="downloads"
+LOG_DIR="logs"
 
 # Nightly log (all_cron.log) rotation.
 LOG_MAX_MB=5

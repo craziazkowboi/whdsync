@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 # retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
+#
+# Purpose: The front end: a menu, and one place to reach every command.
+#   Options: --sync/--auto --plan --update --extract --merge --sort --quick
+#            --rebuild --status --test-notify --doctor --setup --schedule
+#            --artwork-status/-plan/-sync/-verify/-rollback  (see artwork_sync.sh)
+#            plus the variant and formatting options passed through to all.sh
+# Run 'start.sh --help' for the authoritative, current list.
+#
 
 # Amiga Retroplay Archive Minimal CLI Dispatcher
 # Copyright (c) 2025 Craziazkowboi
@@ -26,6 +34,80 @@ script_start_time=$(date +%s)
 # calls that only worked if you'd already cd'ed into the scripts' folder).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# --help is answered before any tool or locale checks (see below).
+SHOW_HELP_ONLY=0
+case "${1:-}" in -h|--help) SHOW_HELP_ONLY=1 ;; esac
+
+show_usage_and_exit() {
+
+      echo
+      echo "Amiga Retroplay Archive Minimal CLI Dispatcher"
+      echo "Version: ${RP_SUITE_VERSION}"
+      echo
+      echo "Usage: $(basename "$0") [options]"
+      echo
+      echo "Options (case-insensitive - --AGA and --aga both work):"
+      echo "  -h, --help            Show this help and exit."
+      echo "  --auto                Run full automation: update, extract, merge, sort."
+      echo "  --update              Only update archives."
+      echo "  --extract             Only extract archives."
+      echo "  --merge               Only merge artwork."
+      echo "  --sort                Only sort languages."
+      echo "  --quick               Only process new files (quick.sh)."
+      echo "  --ecs                 Run merge.sh with --ecs."
+      echo "  --aga                 Run merge.sh with --aga."
+      echo "  --rtg                 Run merge.sh with --rtg."
+      echo "  --ecs-laced           Run merge.sh with --ecs-laced (matches iGame_ECS_Laced)."
+      echo "  --aga-laced           Run merge.sh with --aga-laced (matches iGame_AGA_Laced)."
+      echo "  --set [name]          Run merge.sh with --set NAME (any iGame_NAME directory)."
+      echo "  --ffs                 Run sort.sh with --ffs (FFS filename limits)."
+      echo "  --pfs                 Run sort.sh with --pfs (PFS filename limits, default)."
+      echo "  --dest [path]         Set custom destination directory."
+      echo "  --art [order]         Set merge priority order for non-demos (e.g., Screens,Covers,Titles)."
+      echo "  --demo-art [order]    Set merge priority order for demos (e.g., Titles,Screens,Covers)."
+      echo "  --no-detox            Skip detox entirely - the startup dependency check and"
+      echo "                        the pre-clean step in sort.sh."
+      echo "  --skipchk             Run sort.sh with --skipchk (skip the Amiga filesystem"
+      echo "                        compliance check entirely)."
+      echo "  --skip-variant-sort   Run sort.sh with --skip-variant-sort (skip moving games"
+      echo "                        into CD32/AGA/NTSC/MT32/CDTV and language subfolders -"
+      echo "                        for when that reorganization was already done earlier"
+      echo "                        on a shared base tree)."
+      echo "  --rebuild             Rebuild from the archives already downloaded, without"
+      echo "                        checking for updates (with --auto's variant options)."
+      echo "  --clean               With --auto: check for updates, then rebuild from scratch."
+      echo "  --skip-update         With --auto: don't download; process what's already queued."
+      echo "  --force               With --auto: also fill in missing artwork when up to date."
+      echo "  --detox               Use detox even if retroplay.conf says USE_DETOX=no."
+      echo "  --report-missing FILE With --merge: list games that got no artwork in FILE."
+      echo "  --sync                Update and build (same as --auto)."
+      echo "  --plan                Show what a sync would do; changes nothing."
+      echo "  --setup               Run the setup helper."
+      echo "  --schedule [options]  Set up the nightly run (see install_cron.sh --help)."
+      echo "  --artwork-status      What artwork is installed and whether it's current."
+      echo "  --artwork-plan        What an artwork update would do; changes nothing."
+      echo "  --artwork-sync        Download and install newer artwork packs safely."
+      echo "  --artwork-verify      Check installed artwork (read-only)."
+      echo "  --artwork-rollback N  Put back the previous version of pack N."
+      echo "  --doctor              Check the setup and explain how to fix any problems."
+      echo "  --status              Show the last run, each variant's state, drive and schedule."
+      echo "  --test-notify         Send a test notification (ntfy/email from retroplay.conf)."
+      echo "  --debug               Enable debug output (also passed to extract.sh/merge.sh)."
+      echo "  --exit                Exit immediately."
+      echo
+  exit 0
+}
+
+# Artwork and helper commands are passed straight to the script that owns
+# them, so there is one implementation of each (see artwork_sync.sh).
+case "${1:-}" in
+    --artwork-status|--artwork-plan|--artwork-sync|--artwork-verify|--artwork-rollback)
+        _art_cmd="--${1#--artwork-}"; shift
+        exec "$SCRIPT_DIR/artwork_sync.sh" "$_art_cmd" "$@" ;;
+    --setup)    shift; exec "$SCRIPT_DIR/setup.sh" "$@" ;;
+    --schedule) shift; exec "$SCRIPT_DIR/install_cron.sh" "$@" ;;
+esac
+
 # Shared helpers (retroplay.conf settings, dependency tracking, pending
 # queues, disk-space checks...) live in lib.sh, next to this script.
 if [ ! -f "$SCRIPT_DIR/lib.sh" ]; then
@@ -42,7 +124,6 @@ ulimit -n 16384
 # DO NOT set -e here - we need to parse options first
 set -uo pipefail
 
-version="1.2.4 macOS 10.15.7 Compatible (no color)"
 
 ACTION=""
 MERGE_OPT=""
@@ -60,6 +141,7 @@ ONLY_MISSING_OPT=0
 SKIP_UPDATE=0
 CLEAN_OPT=0
 REBUILD_OPT=0        # --rebuild: rebuild from downloaded archives, no update check
+PLAN_ONLY=0          # --plan: show what would happen, change nothing
 FORCE_OPT=0          # --force: also run the artwork gap-fill on up-to-date variants
 REPORT_MISSING_OPT=""  # --report-missing FILE (passed to merge.sh)
 DETOX_EXPLICIT=""    # "yes"/"no" when --detox/--no-detox was given
@@ -170,6 +252,13 @@ offer_build_detox() {
   fi
   [ "$build_status" -eq 0 ] && command -v detox >/dev/null 2>&1
 }
+
+# Only showing the options? Then skip the tool and locale checks entirely -
+# checking (or offering to install) tools is a poor welcome for someone just
+# reading --help.
+if [ "${SHOW_HELP_ONLY:-0}" = "1" ]; then
+    show_usage_and_exit
+fi
 
 # ----- Tool dependency check (lha, 7z, unar detox) -----
 missing=()
@@ -318,7 +407,7 @@ while [ $# -gt 0 ]; do
     -h|--help)
       echo
       echo "Amiga Retroplay Archive Minimal CLI Dispatcher"
-      echo "Version: ${version}"
+      echo "Version: ${RP_SUITE_VERSION}"
       echo
       echo "Usage: $(basename "$0") [options]"
       echo
@@ -356,6 +445,15 @@ while [ $# -gt 0 ]; do
       echo "  --force               With --auto: also fill in missing artwork when up to date."
       echo "  --detox               Use detox even if retroplay.conf says USE_DETOX=no."
       echo "  --report-missing FILE With --merge: list games that got no artwork in FILE."
+      echo "  --sync                Update and build (same as --auto)."
+      echo "  --plan                Show what a sync would do; changes nothing."
+      echo "  --setup               Run the setup helper."
+      echo "  --schedule [options]  Set up the nightly run (see install_cron.sh --help)."
+      echo "  --artwork-status      What artwork is installed and whether it's current."
+      echo "  --artwork-plan        What an artwork update would do; changes nothing."
+      echo "  --artwork-sync        Download and install newer artwork packs safely."
+      echo "  --artwork-verify      Check installed artwork (read-only)."
+      echo "  --artwork-rollback N  Put back the previous version of pack N."
       echo "  --doctor              Check the setup and explain how to fix any problems."
       echo "  --status              Show the last run, each variant's state, drive and schedule."
       echo "  --test-notify         Send a test notification (ntfy/email from retroplay.conf)."
@@ -446,6 +544,15 @@ while [ $# -gt 0 ]; do
       DETOX_EXPLICIT=yes
       shift
       ;;
+    --sync)
+      ACTION="auto"
+      shift
+      ;;
+    --plan)
+      ACTION="auto"
+      PLAN_ONLY=1
+      shift
+      ;;
     --rebuild)
       ACTION="auto"
       REBUILD_OPT=1
@@ -519,7 +626,7 @@ unset opt_lc
 if [ -z "$ACTION" ]; then
   echo
   echo "Amiga Retroplay Archive Minimal CLI Dispatcher"
-  echo "Version: ${version}"
+  echo "Version: ${RP_SUITE_VERSION}"
   echo
   rp_print_status short
   echo
@@ -790,6 +897,7 @@ if [ "$ACTION" = "auto" ]; then
   [ "$SKIP_UPDATE" -eq 1 ] && engine_args+=(--skip-update)
   [ "$REBUILD_OPT" -eq 1 ] && engine_args+=(--rebuild)
   [ "$FORCE_OPT" -eq 1 ] && engine_args+=(--force)
+  [ "$PLAN_ONLY" -eq 1 ] && engine_args+=(--dry-run)
 
   DELEGATED_AUTO=1
   if ./all.sh "${engine_args[@]}"; then AUTO_EXIT=0; else AUTO_EXIT=$?; fi
@@ -827,6 +935,7 @@ elif [ "$ACTION" = "update" ]; then
   fi
   exit "$update_status"
 elif [ "$ACTION" = "extract" ]; then
+  mkdir -p "$RP_DOWNLOAD_ROOT" 2>/dev/null
   build_extract_args
   run_step "extract.sh" ./extract.sh "${extract_args[@]+"${extract_args[@]}"}"
 elif [ "$ACTION" = "sort" ]; then
@@ -862,10 +971,11 @@ fi
 # all_cron.log, which install_cron.sh sets up to accumulate cron output
 # right here via `>>`; sweeping that into retroerror.log and deleting it
 # would silently break the cron log the moment it existed.
-retro_log="retroerror.log"
+mkdir -p "$RP_LOG_ROOT" 2>/dev/null
+retro_log="$RP_LOG_ROOT/retroerror.log"
 log_files=()
-for f in extract_errors.log merge_errors.log sort.log amiga_filename_issues.log; do
-    [ -f "$f" ] && log_files+=("./$f")
+for f in "$RP_LOG_ROOT"/extract_errors.log "$RP_LOG_ROOT"/merge_errors.log "$RP_LOG_ROOT"/sort.log "$RP_LOG_ROOT"/amiga_filename_issues.log; do
+    [ -f "$f" ] && log_files+=("$f")
 done
 
 # Delete 0‑byte log files and keep non‑empty ones for merging
