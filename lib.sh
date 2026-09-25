@@ -77,6 +77,8 @@ rp_load_config() {
     RP_DOWNLOAD_DIR="downloads"   # holds WHDLoad/ HD_Loaders/ JST/ old/
     RP_LOG_DIR="logs"
     RP_LOG_RETENTION_DAYS="1"     # delete logs older than this; 0 = keep forever
+    RP_STATE_BACKUP="no"          # keep rolling copies of .retroplay? (yes/no)
+    RP_STATE_BACKUP_MAX_MB="50"   # if yes: skip when it would exceed this
     RP_CONFIG_WARNINGS=""
 
     [ -f "$RP_CONF_FILE" ] || { rp_finish_config; return 0; }
@@ -106,7 +108,7 @@ rp_load_config() {
             ARTWORK_SYNC|ARTWORK_SOURCE_URL|ARTWORK_ARCHIVE_DIR|ARTWORK_STATE_ROOT|ARTWORK_PACKS|\
             ARTWORK_OPTIONAL_PACKS|ARTWORK_KEEP_BACKUPS|ARTWORK_LOCAL_CHANGE_POLICY|\
             ARTWORK_VERIFY_DOWNLOADS|ARTWORK_FAILURE_POLICY|ARTWORK_CHECK_INTERVAL_HOURS|\
-            ARTWORK_DIR|BUILD_DIR|DOWNLOAD_DIR|LOG_DIR|LOG_RETENTION_DAYS)
+            ARTWORK_DIR|BUILD_DIR|DOWNLOAD_DIR|LOG_DIR|LOG_RETENTION_DAYS|STATE_BACKUP_MAX_MB|STATE_BACKUP)
                 printf -v "RP_$key" '%s' "$val" ;;
             ART_ORDER_[A-Z0-9_]*|EXCLUDE_TAGS_[A-Z0-9_]*)
                 printf -v "RP_$key" '%s' "$val" ;;
@@ -132,7 +134,7 @@ rp_finish_config() {
     : "${RP_MIN_FREE_MB:=1024}" "${RP_SPACE_FACTOR:=3}" "${RP_KEEP_NEW_BATCHES:=14}"
     : "${RP_OLD_ARCHIVE_DAYS:=30}" "${RP_LOG_MAX_MB:=5}" "${RP_LOG_KEEP:=4}"
     : "${RP_MAX_EXTRACT_ATTEMPTS:=3}" "${RP_DOWNLOAD_RETRIES:=3}" "${RP_GAPFILL_DAYS:=7}"
-    : "${RP_ARTWORK_KEEP_BACKUPS:=2}" "${RP_ARTWORK_CHECK_INTERVAL_HOURS:=24}" "${RP_LOG_RETENTION_DAYS:=1}"
+    : "${RP_ARTWORK_KEEP_BACKUPS:=2}" "${RP_ARTWORK_CHECK_INTERVAL_HOURS:=24}" "${RP_LOG_RETENTION_DAYS:=1}" "${RP_STATE_BACKUP_MAX_MB:=50}"
     # Artwork settings: check the words, and the pack names for anything unsafe.
     case "$RP_ARTWORK_SYNC" in ask|auto|yes|no) ;; *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}ARTWORK_SYNC must be ask, auto, yes or no - using ask
 "; RP_ARTWORK_SYNC=ask ;; esac
@@ -913,9 +915,32 @@ rp_check_output_root() {
 # so losing it doesn't mean losing what's queued. The newest 7 are kept.
 RP_BACKUP_DIR="$RP_BASE_DIR/.retroplay_backups"
 rp_backup_state() {
+    local skip
+    # Off by default: .retroplay holds only the queue and build markers, and
+    # if it is ever lost the next run simply rebuilds what it needs. Set
+    # STATE_BACKUP="yes" to keep the rolling copies.
+    [ "${RP_STATE_BACKUP:-no}" = "yes" ] || return 0
     [ -d "$RP_STATE_DIR" ] || return 0
     mkdir -p "$RP_BACKUP_DIR" 2>/dev/null || return 0
-    tar -czf "$RP_BACKUP_DIR/.state-new.tgz" --exclude='.retroplay/stage' -C "$RP_BASE_DIR" .retroplay 2>/dev/null \
+    # Only the small state: queues, build markers, artwork manifests. The
+    # bulky things that also live under .retroplay - previous artwork
+    # versions, staging and work folders - are NOT backed up: they can be
+    # gigabytes, and tarring them every run took many minutes on a Pi.
+    local kb
+    kb="$(rp_du_kb "$RP_STATE_DIR")"
+    for skip in "$RP_STATE_DIR/artwork/backups" "$RP_STATE_DIR/artwork/work" "$RP_STATE_DIR/stage"; do
+        [ -d "$skip" ] && kb=$(( kb - $(rp_du_kb "$skip") ))
+    done
+    if [ "${kb:-0}" -gt $(( ${RP_STATE_BACKUP_MAX_MB:-50} * 1024 )) ]; then
+        rp_warn "skipping the state backup: it would be $(( kb / 1024 )) MB (limit ${RP_STATE_BACKUP_MAX_MB:-50} MB)"
+        return 0
+    fi
+    tar -czf "$RP_BACKUP_DIR/.state-new.tgz" \
+        --exclude='.retroplay/stage' \
+        --exclude='.retroplay/artwork/backups' \
+        --exclude='.retroplay/artwork/work' \
+        --exclude='.retroplay/artwork/remote_cache' \
+        -C "$RP_BASE_DIR" .retroplay 2>/dev/null \
         && mv -f "$RP_BACKUP_DIR/.state-new.tgz" "$RP_BACKUP_DIR/state-$(date '+%Y%m%d-%H%M%S').tgz"
     rm -f "$RP_BACKUP_DIR/.state-new.tgz"
     ls -1 "$RP_BACKUP_DIR"/state-*.tgz 2>/dev/null | sort -r | awk 'NR > 7' | while IFS= read -r old; do rm -f "$old"; done
@@ -1138,6 +1163,101 @@ rp_prune_logs() {
     [ -d "$RP_LOG_ROOT" ] || return 0
     find "$RP_LOG_ROOT" -type f \( -name '*.log' -o -name '*.log.[0-9]' \) \
         -mtime +"$(( RP_LOG_RETENTION_DAYS - 1 ))" -exec rm -f {} + 2>/dev/null
+    return 0
+}
+
+
+# =============================================================================
+# 16. Keeping .retroplay small
+# =============================================================================
+# Run at the start of each run. Everything removed here is either left over
+# from an interrupted run or can be rebuilt; nothing that the next run needs
+# is touched.
+#
+#   KEPT (essential):  queue/          what is waiting to be installed
+#                      complete/       which collections are built, and where
+#                      building/       an interrupted build, so it gets redone
+#                      gapfill/        when artwork was last filled in
+#                      last_success/, last_run, output_root_id
+#                      extract_attempts.list, prune_exempt.list, user_path
+#                      artwork/manifests/   what artwork is installed
+#   KEPT, but capped:  artwork/backups/     previous artwork (ARTWORK_KEEP_BACKUPS)
+#   REMOVED:           stage/, artwork/work/    staging from an earlier run
+#                      artwork/remote_cache/ temporary listing downloads
+#                      artwork_changed/ markers already acted on
+#                      empty queue files, attempts for archives that are gone
+rp_tidy_state() {
+    local before after freed d n target keep
+    [ -d "$RP_STATE_DIR" ] || return 0
+    before="$(rp_du_kb "$RP_STATE_DIR")"
+
+    rm -rf "$RP_STATE_DIR/stage" "$RP_STATE_DIR/artwork/work" 2>/dev/null
+    rm -f "$RP_STATE_DIR/artwork/remote_cache"/.listing.raw.* 2>/dev/null
+    rm -rf "$RP_STATE_DIR/artwork_changed" 2>/dev/null
+
+    for d in "$RP_STATE_DIR"/queue/*.list; do            # empty queues
+        [ -f "$d" ] && [ ! -s "$d" ] && rm -f "$d"
+    done
+
+    # Attempt counts for archives that no longer exist (downloaded again, or
+    # retired) would otherwise linger for ever.
+    if [ -s "$RP_STATE_DIR/extract_attempts.list" ]; then
+        while IFS="$(printf '\t')" read -r n target; do
+            [ -n "$target" ] && [ -f "$RP_DOWNLOAD_ROOT/$target" ] && printf '%s\t%s\n' "$n" "$target"
+        done < "$RP_STATE_DIR/extract_attempts.list" | rp_atomic_write "$RP_STATE_DIR/extract_attempts.list"
+    fi
+
+    # Previous artwork versions: keep the configured number per pack.
+    keep="${RP_ARTWORK_KEEP_BACKUPS:-2}"
+    for d in "$RP_STATE_DIR"/artwork/backups/*; do
+        [ -d "$d" ] || continue
+        ls -1d "$d"/*/ 2>/dev/null | sort -r | awk -v k="$keep" 'NR > k' | while IFS= read -r old; do rm -rf "$old"; done
+        rmdir "$d" 2>/dev/null                            # nothing left to keep
+    done
+
+    after="$(rp_du_kb "$RP_STATE_DIR")"
+    freed=$(( ${before:-0} - ${after:-0} ))
+    if [ "$freed" -gt 1024 ]; then
+        rp_info "      tidied .retroplay: freed $(( freed / 1024 )) MB (kept the queue, build markers and artwork manifests)"
+    fi
+    return 0
+}
+
+# rp_remote_size <url>: the size the server reports, without downloading the
+# file (an HTTP HEAD). Prints nothing if the server doesn't say.
+rp_remote_size() {
+    local hdr
+    if command -v curl >/dev/null 2>&1; then hdr="$(curl -fsSLI -m 30 "$1" 2>/dev/null)"
+    elif command -v wget >/dev/null 2>&1; then hdr="$(wget -q -T 30 --spider --server-response "$1" 2>&1)"
+    else return 1; fi
+    printf '%s\n' "$hdr" | awk 'BEGIN{IGNORECASE=1} /^ *content-length:/ { gsub(/\r/,""); n=$2 } END { if (n) print n }'
+}
+
+# rp_file_size <file>
+rp_file_size() { [ -f "$1" ] && wc -c < "$1" 2>/dev/null | tr -d ' '; }
+
+# Printed at the end of a run when the collection is built for PFS. Amiga
+# PFS partitions default to 31-character filenames; WHDLoad names are longer,
+# and copying them onto a partition that hasn't been told to allow 107
+# characters can CORRUPT it.
+rp_pfs_reminder() {
+    [ "$(printf '%s' "${RP_FILESYSTEM:-pfs}" | tr '[:upper:]' '[:lower:]')" = "pfs" ] || return 0
+    printf '\n%s' "$RP_C_WARN"
+    echo "============================================================"
+    echo " IMPORTANT - before copying this collection to your Amiga"
+    echo "============================================================"
+    echo " These files are named for PFS, which allows long filenames."
+    echo " Your Amiga PFS partition must be told to allow them first:"
+    echo
+    echo "     setfnsize <drive:> 107"
+    echo
+    echo " for example:  setfnsize DH1: 107"
+    echo
+    echo " Copying long filenames onto a PFS partition that still has the"
+    echo " 31-character default CAN CORRUPT THAT PARTITION."
+    echo " (Set FILESYSTEM=\"ffs\" in retroplay.conf if you use FFS instead.)"
+    echo "============================================================"
+    printf '%s\n' "$RP_C_OFF"
     return 0
 }
 

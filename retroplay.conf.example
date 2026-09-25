@@ -80,6 +80,15 @@ KEEP_NEW_BATCHES=14
 # Days to keep superseded archives in old/ before deleting them.
 OLD_ARCHIVE_DAYS=30
 
+# Keep rolling copies of the .retroplay state folder? It only holds the
+# queue and build markers, and the next run rebuilds what it needs, so this
+# is off by default.
+STATE_BACKUP="no"
+
+# If STATE_BACKUP="yes": largest backup to make (MB). Backups cover the queue and build
+# markers only; previous artwork versions are never included.
+STATE_BACKUP_MAX_MB=50
+
 # Delete logs older than this many days; 0 keeps them for ever.
 LOG_RETENTION_DAYS=1
 

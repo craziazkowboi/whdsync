@@ -143,6 +143,8 @@ whdsync/
 │   ├── artwork_archive/         downloaded artwork archives
 │   └── old/                     superseded archives, kept for a while
 ├── logs/             deleted automatically after LOG_RETENTION_DAYS
+├── .retroplay/       state: the queue, what's built, artwork manifests
+│                     (tidied at the start of every run - only essentials stay)
 ├── reports/          one readable summary per run
 ├── retroplay.conf    your settings
 └── the scripts
@@ -173,6 +175,20 @@ Artwork comes from the Turran FTP mirror and is installed where the merge step e
 | `TinyLauncher.lha` | `artwork/TinyLauncher/…` |
 
 A plain `--aga` or `--ecs` build uses the **LoRes** artwork; `--aga-laced` and `--ecs-laced` use the **Laced** artwork; `--rtg` uses the RTG packs.
+
+**Refreshing artwork.** Every merge writes artwork from the packs' current version — `iGame.iff`, `iGame.data` and the rest — so updating a pack refreshes your collection. (Checking each file first was measured *slower* than simply writing it: 23 s against 11 s over 1500 games.)
+
+The nightly gap-fill only visits games that have no artwork yet. To refresh **every** game, including those:
+
+```bash
+./all.sh --refresh-artwork                    # every variant, every game
+./aga.sh --refresh-artwork                    # one variant
+./start.sh --merge --aga --refresh-artwork --dest build/retro_aga
+```
+
+Each merge reports what it did: which mode it is in, and how many artwork files were added and refreshed. To leave existing artwork alone, use `--only-missing`.
+
+**Artwork you already have is not downloaded twice.** Before fetching anything, the size of your cached archive is compared with the size the source reports (from its listing, or an HTTP header request — no download either way). Unchanged archives are reused.
 
 **Your own artwork is safe.** If you change a folder, or drop in a pack this tool didn't install, it is never overwritten automatically — see `ARTWORK_LOCAL_CHANGE_POLICY`. Put your own images in `artwork/iGame_art/` in whatever structure you like; they're used whenever a game has no artwork in the main packs.
 
@@ -208,9 +224,11 @@ Settings live in `retroplay.conf` beside the scripts. Copy `retroplay.conf.examp
 | `VARIANTS` | `aga ecs rtg` | Which collections to build |
 | `OUTPUT_ROOT` | `.` | Where `build/` goes — point this at a USB SSD |
 | `ART_ORDER` | `Covers,Screens,Titles` | Which artwork iGame shows first |
-| `FILESYSTEM` | `pfs` | Use `ffs` for the 30-character filename limit |
+| `FILESYSTEM` | `pfs` | Use `ffs` for the 30-character filename limit. With `pfs`, every run ends with a reminder to run `setfnsize <drive:> 107` on the Amiga first |
 | `ARTWORK_SYNC` | `ask` | `auto` also updates artwork in the nightly run |
 | `LOG_RETENTION_DAYS` | `1` | Delete logs after this many days; `0` keeps them for ever |
+| `ARTWORK_KEEP_BACKUPS` | `2` | Previous artwork versions kept for rollback |
+| `STATE_BACKUP` | `no` | Keep rolling copies of the state folder (queue and markers only) |
 | `NTFY_TOPIC` | *(empty)* | Get told when a run fails |
 
 See what's in force with `./start.sh --status`, and the full list in `retroplay.conf.example`.
@@ -233,7 +251,7 @@ It checks the whole setup and, for anything wrong, tells you the command that fi
 | "some archives couldn't be extracted" (exit 5) | A damaged download. Everything else was installed; it retries by itself, and after three attempts fetches a fresh copy |
 | "network or server problem" (exit 3) | The server was unreachable. It tries again next run |
 | "scripts are not from the same version" | Some files weren't updated. Copy the whole set across |
-| A game has no artwork | The packs genuinely lack it. `./start.sh --artwork-plan` shows whether newer artwork exists |
+| A game has no artwork | Ask why: `./merge.sh --why SuperSkidmarks -d build/retro_aga`. It lists every set and section it looked in, and anything in `artwork/` with a similar name |
 
 **Exit codes**, if you script around it: `0` done, `2` nothing to do, `3` network, `4` setup problem, `5` some archives failed, `130` interrupted.
 

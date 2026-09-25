@@ -284,10 +284,26 @@ planned_action() {
 # Download, validate, extract, install
 # =============================================================================
 download_archive() {   # <archive>; leaves a validated file in the cache
-    local archive="$1" url part
+    local archive="$1" url part have want
     url="$SOURCE_URL/$archive"; part="$CACHE_DIR/$archive.part"
     mkdir -p "$CACHE_DIR" || return 1
     rm -f "$part"
+
+    # Already downloaded? Compare what we have with the size the source
+    # reports - from the listing if it gave one, otherwise by asking the
+    # server for the headers only. Nothing is downloaded to make this check,
+    # so an archive that hasn't changed is never fetched twice.
+    have="$(rp_file_size "$CACHE_DIR/$archive")"
+    if [ -n "$have" ]; then
+        want="$(remote_field "$archive" 2)"
+        case "$want" in *[!0-9]*) want="" ;; esac       # listing sizes like "185M" are no use
+        [ -n "$want" ] || want="$(rp_remote_size "$url")"
+        if [ -n "$want" ] && [ "$have" = "$want" ]; then
+            rp_info "  $archive is already downloaded and unchanged ($(( have / 1048576 )) MB) - not fetching it again"
+            return 0
+        fi
+    fi
+
     rp_info "  downloading $archive"
     rp_fetch "$url" "$part" || { rm -f "$part"; rp_warn "could not download $archive - the current artwork is unchanged"; return 3; }
     if [ "$RP_ARTWORK_VERIFY_DOWNLOADS" = "yes" ] && ! rp_test_archive "$part" "$archive"; then

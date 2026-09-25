@@ -61,6 +61,9 @@ What to do:
                         checking for updates (same as --clean --skip-update)
   --clean               Check for updates, then rebuild from scratch
   --skip-update         Don't download; process whatever is already queued
+  --refresh-artwork     Refresh artwork for every game, including ones the
+                        nightly gap-fill would skip (artwork already in the
+                        collection is always rewritten from the packs)
   --force               Also run the artwork gap-fill on up-to-date variants
   --dry-run             Show what would happen, change nothing
   --status              Show the last run, each variant's state, drive, schedule
@@ -77,7 +80,9 @@ USAGE
 
 ORIG_ARGS="$*"
 VARIANT_ARGS=""; DEST_OVERRIDE=""
-CLEAN=0; SKIP_UPDATE=0; FORCE=0; DRY_RUN=0; CRON=0; DEBUG=0
+CLEAN=0; SKIP_UPDATE=0; FORCE=0
+REFRESH_ART=0        # --refresh-artwork: replace artwork already in the collection
+DRY_RUN=0; CRON=0; DEBUG=0
 ART_OVERRIDE=""; DEMO_ART_OVERRIDE=""; FS_OVERRIDE=""; DETOX_OVERRIDE=""
 
 while [ $# -gt 0 ]; do
@@ -92,6 +97,7 @@ while [ $# -gt 0 ]; do
         --rebuild)   CLEAN=1; SKIP_UPDATE=1; shift ;;
         --skip-update) SKIP_UPDATE=1; shift ;;
         --force)     FORCE=1; shift ;;
+        --refresh-artwork) REFRESH_ART=1; shift ;;
         --dry-run)   DRY_RUN=1; shift ;;
         --cron)      CRON=1; shift ;;
         --art)       rp_require_option_value "$1" "$#" "${2-}"; ART_OVERRIDE="$2"; shift 2 ;;
@@ -327,9 +333,11 @@ for i in "${!V_TOK[@]}"; do
     V_MFLAGS[$i]="$(rp_variant_merge_args "$tok" | tr '\n' ' ')"
 done
 
-# Leftovers from an interrupted run are only temporary copies - clear them.
+# Leftovers from an interrupted run are only temporary copies. The staging
+# folder lives under .retroplay and is cleared by rp_tidy_state in step 1,
+# which also reports how much it freed.
 if [ "$DRY_RUN" -eq 0 ]; then
-    rm -rf -- "$WORK_ROOT" "$STAGE_ROOT"
+    rm -rf -- "$WORK_ROOT"
     rm -f "$RP_LOG_ROOT/retroerror.log"
 fi
 
@@ -348,6 +356,10 @@ finish() {
         5) result="Finished, but some archives couldn't be extracted (exit 5: they'll be retried)" ;;
         *) result="FAILED (exit $st: $(rp_exit_meaning "$st"))${FAIL_REASON:+ - $FAIL_REASON}" ;;
     esac
+    # However the run ends - built something, nothing to do, or failed - the
+    # PFS filename warning is the last thing shown.
+    [ "$DRY_RUN" -eq 0 ] && rp_pfs_reminder
+
     # For the status view: the last run's result.
     rp_state_init
     printf 'code=%s\ntime=%s\nresult=%s\nreport=reports/%s.txt\n' "$st" "$(rp_ts)" "$result" "$RUN_TS" \
@@ -399,11 +411,17 @@ echo "${RP_C_DIM}Collection: $RP_BUILD_ROOT   Archives: $RP_DOWNLOAD_ROOT   Artw
 if [ "$DRY_RUN" -eq 0 ]; then
     rp_step 1 "$TOTAL_STEPS" "Checking the setup and the output drive"
     rp_restore_state_if_lost
+    printf '      checking the output folder is there...\n'
     rp_check_output_root || fail_with "$RP_EXIT_CONFIG" "the output folder isn't available (drive not mounted?) - nothing was changed"
+    printf '      tidying the folder layout if needed...\n'
     rp_migrate_layout      # only once the output drive is known to be there
+    printf '      tidying leftovers in .retroplay...\n'
+    rp_tidy_state
+    printf '      clearing old logs...\n'
     rp_prune_logs
+    printf '      backing up the queue and build markers...\n'
     rp_backup_state
-    rp_done "output folder ready, state backed up"
+    rp_done "ready"
 else
     rp_step 1 "$TOTAL_STEPS" "Checking the setup (plan only)"
     rp_check_output_root dry || rp_die "$RP_EXIT_CONFIG" "the output folder isn't available (drive not mounted?)"
@@ -506,6 +524,8 @@ for i in "${!V_TOK[@]}"; do
         V_WHY[$i]="folders in the wrong place ($(rp_layout_problems "${V_DEST[$i]}" | tr '\n' ' ' | sed 's/ $//')) - rebuilding it correctly"
     elif [ "$q" -gt 0 ]; then
         V_ACT[$i]=update; V_WHY[$i]="$q new archive(s) queued"
+    elif [ "$REFRESH_ART" -eq 1 ]; then
+        V_ACT[$i]=gapfill; V_WHY[$i]="up to date - refreshing the artwork for every game"
     elif [ "$FORCE" -eq 1 ]; then
         V_ACT[$i]=gapfill; V_WHY[$i]="up to date - artwork gap-fill only"
     elif rp_gapfill_due "${V_KEY[$i]}"; then
@@ -662,11 +682,13 @@ handle_failed() {
 }
 
 # merge_variant <index> <folder> [extra merge.sh options...]
-merge_variant() {
+merge_variant() {   # (adds --refresh-artwork when asked for)
     local i="$1" dir="$2"; shift 2
+    local refresh=""
+    [ "$REFRESH_ART" -eq 1 ] && refresh="--refresh-artwork"
     # shellcheck disable=SC2086
     ./start.sh --merge ${V_MFLAGS[$i]} --art "${V_ART[$i]}" --demo-art "$DEMO_ART" \
-        --dest "$dir" $DETOX_FLAG $DEBUG_FLAG "$@"
+        --dest "$dir" $DETOX_FLAG $DEBUG_FLAG $refresh "$@"
 }
 
 sort_folder() { ./start.sh --sort $FS_FLAG $DETOX_FLAG --dest "$1"; }
@@ -912,8 +934,12 @@ for g in ${G_SIG[@]+"${!G_SIG[@]}"}; do
         # Fill in artwork for anything in the collection still missing it.
         # (only when an artwork pack changed, or every GAPFILL_DAYS days)
         gapnote=""
-        if rp_gapfill_due "$key"; then
-            if merge_variant "$i" "$dest" --only-missing; then rp_gapfill_done "$key"
+        if [ "$REFRESH_ART" -eq 1 ] || rp_gapfill_due "$key"; then
+            gapmode="--only-missing"
+            [ "$REFRESH_ART" -eq 1 ] && gapmode=""      # every game, not just the gaps
+            echo "  refreshing artwork for $key..."
+            # shellcheck disable=SC2086
+            if merge_variant "$i" "$dest" $gapmode; then rp_gapfill_done "$key"
             else gapnote=" (artwork gap-fill reported errors - see retroerror.log)"; fi
         fi
         mark_success "$key"
@@ -935,8 +961,16 @@ for i in "${!V_TOK[@]}"; do
     [ "${V_ACT[$i]}" = gapfill ] || continue
     echo
     echo "===== ${V_KEY[$i]}: artwork gap-fill ====="
+    if [ "$REFRESH_ART" -eq 1 ]; then
+        echo "  refreshing artwork for ${V_KEY[$i]} (every game)..."
+        gapmode=""
+    else
+        echo "  filling in missing artwork for ${V_KEY[$i]}..."
+        gapmode="--only-missing"
+    fi
     miss="$REPORT_TMP.missing"; : > "$miss"
-    merge_variant "$i" "${V_DEST[$i]}" --only-missing --report-missing "$miss" || fail "artwork gap-fill for ${V_KEY[$i]} failed"
+    # shellcheck disable=SC2086
+    merge_variant "$i" "${V_DEST[$i]}" $gapmode --report-missing "$miss" || fail "artwork gap-fill for ${V_KEY[$i]} failed"
     rp_gapfill_done "${V_KEY[$i]}"
     mark_success "${V_KEY[$i]}"
     report "${V_KEY[$i]}: up to date - artwork gap-fill done; $(save_missing_list "$i" "$miss") game(s) still without artwork"

@@ -69,9 +69,13 @@ else
   BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m';
 fi
 DEBUG=0
+WHY_GAME=""      # --why NAME: explain how artwork is looked up for one game
 processed=0
 CUSTOM=0
 REPORT_MISSING=""  # --report-missing FILE: append each game that got no artwork
+REFRESH_ART=0    # --refresh-artwork: kept for compatibility - artwork is always refreshed now
+ART_NEW=0        # artwork files added
+ART_REPLACED=0   # artwork files replaced with the packs' current version
 ONLY_MISSING=0   # --only-missing: skip any target that already has an
                  # iGame.iff-family file AND a .data file - used for a
                  # cheap "fill gaps" pass over an existing collection
@@ -222,6 +226,10 @@ show_artwork_menu() {
 while [ $# -gt 0 ]; do
     opt_lc="${1,,}"
     case "$opt_lc" in
+        --why)
+            rp_require_option_value "$1" "$#" "${2-}"
+            WHY_GAME="$2"; shift 2
+            ;;
         --custom) CUSTOM=1; shift ;;
         --ecs) SET_OPT="ECS"; shift ;;
         --aga) SET_OPT="AGA"; shift ;;
@@ -251,6 +259,9 @@ while [ $# -gt 0 ]; do
         ;; 
         --a314) PLATFORM_HINT="a314"; shift ;;
         --only-missing) ONLY_MISSING=1; shift ;;
+        --refresh-artwork|--overwrite-artwork)
+            REFRESH_ART=1            # artwork is refreshed anyway; kept so the
+            shift ;;                 # option keeps working in scripts and cron
         --report-missing) rp_require_option_value "$1" "$#" "${2-}"; REPORT_MISSING="$2"; shift 2 ;;
         --debug) DEBUG=1; shift ;;
         -h|--help)
@@ -259,6 +270,8 @@ while [ $# -gt 0 ]; do
             echo "Version: 1.8.0-fallback-chain (Priority-ordered merge, dynamic artwork sets, tier fallback)"
             echo "Usage: $(basename "$0") [--custom] [--ecs|--aga|--rtg|--ecs-laced|--aga-laced|--set NAME] [-d DEST] [--art ORDER] [--debug]"
   echo "  -h, --help            Show this help and exit."
+  echo "  --why NAME            Explain where artwork for NAME was looked for, and"
+  echo "                        what is actually in the artwork folder."
             echo
             echo "Artwork sets:"
             echo "  Any directory named iGame_<NAME> next to this script is a usable artwork"
@@ -288,6 +301,9 @@ while [ $# -gt 0 ]; do
             echo "       Example: --demo-art \"Titles,Screens,Covers\""
             echo "  --a314            Hint: running on A314 (lower parallelism, fewer updates)"
             echo "  --only-missing    Skip any target that already has an iGame.iff-family file"
+            echo "  --refresh-artwork Accepted for compatibility: artwork in the collection is"
+            echo "                    always written from the packs' current version anyway."
+            echo "                    (Use --only-missing to leave existing artwork alone.)"
             echo "                    AND a .data file - a cheap pass to fill gaps in an existing"
             echo "                    collection (e.g. from an earlier interrupted run) rather"
             echo "                    than re-checking everything that's already merged."
@@ -422,9 +438,27 @@ for _base in AGA ECS; do
     fi
     if [ -d "$_dir/lores" ]; then
         IGAME_SET_DIR["$_base"]="$_dir/lores"
+        # Artwork installed the older, flat way (iGame_AGA/Covers/...) still
+        # counts: it is kept as an extra fallback right after the flavour
+        # folder, so games only present there keep their artwork.
+        for _sec in Covers Screens Titles; do
+            if [ -d "$_dir/$_sec" ]; then
+                IGAME_SET_DIR["${_base}_FLAT"]="$_dir"
+                break
+            fi
+        done
     fi
 done
 unset _base _dir
+
+# Put each "_FLAT" fallback directly after the set it belongs to.
+_chain_with_flat=()
+for _c in "${FALLBACK_CHAIN[@]}"; do
+    _chain_with_flat+=("$_c")
+    [ -n "${IGAME_SET_DIR[${_c}_FLAT]:-}" ] && _chain_with_flat+=("${_c}_FLAT")
+done
+FALLBACK_CHAIN=("${_chain_with_flat[@]}")
+unset _chain_with_flat _c
 
 # Append any other discovered iGame_* sets not already in the chain, so a
 # fresh iGame_MyPack directory is still tried as a last resort even though
@@ -449,6 +483,10 @@ debug_log "Artwork fallback chain: ${FALLBACK_CHAIN[*]}"
 # -----------------------------------------------------------------------------
 
 declare -A IGAME_INDEX
+# Same index keyed by lower-case game name: packs and the Retroplay archives
+# occasionally differ only in capitalisation, and an exact-only match would
+# report those games as having no artwork.
+declare -A IGAME_INDEX_LC
 
 index_source() {
     local src_key="$1" src_root="$2"
@@ -481,6 +519,8 @@ index_source() {
                             # Only keep the first hit per source+section+game
                             if [ -z "${IGAME_INDEX[$key]+_}" ]; then
                                 IGAME_INDEX["$key"]="$game_dir"
+                                _lckey="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')"
+                                [ -n "${IGAME_INDEX_LC[$_lckey]:-}" ] || IGAME_INDEX_LC["$_lckey"]="${IGAME_INDEX[$key]}"
                             fi
                         done < <(find "$base_path" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
                     done
@@ -512,6 +552,8 @@ index_source_any() {
         key="$src_key|$sec|${dir##*/}"
         if [ -z "${IGAME_INDEX[$key]+_}" ]; then
             IGAME_INDEX["$key"]="$dir"
+            _lckey="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')"
+            [ -n "${IGAME_INDEX_LC[$_lckey]:-}" ] || IGAME_INDEX_LC["$_lckey"]="${IGAME_INDEX[$key]}"
             added=$((added + 1))
         fi
     done < <(find "$src_root" -type f -iname 'igame.iff' 2>/dev/null | sort)
@@ -635,34 +677,13 @@ echo -e "${BOLD}==========================================${NC}"
 echo
 
 whdload_path="$DEST/WHDLoad"
-whdload_dirs=()
-# A game is a folder with its matching "<name>.info" icon beside it - the
-# WHDLoad convention. That skips the category folders (Games, Demos, ...),
-# the letter folders (A, B, C ...) and any variant/language folders, which
-# used to be counted as games and reported as "no artwork" in their
-# thousands. Folders INSIDE a game (data, save, ...) are skipped too: once a
-# game is found, nothing below it is treated as another game.
-#
-# Depth 8 covers the deepest real case: WHDLoad/Languages/German/Games/G/Game.
-_prev=""
-while IFS= read -r dir; do
-    [ -e "${dir}.info" ] || continue
-    if [ -n "$_prev" ]; then
-        case "$dir/" in
-            "$_prev"/*) continue ;;      # inside a game already matched
-        esac
-    fi
-    whdload_dirs+=( "$dir" )
-    _prev="$dir"
-done < <(find "$whdload_path" -mindepth 1 -maxdepth 8 -type d 2>/dev/null | LC_ALL=C sort)
-unset _prev
-
-total_dirs="${#whdload_dirs[@]}"
-[ "$total_dirs" -eq 0 ] && { echo "ERROR: No game subdirectories found under WHDLoad."; exit 1; }
+# (the game list itself is built below, by one rule - see "What counts as a
+# game" - and the count comes from it, so the number reported here is
+# exactly the number of games processed.)
 
 start_time="$(date +%s)"
 
-echo "Found $total_dirs WHDLoad subdirectories to merge."
+# (count printed once the game list is built, below)
 echo
 
 ERROR_LOG="/tmp/artwork_merger_errors.$$"
@@ -687,35 +708,107 @@ trap 'rm -f "$ERROR_LOG" "$IGAMEECS_LOG" "$TINYLAUNCHER_LOG"' EXIT
 trap 'echo -e "\nAborted. Cleaning up..."; pkill -P $$ 2>/dev/null; exit 130' INT TERM
 
 merge_targets=()
-while IFS= read -r -d '' dir; do
-    base="${dir##*/}"
 
-    # Skip known non-game helper directories
-    case "$base" in
-        data|Data|txt|TXT|info|Info|cfg|CFG)
-            debug_log "Skipping helper directory: $dir"
-            continue
-            ;;
+# What counts as a game
+# ---------------------
+# A game is a drawer with its own "<name>.info" icon (the WHDLoad
+# convention), that is NOT itself inside another game. That rules out:
+#   * category and letter folders (Games/, Demos/, S/ ...) - no icon
+#   * drawers inside a game (data/, Maps/, Docs/, MapsFr/CATACOMBES) - they
+#     ship icons too, which is why they used to be reported as missing
+#     artwork in their hundreds
+# Some archives wrap the game in a versioned folder, e.g.
+#   Might&Magic3_v1.2_2346/Might&Magic3/ ,  Elvira_v1.4_De_0474/ElviraDe/
+# The wrapper has an icon but no .slave; the game inside has both. In that
+# case the inner folder is the game, so artwork is looked up under the name
+# the artwork packs actually use.
+# A game installed without an icon at all is still picked up when it sits
+# directly in a letter folder under a category.
+_inside_a_game() {                 # any ancestor with its own icon?
+    local p="${1%/*}"
+    while [ -n "$p" ] && [ "$p" != "$whdload_path" ] && [ "$p" != "/" ]; do
+        [ -e "$p.info" ] && return 0
+        p="${p%/*}"
+    done
+    return 1
+}
+_in_letter_folder() {              # .../<category>/<letter>/<this>
+    local parent="${1%/*}" letter cat
+    letter="${parent##*/}"; cat="${parent%/*}"; cat="${cat##*/}"
+    case "$cat" in
+        Games|Demos|Magazines|Beta|Game|Demo|Magazine) [ "${#letter}" -le 2 ] && return 0 ;;
     esac
+    return 1
+}
+_unwrap_game() {                   # follow a versioned wrapper to the game
+    local d="$1" kids files n child
+    while :; do
+        # A wrapper holds nothing but the game folder: no files of its own
+        # (no .slave, no icons for anything else). A real game always has
+        # files, so this never walks into data/, Maps/ or Docs/.
+        kids=0; files=0; child=""
+        for n in "$d"/* "$d"/.[!.]*; do
+            [ -e "$n" ] || continue
+            if [ -d "$n" ]; then
+                [ -e "$n.info" ] || continue
+                kids=$((kids + 1)); child="$n"
+            else
+                case "$n" in
+                    *.info) [ -d "${n%.info}" ] || files=$((files + 1)) ;;   # icon for a drawer is not a file of its own
+                    *) files=$((files + 1)) ;;
+                esac
+            fi
+        done
+        { [ "$kids" -eq 1 ] && [ "$files" -eq 0 ]; } || break
+        d="$child"
+    done
+    printf '%s\n' "$d"
+}
 
-    merge_targets+=( "$dir" )
-done < <(find "$whdload_path" -mindepth 1 -maxdepth 4 -type d -print0 2>/dev/null)
+while IFS= read -r dir; do
+    _inside_a_game "$dir" && continue
+    if [ -e "${dir}.info" ] || _in_letter_folder "$dir"; then
+        merge_targets+=( "$(_unwrap_game "$dir")" )
+    fi
+done < <(find "$whdload_path" -mindepth 1 -maxdepth 8 -type d 2>/dev/null | LC_ALL=C sort)
 
-# Games that sort.sh has already moved into variant/language subfolders sit
-# deeper than the 4 levels scanned above (e.g. WHDLoad/Languages/German/AGA/
-# Games/S/SomeGame is 7 levels down) - this matters now that all.sh sorts
-# BEFORE merging. Those are found by the WHDLoad drawer-icon convention:
-# every extracted game directory "X" ships with an "X.info" icon beside it,
-# which also cleanly excludes structural folders (AGA/, Languages/, S/ ...)
-# and folders inside a game. The scan above is left exactly as it was, so
-# nothing that used to get artwork can stop getting it.
-while IFS= read -r -d '' _info; do
-    _gd="${_info%.*}"
-    [ -d "$_gd" ] && merge_targets+=( "$_gd" )
-done < <(find "$whdload_path" -mindepth 5 -maxdepth 8 -type f -iname '*.info' -print0 2>/dev/null)
-unset _info _gd
+# --why NAME: show exactly where this game's artwork was looked for.
+if [ -n "$WHY_GAME" ]; then
+    echo
+    echo "Looking up artwork for: $WHY_GAME"
+    echo "Artwork folder: $RP_ARTWORK_ROOT"
+    echo "Sets tried, in order:"
+    for _c in "${FALLBACK_CHAIN[@]}"; do
+        _d="${IGAME_SET_DIR[$_c]:-}"
+        if [ -z "$_d" ]; then printf '  %-12s (no folder for this set)\n' "$_c"; continue; fi
+        printf '  %-12s %s\n' "$_c" "$_d"
+        for _sec in $(printf '%s' "$GAME_ART_PRIORITY" | tr ',' ' ') Any; do
+            _k="$_c|$_sec|$WHY_GAME"
+            if [ -n "${IGAME_INDEX[$_k]:-}" ]; then
+                printf '      %-8s FOUND: %s\n' "$_sec" "${IGAME_INDEX[$_k]}"
+            else
+                printf '      %-8s not in this set\n' "$_sec"
+            fi
+        done
+    done
+    echo
+    echo "Anything in the artwork folder with a similar name:"
+    find "$RP_ARTWORK_ROOT" -maxdepth 8 -iname "*${WHY_GAME}*" 2>/dev/null | head -20 | sed 's|^|  |'
+    echo "  (nothing else found)"
+    echo
+    echo "And in the collection:"
+    find "$DEST" -maxdepth 8 -iname "*${WHY_GAME}*" 2>/dev/null | head -10 | sed 's|^|  |'
+    exit 0
+fi
 
 total_targets="${#merge_targets[@]}"
+[ "$total_targets" -eq 0 ] && { echo "ERROR: No games found under WHDLoad (a game is a folder with its matching .info icon)."; exit 4; }
+echo "Found $total_targets game(s) to check for artwork."
+if [ "$ONLY_MISSING" -eq 1 ]; then
+    echo "Mode: filling gaps only - games that already have artwork are skipped."
+else
+    echo "Mode: refreshing - artwork is written from the packs' current version."
+fi
 
 shopt -s nullglob
 # Given best_dir/best_section/best_src already set (by searching
@@ -724,11 +817,20 @@ shopt -s nullglob
 # copied there (the game is considered handled), 1 otherwise - in which
 # case the caller should keep looking elsewhere (TinyLauncher, or any
 # further fallback-chain entries) rather than treat this as done.
+# art_should_copy <source> <destination>
+# Always copy. Checking first (timestamps, then sizes) was measured SLOWER
+# than simply copying: on 1500 games, checking took 23s against 11s for
+# copying, because each comparison spawns processes while a copy is one.
+# So artwork in the collection is always the artwork packs' current version.
+# (Use --only-missing if you want games that already have artwork skipped.)
+art_should_copy() { return 0; }
+
 try_copy_matched_artwork() {
     [ -n "$best_dir" ] && [ -d "$best_dir" ] || return 1
 
     # 1) Copy all non-IFF artwork files from this section into the game dir
-    #    Preserve original names; skip any that already exist.
+    #    Preserve original names; replace one already there only when the
+    #    pack's copy is newer or bigger (see art_should_copy).
     for f in "$best_dir"/*; do
         [ -f "$f" ] || continue
         base="${f##*/}"
@@ -739,7 +841,8 @@ try_copy_matched_artwork() {
             *.iff) continue ;;  # handled separately below
         esac
         dest_file="$dest_sub/$base"
-        if [ ! -e "$dest_file" ]; then
+        if art_should_copy "$f" "$dest_file"; then
+            [ -e "$dest_file" ] && ART_REPLACED=$((ART_REPLACED + 1)) || ART_NEW=$((ART_NEW + 1))
             debug_log " Non-IFF copy: $base -> ${dest_file##*/}"
             if ! cp -p "$f" "$dest_file" 2>/dev/null; then
                 echo "ERROR copying non-IFF $best_section for $dest_name from $f" >> "$ERROR_LOG"
@@ -788,13 +891,15 @@ try_copy_matched_artwork() {
     if cp -f "$chosen_src_iff" "$dest_file" 2>/dev/null; then
         igameecs_found=1
 
-        # 3) Paired .data handling: same stem as chosen_src_iff, only if missing in target
+        # 3) Paired .data handling: same stem as chosen_src_iff. Written when
+        #    missing, or always with --refresh-artwork.
         src_stem="${chosen_src_iff%.*}"
         data_src="${src_stem}.data"
         if [ -f "$data_src" ]; then
             data_base="${data_src##*/}"
             data_dst="$dest_sub/$data_base"
-            if [ ! -e "$data_dst" ]; then
+            if art_should_copy "$data_src" "$data_dst"; then
+                [ -e "$data_dst" ] && ART_REPLACED=$((ART_REPLACED + 1)) || ART_NEW=$((ART_NEW + 1))
                 debug_log " Paired .data copy: $data_base -> ${data_dst##*/}"
                 if ! cp -p "$data_src" "$data_dst" 2>/dev/null; then
                     echo "ERROR copying .data for $dest_name from $data_src" >> "$ERROR_LOG"
@@ -889,6 +994,10 @@ for dest_sub in "${merge_targets[@]}"; do
         [ "$_fbc" = "TINYLAUNCHER" ] && break
         for section in "${ART_ORDER[@]}" Any; do
             key="$_fbc|$section|$dest_name"
+            if [ -z "${IGAME_INDEX[$key]:-}" ]; then      # try ignoring capitalisation
+                _lck="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')"
+                [ -n "${IGAME_INDEX_LC[$_lck]:-}" ] && IGAME_INDEX["$key"]="${IGAME_INDEX_LC[$_lck]}"
+            fi
             if [ -n "${IGAME_INDEX[$key]+_}" ]; then
                 best_section="$section"
                 best_dir="${IGAME_INDEX[$key]}"
@@ -959,6 +1068,10 @@ for dest_sub in "${merge_targets[@]}"; do
             fi
             for section in "${ART_ORDER[@]}" Any; do
                 key="$_fbc|$section|$dest_name"
+            if [ -z "${IGAME_INDEX[$key]:-}" ]; then      # try ignoring capitalisation
+                _lck="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')"
+                [ -n "${IGAME_INDEX_LC[$_lck]:-}" ] && IGAME_INDEX["$key"]="${IGAME_INDEX_LC[$_lck]}"
+            fi
                 if [ -n "${IGAME_INDEX[$key]+_}" ]; then
                     best_section="$section"
                     best_dir="${IGAME_INDEX[$key]}"
@@ -1015,6 +1128,8 @@ echo "Demo art order: $DEMO_ART_PRIORITY"
 echo "Elapsed Time: $fmt_time"
 echo "iGame artwork merged: $igameecs_count"
 echo "TinyLauncher screenshots: $tinylauncher_count"
+echo "Artwork files added: $ART_NEW"
+echo "Artwork files refreshed: $ART_REPLACED"
 echo "Copy errors: $errors"
 echo -e "${BOLD}====================================================${NC}"
 

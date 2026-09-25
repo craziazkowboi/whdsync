@@ -1,5 +1,48 @@
 # Changelog
 
+## 2026.09.24 (artwork refresh)
+### Changed
+- Artwork in the collection is now always written from the packs' current version, `iGame.data` included. Checking each file first (timestamps, then sizes) was measured slower than simply writing it - 23s against 11s over 1500 games - so the checks are gone.
+- `--refresh-artwork` now means "refresh every game", including ones the nightly gap-fill would skip. It works from `all.sh`, the `aga/ecs/rtg` wrappers, `start.sh --merge` and `merge.sh`.
+- Merge reports its mode ("refreshing" or "filling gaps only") and counts the artwork files added and refreshed. `all.sh` says which variant it is refreshing.
+
+## 2026.09.24 (backups, artwork refresh, PFS warning)
+### Changed
+- The `.retroplay` state folder is no longer backed up. It holds only the queue and build markers, and the next run rebuilds what it needs. Set `STATE_BACKUP="yes"` to keep the rolling copies.
+
+### Added
+- Artwork files already in the collection (including `iGame.data`) are refreshed automatically when the pack's copy is newer, or the same age but bigger. The two timestamp tests are shell built-ins, and sizes are only compared when timestamps match, so this costs nothing on the usual "already up to date" run (checking sizes for every file would have taken a 6s merge to 22s over 1500 games).
+- `--refresh-artwork` (on `all.sh`, `start.sh --merge` and `merge.sh`): replaces artwork already in the collection, including `iGame.data` and other artwork files. `iGame.iff` was already replaced on every merge.
+- Artwork archives already downloaded are not fetched again: the cached file's size is compared with the size the source reports, from its listing or an HTTP header request, before anything is downloaded.
+- Every run built for PFS now ends with a prominent reminder to run `setfnsize <drive:> 107` on the Amiga partition first, warning that copying long filenames without it can corrupt the partition.
+
+## 2026.09.24 (state tidy-up)
+### Added
+- `.retroplay` is tidied at the start of every run. Removed: staging and artwork work folders left by an interrupted run, temporary listing downloads, markers already acted on, empty queue files, and attempt counts for archives that no longer exist. Previous artwork versions are trimmed to `ARTWORK_KEEP_BACKUPS`. Kept: the queue, build markers, what is complete, gap-fill stamps and artwork manifests. It reports how much it freed.
+
+## 2026.09.24 (startup speed)
+### Fixed
+- Step 1 could sit silent for many minutes on a Pi. The state backup tarred the WHOLE `.retroplay` folder, which now holds previous artwork versions - gigabytes, gzipped on every run, seven copies kept. It now backs up only the small state (queues, build markers, artwork manifests) and skips anything over `STATE_BACKUP_MAX_MB` (50) with a warning. A 16 MB test case went to 8 KB.
+- Step 1 now reports each thing it does (checking the drive, tidying folders, clearing logs, backing up), so it is never silent.
+
+## 2026.09.24 (artwork message)
+### Fixed
+- The "artwork directories are missing" notice was out of date: it listed a fixed set of folder names, looked in the wrong place, and pointed at a forum thread even though the packs are now downloaded and installed automatically. It now names exactly which packs and flavours are missing (e.g. `iGame_AGA/laced`, `TinyLauncher`), says they will be fetched for you - or, with `ARTWORK_SYNC=auto`, that it happens during this run - and stays quiet once the artwork is there. Artwork installed the older flat way counts as present.
+
+## 2026.09.24 (artwork matching)
+### Fixed
+- Artwork whose folder differs only in capitalisation (`SUPERSKIDMARKS` vs `SuperSkidmarks`) was reported as missing. Matching now falls back to a case-insensitive lookup.
+- Artwork installed the older flat way (`iGame_AGA/Covers/...`) was ignored once `lores/` and `laced/` existed. The flat folder is kept as a fallback straight after the flavour folder.
+
+### Added
+- `merge.sh --why NAME`: explains where artwork for one game was looked for - every set and section tried, plus anything in the artwork folder with a similar name.
+
+## 2026.09.24 (artwork lookup)
+### Fixed
+- merge.sh reported hundreds of games as having no artwork when they were not games at all. Two separate scans were still in use: every folder 1-4 levels down, plus every `.info` 5-8 levels down. WHDLoad archives ship icons for drawers *inside* a game (`data`, `Maps`, `Docs`, `MapsFr/CATACOMBES`), so those were each treated as a game and reported.
+- One rule now decides: a game is a folder with its matching `.info` icon that is not itself inside another game. Category folders, letter folders and in-game drawers are excluded, and the count reported is the number of games actually processed.
+- Archives that wrap the game in a versioned folder (`Might&Magic3_v1.2_2346/Might&Magic3`, `Elvira_v1.4_De_0474/ElviraDe`) resolve to the game inside, so their artwork is found instead of being reported missing. A wrapper is recognised by holding nothing but the game folder, so a real game is never mistaken for one.
+
 ## 2026.09.24 (usability)
 ### Fixed
 - `all.sh` appeared to hang for minutes before "Checking for updates": the artwork check fingerprinted every installed pack using one process per file. It now uses a single batched listing - 8s to under 1s for 3,000 files, and far more on a real pack. Every startup step also announces itself with the time.

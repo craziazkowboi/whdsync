@@ -140,6 +140,7 @@ SKIP_VARIANT_SORT_OPT=0
 ONLY_MISSING_OPT=0
 SKIP_UPDATE=0
 CLEAN_OPT=0
+MERGE_EXTRA_ARGS=()  # extra options passed straight to merge.sh
 REBUILD_OPT=0        # --rebuild: rebuild from downloaded archives, no update check
 PLAN_ONLY=0          # --plan: show what would happen, change nothing
 FORCE_OPT=0          # --force: also run the artwork gap-fill on up-to-date variants
@@ -586,6 +587,10 @@ while [ $# -gt 0 ]; do
       SKIP_VARIANT_SORT_OPT=1
       shift
       ;;
+    --refresh-artwork|--overwrite-artwork)
+      MERGE_EXTRA_ARGS+=(--refresh-artwork)
+      shift
+      ;;
     --only-missing)
       ONLY_MISSING_OPT=1
       shift
@@ -800,6 +805,7 @@ run_sub() {
 #
 build_merge_args() {
   merge_args=()
+  [ "${#MERGE_EXTRA_ARGS[@]}" -gt 0 ] && merge_args+=("${MERGE_EXTRA_ARGS[@]}")
   [ -n "$MERGE_OPT" ] && merge_args+=("$MERGE_OPT")
   [ -n "$SET_OPT" ] && merge_args+=(--set "$SET_OPT")
   [ -n "$ART_ORDER_OPT" ] && merge_args+=(--art "$ART_ORDER_OPT")

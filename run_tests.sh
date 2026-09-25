@@ -31,6 +31,8 @@ check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 # Fixture setup: a failure here is a broken test environment, not a failed
 # test - stop immediately with a clear setup error.
 setup() { "$@" || { echo "SETUP ERROR (test fixture could not be created): $*" >&2; exit 3; }; }
+# acfg KEY VALUE - change one setting in the test's retroplay.conf
+acfg() { grep -v "^$1=" "$ROOT/retroplay.conf" > "$ROOT/.c.tmp"; printf '%s=%s\n' "$1" "$2" >> "$ROOT/.c.tmp"; mv "$ROOT/.c.tmp" "$ROOT/retroplay.conf"; }
 section() { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/retroplay_tests.XXXXXX")"
@@ -543,6 +545,7 @@ check "drive back: runs normally again" '[ "$st" -eq 0 ] || [ "$st" -eq 2 ]'
 cp "$T/conf.bak" "$ROOT/retroplay.conf"
 
 section "23. State backups, and automatic restore if the state folder is lost"
+acfg STATE_BACKUP '"yes"'      # off by default; this section tests the feature itself
 server_add WHDLoad/Games/Q/QueuedGame_v1.0.lha
 run q_upd ./update.sh
 run q_rtg ./all.sh --skip-update --variants rtg          # takes a backup; aga/ecs keep QueuedGame queued
@@ -552,6 +555,7 @@ run restore ./all.sh --skip-update --variants aga; st=$?
 check "lost state folder is restored, and its queued download still gets installed" \
   '[ "$st" -eq 0 ] && grep -q "restored it from" "$T/restore.log" && [ -n "$(game retro_aga QueuedGame)" ]'
 run drain ./all.sh --skip-update
+acfg STATE_BACKUP '"no"'
 
 section "24. Artwork gap-fill runs only when artwork changed (or weekly)"
 run gap0 ./all.sh --skip-update --variants ecs; st=$?
@@ -638,7 +642,6 @@ check "running it again changes nothing (no new installs)" '[ "$(wc -l < "$SM/ap
 
 
 section "29. Artwork: the published archives, mapped into the right folders"
-acfg() { grep -v "^$1=" "$ROOT/retroplay.conf" > "$ROOT/.c.tmp"; printf '%s=%s\n' "$1" "$2" >> "$ROOT/.c.tmp"; mv "$ROOT/.c.tmp" "$ROOT/retroplay.conf"; }
 acfg ARTWORK_SOURCE_URL '"http://mock/WHDLoad_Images"'
 acfg ARTWORK_LOCAL_CHANGE_POLICY '"keep-local"'
 rm -rf "$ROOT/artwork/iGame_AGA" "$ROOT/artwork/iGame_ECS" "$ROOT/artwork/iGame_RTG" "$ROOT/artwork/TinyLauncher"
@@ -785,6 +788,8 @@ rm -rf "$ROOT/.retroplay/artwork/manifests"
 : > "$MOCK/art_downloads"
 rm -rf "$ROOT/artwork/iGame_AGA" "$ROOT/artwork/iGame_ECS" "$ROOT/artwork/iGame_RTG" "$ROOT/artwork/TinyLauncher"
 run artdefault ./artwork_sync.sh --sync --yes; st=$?
+rm -rf "$ROOT/downloads/artwork_archive"      # force a real fetch for this check
+run artdefault2 ./artwork_sync.sh --sync --yes; st=$?
 check "with no --for, both flavours AND TinyLauncher are fetched" \
   '[ "$st" -eq 0 ] && [ "$(grep "_Laced" "$MOCK/art_downloads" | sort -u | grep -c .)" -eq 6 ] && [ "$(grep "_LoRes" "$MOCK/art_downloads" | sort -u | grep -c .)" -eq 6 ] && grep -q "download TinyLauncher.lha" "$MOCK/art_downloads"'
 check "the Laced folders are created alongside lores" \
@@ -809,7 +814,7 @@ for g in Superfrog Zool Apidya Nothing; do
 done
 ( cd "$MG" && bash merge.sh --aga -d build/retro_aga --report-missing missing.txt ) > "$T/mergereal.log" 2>&1
 check "only real games are counted - not category, letter or in-game folders" \
-  'grep -q "Found 4 WHDLoad subdirectories" "$T/mergereal.log"'
+  'grep -q "Found 4 game(s) to check for artwork" "$T/mergereal.log"'
 check "AGA build uses the lores artwork" '[ "$(cat "$MG/build/retro_aga/WHDLoad/Games/S/Superfrog/iGame.iff")" = "AGA-lores-Covers" ]'
 check "fallbacks still work (RTG pack, then the art pack)" \
   '[ -f "$MG/build/retro_aga/WHDLoad/Games/Z/Zool/iGame.iff" ] && [ "$(cat "$MG/build/retro_aga/WHDLoad/Games/A/Apidya/iGame.iff")" = ART-Apidya ]'
@@ -821,8 +826,205 @@ check "--aga-laced uses the laced artwork" '[ "$(cat "$MG/build/retro_aga/WHDLoa
 
 section "35. Saved backups can be cleared at the end of a hands-on run"
 run nobk ./all.sh --skip-update --variants aga; st=$?
-check "an unattended run never asks and keeps the backups" \
-  '{ [ "$st" -eq 0 ] || [ "$st" -eq 2 ]; } && ! grep -q "Delete them?" "$T/nobk.log" && [ -d "$ROOT/.retroplay_backups" ]'
+check "an unattended run never asks about deleting backups" \
+  '{ [ "$st" -eq 0 ] || [ "$st" -eq 2 ]; } && ! grep -q "Delete them?" "$T/nobk.log"'
+
+
+section "36. Only real games are looked up (drawers and version wrappers)"
+GD="$T/gamedirs"; setup mkdir -p "$GD"
+cp "$ROOT/merge.sh" "$ROOT/lib.sh" "$GD/"
+mkgame() {   # a WHDLoad game: folder + icon + slave
+    setup mkdir -p "$GD/build/retro_aga/WHDLoad/$1"; touch "$GD/build/retro_aga/WHDLoad/$1.info"; echo s > "$GD/build/retro_aga/WHDLoad/$1/game.slave"
+}
+mkdrawer() { setup mkdir -p "$GD/build/retro_aga/WHDLoad/$1"; touch "$GD/build/retro_aga/WHDLoad/$1.info"; }   # drawer WITH an icon, as archives ship
+mkart() { setup mkdir -p "$GD/artwork/iGame_AGA/lores/Covers/Games/$2/$1"; echo "art-$1" > "$GD/artwork/iGame_AGA/lores/Covers/Games/$2/$1/iGame.iff"; }
+mkgame Games/E/Elvira;            mkdrawer Games/E/Elvira/Maps
+mkgame Games/O/Obitus;            mkdrawer Games/O/Obitus/MapsFr; mkdrawer Games/O/Obitus/MapsFr/CATACOMBES
+mkgame Games/S/SimCity;           setup mkdir -p "$GD/build/retro_aga/WHDLoad/Games/S/SimCity/data"
+mkgame Languages/German/Games/E/ElviraDe;  mkdrawer Languages/German/Games/E/ElviraDe/Maps
+mkgame NTSC/Games/B/BardsTaleNTSC
+# version wrapper: only the game folder inside, no files of its own
+mkdrawer "Games/M/Might&Magic3_v1.2_2346"; mkgame "Games/M/Might&Magic3_v1.2_2346/Might&Magic3"
+for a in Elvira:E Obitus:O SimCity:S ElviraDe:E BardsTaleNTSC:B; do mkart "${a%%:*}" "${a##*:}"; done
+mkart "Might&Magic3" M
+( cd "$GD" && bash merge.sh --aga -d build/retro_aga --report-missing missing.txt ) > "$T/gamedirs.log" 2>&1
+check "drawers inside a game (Maps, MapsFr/CATACOMBES, data) are not games" \
+  'grep -q "Found 6 game(s)" "$T/gamedirs.log"'
+check "nothing is wrongly reported as having no artwork" '[ ! -s "$GD/missing.txt" ]'
+check "a version wrapper resolves to the game inside it, so its artwork is found" \
+  '[ -f "$GD/build/retro_aga/WHDLoad/Games/M/Might&Magic3_v1.2_2346/Might&Magic3/iGame.iff" ] && [ ! -e "$GD/build/retro_aga/WHDLoad/Games/M/Might&Magic3_v1.2_2346/iGame.iff" ]'
+check "games sorted into Languages/ and NTSC/ are still found" \
+  '[ -f "$GD/build/retro_aga/WHDLoad/Languages/German/Games/E/ElviraDe/iGame.iff" ] && [ -f "$GD/build/retro_aga/WHDLoad/NTSC/Games/B/BardsTaleNTSC/iGame.iff" ]'
+check "no artwork is put inside a drawer" '[ ! -e "$GD/build/retro_aga/WHDLoad/Games/E/Elvira/Maps/iGame.iff" ]'
+
+
+section "37. Artwork found despite capitalisation and older flat layouts"
+CS="$T/caseflat"; setup mkdir -p "$CS"
+cp "$ROOT/merge.sh" "$ROOT/lib.sh" "$CS/"
+g() { setup mkdir -p "$CS/build/retro_aga/WHDLoad/Games/$2/$1"; touch "$CS/build/retro_aga/WHDLoad/Games/$2/$1.info"; echo s > "$CS/build/retro_aga/WHDLoad/Games/$2/$1/g.slave"; }
+g SuperSkidmarks S; g Zool Z; g Apidya A
+# pack spells it in capitals; the collection does not
+setup mkdir -p "$CS/artwork/iGame_AGA/lores/Covers/Games/S/SUPERSKIDMARKS"
+echo caps > "$CS/artwork/iGame_AGA/lores/Covers/Games/S/SUPERSKIDMARKS/iGame.iff"
+# artwork installed the older flat way, only for Zool
+setup mkdir -p "$CS/artwork/iGame_AGA/Covers/Games/Z/Zool"
+echo flat > "$CS/artwork/iGame_AGA/Covers/Games/Z/Zool/iGame.iff"
+( cd "$CS" && bash merge.sh --aga -d build/retro_aga --report-missing missing.txt ) > "$T/caseflat.log" 2>&1
+check "a pack folder spelled with different capitals is still matched" \
+  '[ "$(cat "$CS/build/retro_aga/WHDLoad/Games/S/SuperSkidmarks/iGame.iff" 2>/dev/null)" = caps ]'
+check "artwork installed the older flat way is still used" \
+  '[ "$(cat "$CS/build/retro_aga/WHDLoad/Games/Z/Zool/iGame.iff" 2>/dev/null)" = flat ]'
+check "a game with no artwork anywhere is the only one reported" \
+  '[ "$(grep -c . "$CS/missing.txt")" -eq 1 ] && grep -q Apidya "$CS/missing.txt"'
+( cd "$CS" && bash merge.sh --aga -d build/retro_aga --why SuperSkidmarks ) > "$T/why.log" 2>&1
+check "--why explains where it looked and what is on disk" \
+  'grep -q "Sets tried, in order" "$T/why.log" && grep -q "SUPERSKIDMARKS" "$T/why.log"'
+
+
+section "38. The 'artwork not installed' message is specific and reassuring"
+AM="$T/artmsg"; setup mkdir -p "$AM/none"
+sed -n '/^# Artwork check, naming exactly/,/^fi$/p' "$ROOT/update.sh" > "$AM/block.sh"
+artmsg() {   # artmsg <artwork root> <ARTWORK_SYNC>
+    SCRIPT_DIR="$ROOT" RP_ARTWORK_ROOT="$1" RP_ARTWORK_SYNC="$2" \
+    RP_ARTWORK_SOURCE_URL="http://mock/WHDLoad_Images" bash "$AM/block.sh"
+}
+artmsg "$AM/none" ask > "$AM/ask.log" 2>&1
+check "it names each missing pack and flavour, not a vague list" \
+  'grep -q "iGame_AGA/lores" "$AM/ask.log" && grep -q "iGame_AGA/laced" "$AM/ask.log" && grep -q "iGame_ECS/lores" "$AM/ask.log" && grep -q "TinyLauncher" "$AM/ask.log"'
+check "it says they will be downloaded for you, and how to do it now" \
+  'grep -q "Don.t worry" "$AM/ask.log" && grep -q -- "--artwork-sync" "$AM/ask.log"'
+check "it no longer sends you to a forum thread" '! grep -q "eab.abime.net" "$AM/ask.log"'
+artmsg "$AM/none" auto > "$AM/auto.log" 2>&1
+check "with ARTWORK_SYNC=auto it says they are fetched during this run" \
+  'grep -q "automatically when the run reaches the artwork stage" "$AM/auto.log"'
+for p in iGame_AGA/lores/Covers iGame_AGA/laced/Covers iGame_ECS/lores/Screens iGame_ECS/laced/Screens iGame_RTG/Titles TinyLauncher/Game; do setup mkdir -p "$AM/full/$p"; done
+artmsg "$AM/full" auto > "$AM/full.log" 2>&1
+check "nothing is said once the artwork is installed" '[ ! -s "$AM/full.log" ]'
+for p in iGame_AGA/Covers iGame_ECS/Covers iGame_RTG/Covers TinyLauncher/Game; do setup mkdir -p "$AM/flat/$p"; done
+artmsg "$AM/flat" auto > "$AM/flat.log" 2>&1
+check "artwork installed the older flat way counts as present" '[ ! -s "$AM/flat.log" ]'
+
+
+section "39. The state backup stays small (artwork copies are not tarred)"
+acfg STATE_BACKUP '"yes"'
+setup mkdir -p "$ROOT/.retroplay/artwork/backups/iGame_AGA_lores_Covers/20260101-000000/Games/A"
+dd if=/dev/zero of="$ROOT/.retroplay/artwork/backups/iGame_AGA_lores_Covers/20260101-000000/Games/A/big.iff" bs=1024 count=4096 2>/dev/null
+setup mkdir -p "$ROOT/.retroplay/stage/leftover"
+dd if=/dev/zero of="$ROOT/.retroplay/stage/leftover/big2.bin" bs=1024 count=4096 2>/dev/null
+rm -f "$ROOT"/.retroplay_backups/state-*.tgz
+run bkslim ./all.sh --skip-update --variants aga
+newest="$(ls -1 "$ROOT"/.retroplay_backups/state-*.tgz 2>/dev/null | sort | tail -1)"
+check "a backup is still made" '[ -n "$newest" ]'
+check "it does not contain the artwork backups or the staging folder" \
+  '! tar -tzf "$newest" | grep -q "artwork/backups" && ! tar -tzf "$newest" | grep -q "stage/leftover"'
+check "it still contains the queue and build markers" \
+  'tar -tzf "$newest" | grep -q ".retroplay/complete"'
+check "so it stays small (well under a megabyte)" '[ "$(wc -c < "$newest")" -lt 1000000 ]'
+rm -rf "$ROOT/.retroplay/artwork/backups/iGame_AGA_lores_Covers" "$ROOT/.retroplay/stage/leftover"
+check "step 1 says what it is doing rather than sitting silent" \
+  'grep -q "checking the output folder is there" "$T/bkslim.log" && grep -q "tidying leftovers" "$T/bkslim.log"'
+acfg STATE_BACKUP '"no"'
+
+
+section "40. .retroplay is tidied each run, keeping only what matters"
+ST="$ROOT/.retroplay"
+# leftovers from an interrupted run, plus old artwork backups
+setup mkdir -p "$ST/stage/src_old" "$ST/artwork/work/iGame_AGA_lores_Covers.999" "$ST/artwork_changed"
+dd if=/dev/zero of="$ST/stage/src_old/junk.bin" bs=1024 count=2048 2>/dev/null
+: > "$ST/artwork_changed/iGame_AGA_lores_Covers"
+: > "$ST/artwork/remote_cache/.listing.raw.999"
+for n in 1 2 3 4; do setup mkdir -p "$ST/artwork/backups/iGame_AGA_lores_Covers/2026010$n-000000"; done
+: > "$ST/queue/retro_empty.list"
+printf '2\tWHDLoad/Games/G/GoneAway_v1.0.lha\n' > "$ST/extract_attempts.list"
+# things that MUST survive
+: > "$ST/complete/keepme"; printf 'WHDLoad/Games/K/Keep_v1.0.lha\n' > "$ST/queue/retro_keep.list"
+setup mkdir -p "$ST/artwork/manifests"; : > "$ST/artwork/manifests/iGame_AGA_lores_Covers.meta"
+run tidy ./all.sh --skip-update --variants aga
+check "staging and work leftovers are removed" \
+  '[ ! -e "$ST/stage" ] && [ ! -e "$ST/artwork/work/iGame_AGA_lores_Covers.999" ] && [ ! -e "$ST/artwork/remote_cache/.listing.raw.999" ]'
+check "old artwork backups are trimmed to ARTWORK_KEEP_BACKUPS" \
+  '[ "$(ls -1d "$ST"/artwork/backups/iGame_AGA_lores_Covers/*/ 2>/dev/null | grep -c .)" -le 2 ]'
+check "attempt counts for archives that no longer exist are dropped" \
+  '! grep -qs GoneAway "$ST/extract_attempts.list"'
+check "empty queue files are cleared away" '[ ! -e "$ST/queue/retro_empty.list" ]'
+check "the queue, build markers and artwork manifests all survive" \
+  '[ -f "$ST/queue/retro_keep.list" ] && [ -f "$ST/complete/keepme" ] && [ -f "$ST/artwork/manifests/iGame_AGA_lores_Covers.meta" ]'
+check "it says how much it freed" 'grep -q "tidied .retroplay" "$T/tidy.log"'
+
+
+section "41. Backups, artwork refresh, re-download check and the PFS reminder"
+# --- .retroplay is no longer backed up ---
+rm -f "$ROOT"/.retroplay_backups/state-*.tgz 2>/dev/null
+run nobackup ./all.sh --skip-update --variants aga
+check "the state folder is not backed up any more" \
+  '[ -z "$(ls "$ROOT"/.retroplay_backups/state-*.tgz 2>/dev/null)" ]'
+acfg STATE_BACKUP '"yes"'
+run withbackup ./all.sh --skip-update --variants aga
+check "STATE_BACKUP=\"yes\" brings the rolling copies back" \
+  '[ -n "$(ls "$ROOT"/.retroplay_backups/state-*.tgz 2>/dev/null)" ]'
+acfg STATE_BACKUP '"no"'
+
+# --- refreshing artwork already in the collection ---
+RF="$T/refresh"; setup mkdir -p "$RF"
+cp "$ROOT/merge.sh" "$ROOT/lib.sh" "$RF/"
+setup mkdir -p "$RF/build/retro_aga/WHDLoad/Games/E/Elvira" "$RF/artwork/iGame_AGA/lores/Covers/Games/E/Elvira"
+touch "$RF/build/retro_aga/WHDLoad/Games/E/Elvira.info"; echo s > "$RF/build/retro_aga/WHDLoad/Games/E/Elvira/g.slave"
+echo new-iff  > "$RF/artwork/iGame_AGA/lores/Covers/Games/E/Elvira/iGame.iff"
+echo new-data > "$RF/artwork/iGame_AGA/lores/Covers/Games/E/Elvira/iGame.data"
+echo old-iff  > "$RF/build/retro_aga/WHDLoad/Games/E/Elvira/iGame.iff"
+echo old-data > "$RF/build/retro_aga/WHDLoad/Games/E/Elvira/iGame.data"
+( cd "$RF" && bash merge.sh --aga -d build/retro_aga ) > /dev/null 2>&1
+check "a normal merge refreshes both the .iff and the .data" \
+  '[ "$(cat "$RF/build/retro_aga/WHDLoad/Games/E/Elvira/iGame.iff")" = new-iff ] && [ "$(cat "$RF/build/retro_aga/WHDLoad/Games/E/Elvira/iGame.data")" = new-data ]'
+echo older-again > "$RF/build/retro_aga/WHDLoad/Games/E/Elvira/iGame.data"
+( cd "$RF" && bash merge.sh --aga -d build/retro_aga --refresh-artwork ) > /dev/null 2>&1
+check "--refresh-artwork works on merge.sh too" \
+  '[ "$(cat "$RF/build/retro_aga/WHDLoad/Games/E/Elvira/iGame.data")" = new-data ]'
+( cd "$RF" && bash merge.sh --aga -d build/retro_aga ) > "$T/mergemode.log" 2>&1
+check "merge says which mode it is in and how many files it wrote" \
+  'grep -q "Mode: refreshing" "$T/mergemode.log" && grep -q "Artwork files refreshed:" "$T/mergemode.log"'
+( cd "$RF" && bash merge.sh --aga -d build/retro_aga --only-missing ) > "$T/mergegap.log" 2>&1
+check "--only-missing says it is filling gaps only" 'grep -q "Mode: filling gaps only" "$T/mergegap.log"'
+
+# --- an archive already downloaded is not fetched again ---
+: > "$MOCK/art_downloads"
+run artagain2 ./artwork_sync.sh --sync --for rtg --yes
+check "nothing is downloaded when the cached archives match the source" \
+  '[ ! -s "$MOCK/art_downloads" ]'
+rm -rf "$ROOT/.retroplay/artwork/manifests"     # state lost, but the archives are still here
+: > "$MOCK/art_downloads"
+run artcached ./artwork_sync.sh --sync --for rtg --yes
+check "even with no record of them, matching archives are reused not re-downloaded" \
+  'grep -q "already downloaded and unchanged" "$T/artcached.log" && [ ! -s "$MOCK/art_downloads" ]'
+
+# --- the PFS warning ---
+acfg FILESYSTEM '"pfs"'
+run pfsmsg ./all.sh --skip-update --variants aga
+check "a PFS build ends with the setfnsize warning" \
+  'grep -q "setfnsize <drive:> 107" "$T/pfsmsg.log" && grep -q "CAN CORRUPT THAT PARTITION" "$T/pfsmsg.log"'
+acfg FILESYSTEM '"ffs"'
+run ffsmsg ./all.sh --skip-update --variants aga
+check "an FFS build does not show it" '! grep -q "setfnsize" "$T/ffsmsg.log"'
+acfg FILESYSTEM '"pfs"'
+
+
+section "42. --refresh-artwork works from all.sh and start.sh, with messages"
+# a game the gap-fill would skip, whose artwork has since changed
+G2="$ROOT/build/retro_aga/WHDLoad/Games/A/Alpha"
+echo stale > "$G2/iGame.iff"; echo stale > "$G2/iGame.data"
+setup mkdir -p "$ROOT/artwork/iGame_AGA/lores/Covers/Games/A/Alpha"
+echo fresh > "$ROOT/artwork/iGame_AGA/lores/Covers/Games/A/Alpha/iGame.iff"
+echo freshdata > "$ROOT/artwork/iGame_AGA/lores/Covers/Games/A/Alpha/iGame.data"
+run refreshall ./all.sh --skip-update --variants aga --refresh-artwork; st=$?
+check "all.sh --refresh-artwork runs and says what it is doing" \
+  '{ [ "$st" -eq 0 ] || [ "$st" -eq 2 ]; } && grep -q "refreshing artwork for retro_aga" "$T/refreshall.log"'
+check "...and every game is refreshed, not just the ones missing artwork" \
+  '[ "$(cat "$G2/iGame.iff")" = fresh ] && [ "$(cat "$G2/iGame.data")" = freshdata ]'
+check "...and it reports how many files it wrote" 'grep -q "Artwork files refreshed:" "$T/refreshall.log"'
+echo stale2 > "$G2/iGame.data"
+run refreshstart ./start.sh --merge --aga --refresh-artwork --dest "$ROOT/build/retro_aga"; st=$?
+check "start.sh --merge --refresh-artwork does the same" \
+  '[ "$st" -eq 0 ] && [ "$(cat "$G2/iGame.data")" = freshdata ]'
 
 # ================================================================ summary ===
 echo

@@ -104,26 +104,51 @@ required_art_dirs=(
   "TinyLauncher"
 )
 
-# Artwork check. The packs live in the artwork folder, as
-#   iGame_AGA/{laced,lores}/<Section>/...   iGame_RTG/<Section>/...
-# so a pack counts as present when any of those holds a Section folder.
-missing_art=""
-for d in AGA ECS RTG; do
-    found=""
-    for p in "$RP_ARTWORK_ROOT/iGame_$d"/Covers "$RP_ARTWORK_ROOT/iGame_$d"/Screens "$RP_ARTWORK_ROOT/iGame_$d"/Titles \
-             "$RP_ARTWORK_ROOT/iGame_$d"/lores/* "$RP_ARTWORK_ROOT/iGame_$d"/laced/*; do
-        [ -d "$p" ] && found=1 && break
+# Artwork check, naming exactly which packs (and flavours) are missing.
+# In the artwork folder a pack looks like:
+#   iGame_AGA/lores/<Section>/...   iGame_AGA/laced/<Section>/...
+#   iGame_RTG/<Section>/...         TinyLauncher/...
+# When artwork_sync.sh can fetch them, say so instead of sending the reader
+# off to a forum thread - all.sh downloads and installs them by itself.
+art_have() {          # art_have <folder under artwork/>  - any Section inside?
+    local base="$RP_ARTWORK_ROOT/$1" p
+    for p in "$base"/Covers "$base"/Screens "$base"/Titles "$base"/Game "$base"/Demo; do
+        [ -d "$p" ] && return 0
     done
-    [ -n "$found" ] || missing_art="$missing_art iGame_$d"
+    return 1
+}
+missing_art=""
+for d in AGA ECS; do
+    art_have "iGame_$d/lores" || missing_art="$missing_art iGame_$d/lores"
+    art_have "iGame_$d/laced" || missing_art="$missing_art iGame_$d/laced"
+done
+art_have "iGame_RTG"     || missing_art="$missing_art iGame_RTG"
+art_have "TinyLauncher"  || missing_art="$missing_art TinyLauncher"
+# Artwork already installed the older flat way still counts.
+for d in AGA ECS; do
+    if art_have "iGame_$d"; then
+        missing_art="$(printf '%s' "$missing_art" | sed "s| iGame_$d/lores||; s| iGame_$d/laced||")"
+    fi
 done
 
 if [ -n "$missing_art" ]; then
-  echo "No artwork found yet for:$missing_art"
-  echo "Get it with:  ./start.sh --artwork-sync        (all of it)"
-  echo "         or:  ./start.sh --artwork-sync --for aga   (just one build)"
-  echo "Source:       $RP_ARTWORK_SOURCE_URL"
-  echo "See what it would do first:  ./start.sh --artwork-plan"
-  echo
+    echo "Artwork not installed yet for:$missing_art"
+    if [ -x "$SCRIPT_DIR/artwork_sync.sh" ]; then
+        case "${RP_ARTWORK_SYNC:-ask}" in
+            auto|yes)
+                echo "  Don't worry - these are downloaded and installed automatically when the run reaches the artwork stage." ;;
+            *)
+                echo "  Don't worry - all.sh downloads and installs these for you. To do it now:"
+                echo "      ./start.sh --artwork-sync              (everything)"
+                echo "      ./start.sh --artwork-sync --for aga    (just one build)"
+                echo "  Set ARTWORK_SYNC=\"auto\" in retroplay.conf to include artwork in the nightly run." ;;
+        esac
+        echo "  Source: $RP_ARTWORK_SOURCE_URL"
+    else
+        echo "  artwork_sync.sh is missing, so these can't be fetched automatically."
+        echo "  Source: $RP_ARTWORK_SOURCE_URL"
+    fi
+    echo
 fi
 
 dirs=(
