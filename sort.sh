@@ -181,7 +181,25 @@ done
 unset opt_lc
 
 # Use either CLI override, or default
-DEST="${DEST_OVERRIDE:-$DEFAULT_DEST}"
+DEST="${DEST_OVERRIDE:-}"
+# With no --dest, work on the collection matching the variant asked for, or
+# the only collection there is - the same rule merge.sh uses.
+if [ -z "$DEST" ]; then
+    if _auto="$(rp_default_collection "")"; then
+        DEST="$_auto"
+        echo "Using collection: ${DEST##*/}   (no --dest given)"
+    else
+        DEST="$DEFAULT_DEST"
+        if [ ! -d "$DEST" ]; then
+            _have="$(rp_list_collections)"
+            if [ -n "$_have" ]; then
+                rp_die "$RP_EXIT_CONFIG" "more than one collection here:$_have
+Say which one, e.g.  --dest $RP_BUILD_ROOT/${_have##* }"
+            fi
+            rp_die "$RP_EXIT_CONFIG" "no collection found in $RP_BUILD_ROOT - build one first (./all.sh)"
+        fi
+    fi
+fi
 
 LOGFILE="$(pwd)/sort.log"
 AMIGA_ISSUES_LOG="$(pwd)/amiga_filename_issues.log"
@@ -684,8 +702,18 @@ lang_sort() {
 
     # Determine source root: /retro/WHDLoad or /WHDLoad under custom destination
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    DEFAULT_DEST="$SCRIPT_DIR/retro"
-    DEST="${DEST_OVERRIDE:-$DEFAULT_DEST}"
+    DEFAULT_DEST="$RP_BUILD_ROOT/retro"
+    DEST="${DEST_OVERRIDE:-}"
+# With no --dest, work on the collection matching the variant asked for, or
+# the only collection there is - the same rule merge.sh uses.
+if [ -z "$DEST" ]; then
+    if _auto="$(rp_default_collection "")"; then
+        DEST="$_auto"
+        echo "Using collection: ${DEST##*/}   (no --dest given)"
+    else
+        DEST="$DEFAULT_DEST"
+    fi
+fi
 
     SRC="$DEST/WHDLoad"
 
@@ -819,7 +847,7 @@ fi
 # ============================================================================
 if [ "$RUN_COMPLIANCE_CHECK" = true ]; then
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    DEFAULT_DEST="$SCRIPT_DIR/retro"
+    DEFAULT_DEST="$RP_BUILD_ROOT/retro"
 
     # If -d/--dest was given, only check that path; otherwise behave as before.
     if [ -n "$DEST_OVERRIDE" ]; then

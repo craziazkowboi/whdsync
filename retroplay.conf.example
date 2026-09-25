@@ -49,6 +49,21 @@ ARTWORK_VERIFY_DOWNLOADS="yes"
 # Where downloaded artwork archives are cached (not inside the live folders).
 ARTWORK_ARCHIVE_DIR="artwork_archive"
 
+# ---- Artwork for games the packs don't cover -----------------------------
+# As a last resort, after every artwork pack has been tried, a command of
+# YOUR choosing can be asked for a picture. Whatever it returns is converted
+# to a proper Amiga IFF ILBM (same size and colours as your other artwork)
+# and installed into artwork/iGame_art/ and the collection.
+#
+# The command is called as:   <command> "<game name>" "<output .png>"
+# It should write one image and exit 0, or exit non-zero if it found nothing.
+# Examples of what people plug in here: an AI command line tool, an image
+# search API wrapper, or a script that picks from a folder of pictures.
+# Needs python3 with Pillow (sudo apt install python3-pil).
+ARTWORK_FETCH="no"
+ARTWORK_FETCH_COMMAND=""
+ARTWORK_FETCH_LIMIT=25
+
 # Amiga filename limits: pfs (107 characters) or ffs (30 characters).
 # For PFS, run  setfnsize <drive:> 107  on the Amiga first.
 FILESYSTEM="pfs"

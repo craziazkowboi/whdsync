@@ -1,0 +1,30 @@
+# Your settings (keep yours; retroplay.conf.example is the template)
+retroplay.conf
+
+# Everything the tool downloads, builds or logs - never commit these
+artwork/
+build/
+downloads/
+logs/
+reports/
+previews/
+new/
+new_*/
+retro_*/
+
+# State and working folders
+.retroplay/
+.retroplay_backups/
+.retroplay_work/
+.retroplay_installed_deps.log
+.all.lock*
+extract_tmp.*
+*.log
+
+# OS and editor clutter
+.DS_Store
+Thumbs.db
+*.swp
+*~
+__pycache__/
+*.pyc

@@ -129,7 +129,7 @@ rp_load_config
 STRUCTURED_SETS=" $(printf '%s' "$RP_STRUCTURED_ART_SETS" | tr '[:lower:]' '[:upper:]') "
 
 TINYLAUNCHER_SRC="$SCRIPT_DIR/TinyLauncher"
-DEFAULT_DEST="$RP_BUILD_ROOT/retro"
+DEFAULT_DEST="$RP_BUILD_ROOT/retro"      # only used when nothing else fits
 ART_SRC=""
 SET_OPT=""
 DEST=""
@@ -348,8 +348,18 @@ else
     fi
 fi
 
-# DEST can be set via -d/--dest or forwarded from start.sh
-DEST="${DEST:-$DEFAULT_DEST}"
+# DEST comes from -d/--dest, or from start.sh. With neither, use the
+# collection that matches the variant asked for (--aga -> build/retro_aga),
+# or the only collection there is.
+if [ -z "${DEST:-}" ]; then
+    _want="$(printf '%s' "${SELECTED_SET_KEY:-}" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+    if _auto="$(rp_default_collection "$_want")"; then
+        DEST="$_auto"
+        echo "Using collection: ${DEST##*/}   (no --dest given)"
+    else
+        DEST="$DEFAULT_DEST"
+    fi
+fi
 DEST="${DEST%/}"
 
 # Parse section priority order (non-demos baseline)
@@ -595,6 +605,8 @@ if [ ! -d "$DEST/WHDLoad" ]; then
         exit 0
     fi
     echo "ERROR: destination folder not found: $DEST"
+    _have="$(rp_list_collections)"
+    [ -n "$_have" ] && echo "Collections here:$_have  - pick one with -d, or name a variant (e.g. --aga)"
     echo "(Build it first, e.g. ./start.sh --sync --aga, or pass -d <folder>.)"
     exit 4
 fi

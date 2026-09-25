@@ -41,7 +41,7 @@ ROOT="$T/retroplay"; SERVER="$T/server"; MOCK="$T/mockbin"
 mkdir -p "$ROOT" "$SERVER" "$MOCK"
 export TMPDIR="$T/tmp"; mkdir -p "$TMPDIR"
 export RP_RETRY_WAIT=0          # no pauses between download retries in tests
-cp "$REPO"/*.sh "$ROOT"/
+cp "$REPO"/*.sh "$REPO"/to_ilbm.py "$ROOT"/
 chmod +x "$ROOT"/*.sh
 
 # ---------------------------------------------------------------- mocks ---
@@ -600,7 +600,7 @@ check "the menu shows a status summary on top, and option 9 the full status" \
 section "28. setup.sh installs everything on a bare system, and is safe to repeat"
 S="$T/setupbox"; SM="$T/setupmock"; IB="$T/installed"; SB="$T/setupsys"
 setup mkdir -p "$S" "$SM" "$IB" "$SB" "$T/h"
-cp "$REPO"/*.sh "$REPO"/retroplay.conf.example "$S"/ 2>/dev/null; chmod +x "$S"/*.sh
+cp "$REPO"/*.sh "$REPO"/to_ilbm.py "$REPO"/retroplay.conf.example "$S"/ 2>/dev/null; chmod +x "$S"/*.sh
 for d in /usr/bin /bin; do for f in "$d"/*; do n="${f##*/}"
     case "$n" in lha|7z|7za|unar|lsar|unlzx|wget|curl|unzip|flock|detox|locale|locale-gen|crontab|apt-get|dpkg-query|sudo) continue ;; esac
     [ -e "$SB/$n" ] || ln -s "$f" "$SB/$n"; done; done
@@ -726,7 +726,7 @@ check "artwork archives are cached under downloads/artwork_archive" \
   '[ -d "$ROOT/downloads/artwork_archive" ] && [ -z "$(find "$ROOT/artwork" -name "*.lha" | head -1)" ]'
 # migration from the old flat layout
 OLD="$T/oldlayout"; setup mkdir -p "$OLD"
-cp "$REPO"/*.sh "$REPO"/retroplay.conf.example "$OLD"/; chmod +x "$OLD"/*.sh
+cp "$REPO"/*.sh "$REPO"/to_ilbm.py "$REPO"/retroplay.conf.example "$OLD"/; chmod +x "$OLD"/*.sh
 setup mkdir -p "$OLD/iGame_AGA/Covers" "$OLD/TinyLauncher" "$OLD/WHDLoad/Games/A" "$OLD/retro_aga/WHDLoad" "$OLD/new_aga" "$OLD/artwork_archive"
 echo old > "$OLD/iGame_AGA/Covers/marker"; echo old > "$OLD/retro_aga/WHDLoad/marker"; : > "$OLD/update.log"
 ( cd "$OLD" && ./all.sh --skip-update --variants aga ) < /dev/null > "$T/migrate.log" 2>&1
@@ -747,7 +747,7 @@ check "LOG_RETENTION_DAYS=0 keeps logs for ever" '[ -f "$ROOT/logs/ancient2.log"
 rm -f "$ROOT/logs/ancient2.log"; acfg LOG_RETENTION_DAYS 1
 # scripts/ subfolder
 SUB="$T/subfolder"; setup mkdir -p "$SUB/scripts"
-cp "$REPO"/*.sh "$REPO"/retroplay.conf.example "$SUB/scripts"/; chmod +x "$SUB/scripts"/*.sh
+cp "$REPO"/*.sh "$REPO"/to_ilbm.py "$REPO"/retroplay.conf.example "$SUB/scripts"/; chmod +x "$SUB/scripts"/*.sh
 setup mkdir -p "$SUB/downloads/WHDLoad/Games/A"
 ( cd "$SUB" && ./scripts/all.sh --skip-update --variants aga ) < /dev/null > "$T/subfolder.log" 2>&1
 check "the scripts also work from a scripts/ subfolder, using the folder above" \
@@ -1002,6 +1002,13 @@ acfg FILESYSTEM '"pfs"'
 run pfsmsg ./all.sh --skip-update --variants aga
 check "a PFS build ends with the setfnsize warning" \
   'grep -q "setfnsize <drive:> 107" "$T/pfsmsg.log" && grep -q "CAN CORRUPT THAT PARTITION" "$T/pfsmsg.log"'
+check "...and nothing else follows it (it is the last thing on screen)" \
+  '! tail -n +"$(grep -n "setfnsize <drive:> 107" "$T/pfsmsg.log" | cut -d: -f1)" "$T/pfsmsg.log" | grep -qE "Summary|saved as reports"'
+# and with a run that does print a summary
+echo stale > "$ROOT/build/retro_aga/WHDLoad/Games/A/Alpha/iGame.data"
+run pfsorder ./all.sh --skip-update --variants aga --refresh-artwork
+check "after a summary, the warning still comes last" \
+  'grep -q "Summary" "$T/pfsorder.log" && [ "$(grep -n "setfnsize <drive:> 107" "$T/pfsorder.log" | cut -d: -f1)" -gt "$(grep -n "Summary" "$T/pfsorder.log" | tail -1 | cut -d: -f1)" ]'
 acfg FILESYSTEM '"ffs"'
 run ffsmsg ./all.sh --skip-update --variants aga
 check "an FFS build does not show it" '! grep -q "setfnsize" "$T/ffsmsg.log"'
@@ -1025,6 +1032,87 @@ echo stale2 > "$G2/iGame.data"
 run refreshstart ./start.sh --merge --aga --refresh-artwork --dest "$ROOT/build/retro_aga"; st=$?
 check "start.sh --merge --refresh-artwork does the same" \
   '[ "$st" -eq 0 ] && [ "$(cat "$G2/iGame.data")" = freshdata ]'
+
+
+section "43. Artwork found elsewhere is converted to IFF and installed"
+# A stand-in for whatever you plug in: writes a picture for known games only.
+cat > "$MOCK/findart" << 'EOF'
+#!/usr/bin/env bash
+game="$1"; out="$2"
+case "$game" in
+    *NoSuchGame*) exit 1 ;;                       # nothing found
+    *NotAPicture*) echo "this is not an image" > "$out"; exit 0 ;;
+esac
+python3 -c "
+from PIL import Image
+im = Image.new('RGB', (600, 400))
+for x in range(600):
+    for y in range(0, 400, 40): im.putpixel((x, y), (x % 256, y % 256, 128))
+im.save('$out')
+" 2>/dev/null || exit 1
+EOF
+chmod +x "$MOCK/findart"
+if ! python3 -c 'import PIL' 2>/dev/null; then
+    echo "  (skipped: python3-pil is not installed here)"
+else
+    FA="$T/fetch"; setup mkdir -p "$FA/build/retro_aga/WHDLoad/Games/N/NoArtGame" "$FA/artwork/iGame_AGA/lores/Covers/Games/R/Ref"
+    cp "$ROOT"/*.sh "$REPO/to_ilbm.py" "$FA/"
+    touch "$FA/build/retro_aga/WHDLoad/Games/N/NoArtGame.info"
+    # a reference iff, so what we add matches the artwork already in use
+    python3 -c "from PIL import Image; Image.new('RGB',(320,128),(1,2,3)).save('$T/ref.png')"
+    python3 "$REPO/to_ilbm.py" "$T/ref.png" "$FA/artwork/iGame_AGA/lores/Covers/Games/R/Ref/iGame.iff" --width 320 --height 128 --planes 8 >/dev/null 2>&1
+    printf 'WHDLoad/Games/N/NoArtGame\nWHDLoad/Games/X/NoSuchGame\nWHDLoad/Games/Y/NotAPicture\n' > "$FA/missing.txt"
+    cat > "$FA/retroplay.conf" << EOF
+ARTWORK_FETCH="yes"
+ARTWORK_FETCH_COMMAND="$MOCK/findart"
+ARTWORK_FETCH_LIMIT=10
+EOF
+    ( cd "$FA" && ./artwork_fetch.sh --list missing.txt --variant retro_aga --dest build/retro_aga ) > "$T/fetch.log" 2>&1
+    check "it says what it is doing, game by game" \
+      'grep -q "NoArtGame: searching" "$T/fetch.log" && grep -q "found - converted and installed" "$T/fetch.log"'
+    check "a game it cannot find is reported, not silently skipped" 'grep -q "nothing found" "$T/fetch.log"'
+    check "something that is not a picture is rejected" 'grep -q "not an image" "$T/fetch.log"'
+    check "the result is a real IFF ILBM, matching the artwork already in use" \
+      '[ -f "$FA/artwork/iGame_art/NoArtGame/iGame.iff" ] && [ "$(head -c 4 "$FA/artwork/iGame_art/NoArtGame/iGame.iff")" = FORM ] && python3 -c "
+import sys; sys.path.insert(0, \"$ROOT\")
+from to_ilbm import read_bmhd
+w,h,p = read_bmhd(\"$FA/artwork/iGame_art/NoArtGame/iGame.iff\")
+sys.exit(0 if (w,h,p) == (320,128,8) else 1)"'
+    check "it is installed into the collection as well" '[ -f "$FA/build/retro_aga/WHDLoad/Games/N/NoArtGame/iGame.iff" ]'
+    check "and saved in your own pack, which artwork updates never overwrite" \
+      '[ -d "$FA/artwork/iGame_art/NoArtGame" ]'
+    check "the totals are reported" \
+      'grep -q "Artwork found and installed: 1" "$T/fetch.log" && grep -q "Still without artwork:       2" "$T/fetch.log"'
+    # off by default
+    printf 'ARTWORK_FETCH="no"\n' > "$FA/retroplay.conf"
+    ( cd "$FA" && ./artwork_fetch.sh --list missing.txt --variant retro_aga --dest build/retro_aga ) > "$T/fetchoff.log" 2>&1
+    check "it does nothing unless you turn it on" '[ ! -s "$T/fetchoff.log" ]'
+fi
+
+
+section "44. Running the leaf scripts by hand finds the right collection"
+DC="$T/defaultdest"; setup mkdir -p "$DC"
+cp "$ROOT"/*.sh "$REPO/to_ilbm.py" "$DC/"
+setup mkdir -p "$DC/build/retro_aga/WHDLoad/Games/A/Alpha" "$DC/artwork/iGame_AGA/lores/Covers/Games/A/Alpha"
+touch "$DC/build/retro_aga/WHDLoad/Games/A/Alpha.info"; echo s > "$DC/build/retro_aga/WHDLoad/Games/A/Alpha/g.slave"
+echo art > "$DC/artwork/iGame_AGA/lores/Covers/Games/A/Alpha/iGame.iff"
+( cd "$DC" && bash merge.sh --refresh-artwork ) > "$T/dd_merge.log" 2>&1; st=$?
+check "merge.sh with no --dest uses the collection that is there" \
+  '[ "$st" -eq 0 ] && grep -q "Using collection: retro_aga" "$T/dd_merge.log" && [ -f "$DC/build/retro_aga/WHDLoad/Games/A/Alpha/iGame.iff" ]'
+( cd "$DC" && bash sort.sh --no-detox ) > "$T/dd_sort.log" 2>&1; st=$?
+check "sort.sh with no --dest does the same" \
+  '[ "$st" -eq 0 ] && grep -q "Using collection: retro_aga" "$T/dd_sort.log"'
+setup mkdir -p "$DC/build/retro_ecs/WHDLoad" "$DC/build/retro_rtg/WHDLoad"
+( cd "$DC" && bash merge.sh --ecs --refresh-artwork ) > "$T/dd_ecs.log" 2>&1
+check "naming a variant picks that collection (--ecs -> retro_ecs)" 'grep -q "Using collection: retro_ecs" "$T/dd_ecs.log"'
+( cd "$DC" && bash sort.sh --no-detox ) > "$T/dd_many.log" 2>&1; st=$?
+check "with several collections and no hint, it says so instead of guessing" \
+  '[ "$st" -eq 4 ] && grep -q "more than one collection here" "$T/dd_many.log" && grep -q "retro_rtg" "$T/dd_many.log"'
+rm -rf "$DC/build"
+( cd "$DC" && bash sort.sh --no-detox ) > "$T/dd_none.log" 2>&1; st=$?
+check "with no collection at all, it says to build one first" \
+  '[ "$st" -eq 4 ] && grep -q "build one first" "$T/dd_none.log"'
+check "nothing is created beside the scripts any more" '[ ! -e "$DC/retro" ] && [ ! -e "$DC/new" ]'
 
 # ================================================================ summary ===
 echo

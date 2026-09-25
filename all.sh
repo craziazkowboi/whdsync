@@ -356,10 +356,6 @@ finish() {
         5) result="Finished, but some archives couldn't be extracted (exit 5: they'll be retried)" ;;
         *) result="FAILED (exit $st: $(rp_exit_meaning "$st"))${FAIL_REASON:+ - $FAIL_REASON}" ;;
     esac
-    # However the run ends - built something, nothing to do, or failed - the
-    # PFS filename warning is the last thing shown.
-    [ "$DRY_RUN" -eq 0 ] && rp_pfs_reminder
-
     # For the status view: the last run's result.
     rp_state_init
     printf 'code=%s\ntime=%s\nresult=%s\nreport=reports/%s.txt\n' "$st" "$(rp_ts)" "$result" "$RUN_TS" \
@@ -396,6 +392,10 @@ finish() {
         rp_notify "Amiga Retroplay: run finished" "$body"
     fi
     rm -f "$REPORT_TMP"
+
+    # Last thing on the screen, after the summary, however the run ended:
+    # the PFS filename warning (only when building for PFS).
+    [ "$DRY_RUN" -eq 0 ] && rp_pfs_reminder
 }
 trap finish EXIT
 trap 'fail_with "$RP_EXIT_INTERRUPTED" "interrupted"' INT TERM
@@ -693,6 +693,27 @@ merge_variant() {   # (adds --refresh-artwork when asked for)
 
 sort_folder() { ./start.sh --sort $FS_FLAG $DETOX_FLAG --dest "$1"; }
 
+# After the packs have had their turn: ask the command you configured for
+# anything still missing (off unless ARTWORK_FETCH=yes). Counts go into the
+# run report; a failure here never affects the collection.
+FETCH_FOUND=0
+fetch_missing_artwork() {   # <index> <missing-list-file>
+    local out found
+    [ "$RP_ARTWORK_FETCH" = "yes" ] || return 0
+    [ -s "$2" ] || return 0
+    [ -f "$SCRIPT_DIR/artwork_fetch.sh" ] || return 0
+    out="$REPORT_TMP.fetch"
+    ./artwork_fetch.sh --list "$2" --variant "${V_KEY[$1]}" --dest "${V_DEST[$1]}" | tee "$out"
+    found="$(sed -n 's/.*Artwork found and installed: *//p' "$out" | tail -1)"
+    found="${found:-0}"
+    if [ "$found" -gt 0 ]; then
+        FETCH_FOUND=$(( FETCH_FOUND + found ))
+        report "${V_KEY[$1]}: found artwork elsewhere for $found game(s) and converted it to IFF"
+    fi
+    rm -f "$out"
+    return 0
+}
+
 save_missing_list() {   # <index> <missing-list-file> ; prints the count
     local n=0
     if [ -s "$2" ]; then
@@ -795,6 +816,7 @@ if [ "${#FULL[@]}" -gt 0 ]; then
         rp_queue_clear "$key"
         rp_gapfill_done "$key"          # a full build merged everything
         mark_success "$key"
+        fetch_missing_artwork "$i" "$miss"
         games="$(rp_count_games "$dest")"; nomiss="$(save_missing_list "$i" "$miss")"
         line="$key: full build - $games games${V_EXCL[$i]:+ (without ${V_EXCL[$i]} releases)}, $nomiss without artwork"
         [ "$nomiss" -gt 0 ] && line="$line (list: reports/${RUN_TS}_${key}_no_artwork.txt)"
@@ -945,6 +967,7 @@ for g in ${G_SIG[@]+"${!G_SIG[@]}"}; do
         mark_success "$key"
 
         rp_queue_remove_processed "$key" "$STAGE_ROOT/processed_$key.list"
+        fetch_missing_artwork "$i" "$miss"
         nomiss="$(save_missing_list "$i" "$miss")"
         line="$key: $bgames game(s) added/updated from $narch archive(s) - batch saved in ${V_NEW[$i]##*/}/$RUN_TS, $nomiss without artwork"
         [ "$nomiss" -gt 0 ] && line="$line (list: reports/${RUN_TS}_${key}_no_artwork.txt)"
@@ -973,6 +996,7 @@ for i in "${!V_TOK[@]}"; do
     merge_variant "$i" "${V_DEST[$i]}" $gapmode --report-missing "$miss" || fail "artwork gap-fill for ${V_KEY[$i]} failed"
     rp_gapfill_done "${V_KEY[$i]}"
     mark_success "${V_KEY[$i]}"
+    fetch_missing_artwork "$i" "$miss"
     report "${V_KEY[$i]}: up to date - artwork gap-fill done; $(save_missing_list "$i" "$miss") game(s) still without artwork"
 done
 

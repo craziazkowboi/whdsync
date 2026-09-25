@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026.09.25 (final message, README)
+### Changed
+- The PFS `setfnsize` warning is now printed after the run summary, so it is the last thing on the screen.
+- The README lists the artwork fallback order for every build (AGA, AGA Laced, ECS, ECS Laced, RTG, `--set NAME`, and none), not just RTG - including the two chains that are added automatically (older flat artwork, and any other `iGame_*` pack you have).
+
+## 2026.09.25 (running the leaf scripts by hand)
+### Fixed
+- `./merge.sh` on its own failed with "destination folder not found: build/retro" - a folder that never exists. The leaf scripts now work out which collection you mean: the one matching the variant you named (`--aga` -> `build/retro_aga`), or the only collection there is. With several and no hint they list them and ask, instead of silently using a path that isn't there.
+- Same fault in `sort.sh`, and two places in it that still pointed at a `retro` folder beside the scripts rather than under `build/`.
+- `extract.sh` and `quick.sh` defaulted to `retro` and `new` beside the scripts; both now sit under `build/`.
+
+## 2026.09.25 (artwork of last resort)
+### Added
+- `artwork_fetch.sh`: for games no artwork pack covers, a command of your choosing is asked for a picture, which is converted to a real Amiga IFF ILBM matching your existing artwork's size and colour depth, then installed into `artwork/iGame_art/` and the collection. Off by default (`ARTWORK_FETCH`), with per-game messages and totals in the run report.
+- `to_ilbm.py`: the IFF ILBM writer (BMHD/CMAP/ByteRun1 BODY), sized from an existing `iGame.iff` so added artwork matches the rest. ImageMagick cannot write ILBM, hence writing it directly.
+- `doctor.sh` checks the fetch command and that Pillow is installed.
+
 ## 2026.09.24 (artwork refresh)
 ### Changed
 - Artwork in the collection is now always written from the packs' current version, `iGame.data` included. Checking each file first (timestamps, then sizes) was measured slower than simply writing it - 23s against 11s over 1500 games - so the checks are gone.

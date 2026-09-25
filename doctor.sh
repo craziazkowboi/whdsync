@@ -166,6 +166,20 @@ else
     warn "artwork_sync.sh is missing - artwork can't be downloaded automatically"
 fi
 
+if [ "$RP_ARTWORK_FETCH" = "yes" ]; then
+    if [ -z "$RP_ARTWORK_FETCH_COMMAND" ]; then
+        prob "ARTWORK_FETCH=yes but no ARTWORK_FETCH_COMMAND is set" "Set the command that finds a picture, or turn ARTWORK_FETCH off"
+    elif ! command -v "${RP_ARTWORK_FETCH_COMMAND%% *}" >/dev/null 2>&1 && [ ! -x "${RP_ARTWORK_FETCH_COMMAND%% *}" ]; then
+        prob "ARTWORK_FETCH_COMMAND is not runnable: $RP_ARTWORK_FETCH_COMMAND" "Check the path, and that it is executable"
+    elif ! python3 -c 'import PIL' 2>/dev/null; then
+        prob "artwork search needs python3 with Pillow to write IFF files" "Fix: sudo apt install python3-pil   (macOS: pip3 install pillow)"
+    else
+        good "artwork search is on, using ${RP_ARTWORK_FETCH_COMMAND%% *} (up to $RP_ARTWORK_FETCH_LIMIT per run)"
+    fi
+else
+    good "artwork search for games the packs miss: off (ARTWORK_FETCH)"
+fi
+
 head_ "Disk space"
 # (Never create the output folder here: if it's on a USB drive that isn't
 # mounted, that would create it on the SD card instead.)

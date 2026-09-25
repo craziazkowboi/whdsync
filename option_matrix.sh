@@ -81,7 +81,7 @@ sec() { case " $SECTIONS " in *" $1 "*) return 0 ;; esac; return 1; }
 
 if sec 1; then
 echo "== help and unknown options"
-for s in all.sh start.sh extract.sh merge.sh sort.sh update.sh quick.sh doctor.sh uninstall_deps.sh setup.sh artwork_sync.sh; do
+for s in all.sh start.sh extract.sh merge.sh sort.sh update.sh quick.sh doctor.sh uninstall_deps.sh setup.sh artwork_sync.sh artwork_fetch.sh; do
     tt "0" "$s --help" ./"$s" --help
     tt "1|4" "$s unknown option" ./"$s" --no-such-option
 done
@@ -139,6 +139,8 @@ tt "0|2|3|5" "start.sh --artwork-status" ./start.sh --artwork-status
 tt "0|2|3|5" "start.sh --artwork-verify" ./start.sh --artwork-verify
 tt "1|4" "artwork_sync.sh --set (no value)" ./artwork_sync.sh --sync --set
 tt "1|4" "artwork_sync.sh --rollback (no value)" ./artwork_sync.sh --rollback
+tt "1|4" "artwork_fetch.sh --list (no value)" ./artwork_fetch.sh --list
+tt "1|2|4" "artwork_fetch.sh with no options" ./artwork_fetch.sh
 tt "0|2" "start.sh --plan" ./start.sh --plan
 tt "0|2" "start.sh --sync --skip-update" ./start.sh --sync --skip-update
 tt "0" "setup.sh --dry-run --no-cron" ./setup.sh --dry-run --no-cron

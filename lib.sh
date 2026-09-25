@@ -72,6 +72,9 @@ rp_load_config() {
     RP_ARTWORK_VERIFY_DOWNLOADS="yes"
     RP_ARTWORK_FAILURE_POLICY="warn-and-continue"
     RP_ARTWORK_CHECK_INTERVAL_HOURS="24"
+    RP_ARTWORK_FETCH="no"          # look elsewhere for artwork the packs lack?
+    RP_ARTWORK_FETCH_COMMAND=""    # your command: <cmd> "<game>" "<output image>"
+    RP_ARTWORK_FETCH_LIMIT="25"    # at most this many searches per run
     RP_ARTWORK_DIR="artwork"      # holds iGame_*/ TinyLauncher/ archives/
     RP_BUILD_DIR="build"          # holds retro_*/ and new_*/ (under OUTPUT_ROOT)
     RP_DOWNLOAD_DIR="downloads"   # holds WHDLoad/ HD_Loaders/ JST/ old/
@@ -108,6 +111,7 @@ rp_load_config() {
             ARTWORK_SYNC|ARTWORK_SOURCE_URL|ARTWORK_ARCHIVE_DIR|ARTWORK_STATE_ROOT|ARTWORK_PACKS|\
             ARTWORK_OPTIONAL_PACKS|ARTWORK_KEEP_BACKUPS|ARTWORK_LOCAL_CHANGE_POLICY|\
             ARTWORK_VERIFY_DOWNLOADS|ARTWORK_FAILURE_POLICY|ARTWORK_CHECK_INTERVAL_HOURS|\
+            ARTWORK_FETCH|ARTWORK_FETCH_COMMAND|ARTWORK_FETCH_LIMIT|\
             ARTWORK_DIR|BUILD_DIR|DOWNLOAD_DIR|LOG_DIR|LOG_RETENTION_DAYS|STATE_BACKUP_MAX_MB|STATE_BACKUP)
                 printf -v "RP_$key" '%s' "$val" ;;
             ART_ORDER_[A-Z0-9_]*|EXCLUDE_TAGS_[A-Z0-9_]*)
@@ -134,7 +138,7 @@ rp_finish_config() {
     : "${RP_MIN_FREE_MB:=1024}" "${RP_SPACE_FACTOR:=3}" "${RP_KEEP_NEW_BATCHES:=14}"
     : "${RP_OLD_ARCHIVE_DAYS:=30}" "${RP_LOG_MAX_MB:=5}" "${RP_LOG_KEEP:=4}"
     : "${RP_MAX_EXTRACT_ATTEMPTS:=3}" "${RP_DOWNLOAD_RETRIES:=3}" "${RP_GAPFILL_DAYS:=7}"
-    : "${RP_ARTWORK_KEEP_BACKUPS:=2}" "${RP_ARTWORK_CHECK_INTERVAL_HOURS:=24}" "${RP_LOG_RETENTION_DAYS:=1}" "${RP_STATE_BACKUP_MAX_MB:=50}"
+    : "${RP_ARTWORK_FETCH_LIMIT:=25}" "${RP_ARTWORK_KEEP_BACKUPS:=2}" "${RP_ARTWORK_CHECK_INTERVAL_HOURS:=24}" "${RP_LOG_RETENTION_DAYS:=1}" "${RP_STATE_BACKUP_MAX_MB:=50}"
     # Artwork settings: check the words, and the pack names for anything unsafe.
     case "$RP_ARTWORK_SYNC" in ask|auto|yes|no) ;; *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}ARTWORK_SYNC must be ask, auto, yes or no - using ask
 "; RP_ARTWORK_SYNC=ask ;; esac
@@ -143,6 +147,8 @@ rp_finish_config() {
     case "$RP_ARTWORK_FAILURE_POLICY" in warn-and-continue|fail) ;; *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}ARTWORK_FAILURE_POLICY must be warn-and-continue or fail - using warn-and-continue
 "; RP_ARTWORK_FAILURE_POLICY=warn-and-continue ;; esac
     case "$RP_ARTWORK_VERIFY_DOWNLOADS" in yes|no) ;; *) RP_ARTWORK_VERIFY_DOWNLOADS=yes ;; esac
+    case "$RP_ARTWORK_FETCH" in yes|no) ;; *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}ARTWORK_FETCH must be yes or no - using no
+"; RP_ARTWORK_FETCH=no ;; esac
     case "$RP_ARTWORK_SOURCE_URL" in http://*|https://*|ftp://*) ;; *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}ARTWORK_SOURCE_URL must start with http://, https:// or ftp://
 " ;; esac
     for _p in $RP_ARTWORK_PACKS $RP_ARTWORK_OPTIONAL_PACKS; do
@@ -624,7 +630,7 @@ rp_layout_problems() {
 # Users/<you>/Downloads/Amiga/... inside retro_* - so the set is checked as
 # a whole. Prints each script whose stamp doesn't match this lib.sh.
 RP_SUITE_VERSION="2026.09.22"
-RP_SUITE_FILES="all.sh start.sh extract.sh merge.sh sort.sh update.sh quick.sh aga.sh ecs.sh rtg.sh doctor.sh install_cron.sh uninstall_deps.sh setup.sh"
+RP_SUITE_FILES="all.sh start.sh extract.sh merge.sh sort.sh update.sh quick.sh aga.sh ecs.sh rtg.sh doctor.sh install_cron.sh uninstall_deps.sh setup.sh artwork_sync.sh artwork_fetch.sh"
 
 rp_suite_mismatches() {
     local f v
@@ -1261,3 +1267,30 @@ rp_pfs_reminder() {
     return 0
 }
 
+
+# rp_default_collection [variant suffix]
+# Which collection a script should work on when no --dest was given:
+#   * the one matching the variant asked for (--aga -> build/retro_aga)
+#   * or, if there is only one collection, that one
+#   * otherwise nothing, and the caller lists the choices
+rp_default_collection() {
+    local want="$1" d n=0 only=""
+    if [ -n "$want" ] && [ -d "$RP_BUILD_ROOT/retro_$want" ]; then
+        printf '%s\n' "$RP_BUILD_ROOT/retro_$want"; return 0
+    fi
+    for d in "$RP_BUILD_ROOT"/retro_*; do
+        [ -d "$d" ] || continue
+        n=$((n + 1)); only="$d"
+    done
+    [ "$n" -eq 1 ] && { printf '%s\n' "$only"; return 0; }
+    return 1
+}
+
+# The collections that exist, for a helpful error message.
+rp_list_collections() {
+    local d found=""
+    for d in "$RP_BUILD_ROOT"/retro_*; do
+        [ -d "$d" ] && found="$found ${d##*/}"
+    done
+    printf '%s' "$found"
+}

@@ -192,7 +192,50 @@ Each merge reports what it did: which mode it is in, and how many artwork files 
 
 **Your own artwork is safe.** If you change a folder, or drop in a pack this tool didn't install, it is never overwritten automatically — see `ARTWORK_LOCAL_CHANGE_POLICY`. Put your own images in `artwork/iGame_art/` in whatever structure you like; they're used whenever a game has no artwork in the main packs.
 
-If a game still has none, the merge step falls back in order — for an RTG build: RTG → AGA Laced → AGA → your own art → ECS Laced → ECS → TinyLauncher.
+### When no pack has the artwork
+
+After every pack has been tried, the games still without artwork can be looked up elsewhere. This is **off by default**, and you decide what does the looking:
+
+```
+ARTWORK_FETCH="yes"
+ARTWORK_FETCH_COMMAND="/home/pi/bin/find-cover"     # your command
+ARTWORK_FETCH_LIMIT=25                              # per run
+```
+
+Your command is called as `<command> "<game name>" "<output .png>"`; it writes one picture and exits 0, or exits non-zero if it found nothing. People plug in an AI command line tool, an image-search API wrapper, or a script that picks from their own folder of pictures. Nothing is fetched unless you set this up.
+
+What the suite does with the result: checks it really is an image, converts it to a proper Amiga IFF ILBM with the **same size and colour depth as your existing artwork**, then installs it into `artwork/iGame_art/<Game>/` (your own pack, which artwork updates never overwrite) and into the collection. It says what it is doing for each game and counts the results:
+
+```
+  [3/18] Blastaway: searching... found - converted and installed (320x128, 256 colours)
+  [4/18] Zoetrope: searching... nothing found
+
+  Artwork found and installed: 11
+  Still without artwork:       7
+```
+
+Needs `python3` with Pillow (`sudo apt install python3-pil`). `./doctor.sh` checks it for you.
+
+### Which artwork a build uses, and what it falls back to
+
+Each build tries its own artwork first, then works down the list until it finds a picture. "Your own art" is `artwork/iGame_art/`.
+
+| Build | Order it tries |
+|---|---|
+| `--aga` | AGA (lores) → your own art → ECS → TinyLauncher |
+| `--aga-laced` | AGA Laced → AGA (lores) → your own art → ECS → TinyLauncher |
+| `--ecs` | ECS (lores) → your own art → TinyLauncher |
+| `--ecs-laced` | ECS Laced → ECS (lores) → your own art → TinyLauncher |
+| `--rtg` | RTG → AGA Laced → AGA (lores) → your own art → ECS Laced → ECS → TinyLauncher |
+| `--set NAME` | that pack → your own art → TinyLauncher |
+| no variant given | your own art → TinyLauncher |
+
+Two things are added to these automatically:
+
+- **Artwork you installed the older flat way** (`iGame_AGA/Covers/…` rather than `iGame_AGA/lores/…`) is tried immediately after the pack it belongs to, so nothing is lost.
+- **Any other `iGame_*` pack you have** is tried last, after TinyLauncher — so a pack the list doesn't mention still gets used rather than ignored.
+
+Within each pack, sections are tried in `ART_ORDER` (`Covers,Screens,Titles` by default), and demos use `DEMO_ART_ORDER`.
 
 ---
 
@@ -308,6 +351,8 @@ Every one of these has an automated test that fails if the protection is removed
 | `./start.sh --test-notify` | Check notifications work |
 | `./doctor.sh` | Check the setup and explain any fixes |
 | `./uninstall_deps.sh` | Remove tools this tool installed |
+
+Run the leaf scripts on their own and they work out which collection you mean — the one matching the variant you name (`./merge.sh --aga`), or the only one you have. With several and no hint, they list them rather than guess.
 
 Every script supports `--help`. Useful extras: `--rebuild` (rebuild from archives already downloaded, no server check), `--skip-update`, `--force` (also fill in missing artwork), `--dry-run`.
 
