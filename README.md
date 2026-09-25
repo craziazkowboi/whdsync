@@ -12,7 +12,7 @@ downloads/            →  extract  →  artwork  →  sort  →  build/retro_ag
 
 - **Runs on** a Raspberry Pi (including a Pi Zero 2 W) or a Mac. Linux and macOS, nothing else needed.
 - **Safe by design.** It never deletes a collection until its replacement is ready, never overwrites artwork you changed yourself, and stops rather than guessing.
-- **Tested.** 157 automated tests plus 201 option checks, run on Linux and macOS.
+- **Tested.** 213 automated tests plus 205 option checks, run offline on every change. GitHub Actions runs them on Ubuntu and on macOS (bash 3.2), with ShellCheck.
 
 ---
 
@@ -460,7 +460,7 @@ Run these directly only if you want one job done. Each works out which collectio
 ## For developers
 
 ```bash
-tests/run_tests.sh                    # 157 end-to-end tests, no network needed
+tests/run_tests.sh                    # 213 end-to-end tests, no network needed
 tests/option_matrix.sh                # every option of every script
 MATRIX_SECTIONS="1 2" tests/option_matrix.sh    # just some sections
 ```
