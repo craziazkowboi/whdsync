@@ -12,7 +12,7 @@ downloads/            →  extract  →  artwork  →  sort  →  build/retro_ag
 
 - **Runs on** a Raspberry Pi (including a Pi Zero 2 W) or a Mac. Linux and macOS, nothing else needed.
 - **Safe by design.** It never deletes a collection until its replacement is ready, never overwrites artwork you changed yourself, and stops rather than guessing.
-- **Tested.** 157 automated tests plus 201 option checks, run on Linux and macOS.
+- **Tested.** 213 automated tests plus 205 option checks, run offline on every change. GitHub Actions runs them on Ubuntu and on macOS (bash 3.2), with ShellCheck.
 
 ---
 
@@ -51,13 +51,20 @@ On a Raspberry Pi, putting the collection on a **USB SSD** rather than the SD ca
 
 ### 1. Get the files
 
+Download **`whdsync.zip`** — everything in one archive — save it wherever you want the tool to live, and unpack it:
+
 ```bash
-git clone https://github.com/<your-account>/whdsync.git
+unzip whdsync.zip          # creates a whdsync/ folder
 cd whdsync
-chmod +x *.sh
+chmod +x *.sh to_ilbm.py   # usually already set
 ```
 
-No git? Download the ZIP from the GitHub page, unzip it, and `cd` into the folder.
+Prefer Git?
+
+```bash
+git clone https://github.com/craziazkowboi/whdsync.git
+cd whdsync
+```
 
 ### 2. Choose where it lives
 
@@ -70,6 +77,8 @@ macOS note: avoid iCloud-synced folders such as Desktop and Documents. Something
 ```bash
 ./setup.sh
 ```
+
+That is the whole install: save the zip where you want it, unpack, run `./setup.sh`.
 
 It will:
 
@@ -266,7 +275,7 @@ Settings live in `retroplay.conf` beside the scripts. Copy `retroplay.conf.examp
 |---|---|---|
 | `VARIANTS` | `aga ecs rtg` | Which collections to build |
 | `OUTPUT_ROOT` | `.` | Where `build/` goes — point this at a USB SSD |
-| `ART_ORDER` | `Screens,Covers,Titles` | Which artwork iGame shows first |
+| `ART_ORDER` | `Covers,Screens,Titles` | Which artwork iGame shows first |
 | `FILESYSTEM` | `pfs` | Use `ffs` for the 30-character filename limit. With `pfs`, every run ends with a reminder to run `setfnsize <drive:> 107` on the Amiga first |
 | `ARTWORK_SYNC` | `ask` | `auto` also updates artwork in the nightly run |
 | `LOG_RETENTION_DAYS` | `1` | Delete logs after this many days; `0` keeps them for ever |
@@ -338,25 +347,115 @@ Every one of these has an automated test that fails if the protection is removed
 
 ## Command reference
 
+Every script takes `-h` / `--help`. Options are case-insensitive where a variant is named (`--AGA` works).
+
+### Everyday commands
+
 | Command | What it does |
 |---|---|
 | `./setup.sh` | Install and set up everything (safe to repeat) |
 | `./all.sh` | Update and build every configured variant |
-| `./aga.sh` `./ecs.sh` `./rtg.sh` | Build one variant |
+| `./aga.sh` `./ecs.sh` `./rtg.sh` | Build one variant (pass any `start.sh` option) |
 | `./start.sh` | Menu |
-| `./start.sh --status` | Last run, what's queued, drive, schedule |
-| `./start.sh --plan` | What a run would do; changes nothing |
-| `./start.sh --artwork-*` | `status`, `plan`, `sync`, `verify`, `rollback` |
-| `./start.sh --schedule` | Set up, show or disable the nightly run |
-| `./start.sh --test-notify` | Check notifications work |
 | `./doctor.sh` | Check the setup and explain any fixes |
-| `./uninstall_deps.sh` | Remove tools this tool installed |
 
-Run the leaf scripts on their own and they work out which collection you mean — the one matching the variant you name (`./merge.sh --aga`), or the only one you have. With several and no hint, they list them rather than guess.
+### `all.sh` — the engine
 
-Every script supports `--help`. Useful extras: `--rebuild` (rebuild from archives already downloaded, no server check), `--skip-update`, `--force` (also fill in missing artwork), `--dry-run`.
+| Option | Meaning |
+|---|---|
+| `--aga` `--ecs` `--rtg` `--aga-laced` `--ecs-laced` | Build just this variant (repeatable) |
+| `--set NAME` | Build using the `iGame_NAME` artwork pack |
+| `--variants LIST` / `--variant NAME` | Variants as a list: `--variants aga,ecs` |
+| `--clean` | Rebuild from scratch, discarding the existing collection |
+| `--rebuild` | Rebuild from the archives you already have (no server check) |
+| `--skip-update` | Don't check the server |
+| `--force` | Also fill in artwork for games that have none |
+| `--refresh-artwork` | Rewrite artwork for **every** game, not just gaps |
+| `--dry-run` / `--plan` | Show what would happen; change nothing |
+| `--dest DIR` | Build into this folder (single variant only) |
+| `--art LIST` / `--demo-art LIST` | Artwork order, e.g. `Covers,Screens,Titles` |
+| `--ffs` / `--pfs` | Filename limits to enforce |
+| `--detox` / `--no-detox` | Clean filenames with detox, or don't |
+| `--status` | Last run, what's queued, drive, schedule |
+| `--test-notify` | Send a test notification |
+| `--cron` | Unattended mode: full `PATH`, own log, no prompts |
+| `--debug` | Verbose output |
 
----
+### `start.sh` — the front end
+
+Accepts the variant and formatting options above, plus:
+
+| Option | Meaning |
+|---|---|
+| `--sync` (or `--auto`) | Update and build |
+| `--plan` | Show what a run would do |
+| `--update` `--extract` `--merge` `--sort` `--quick` | Run one stage only |
+| `--rebuild` | Rebuild from downloaded archives |
+| `--status` | Full status |
+| `--test-notify` | Check notifications work |
+| `--setup` | Run the setup helper |
+| `--schedule [options]` | Set up, show or remove the nightly run |
+| `--doctor` | Check the setup |
+| `--artwork-status` `--artwork-plan` `--artwork-sync` `--artwork-verify` `--artwork-rollback NAME` | Artwork (see below) |
+| `--only-missing` | Merge only games with no artwork |
+| `--refresh-artwork` | Rewrite artwork for every game |
+| `--report-missing FILE` | Write the no-artwork list to a file |
+| `--skipchk` `--skip-variant-sort` | Skip the filename check / the variant sort |
+| `--exit` | Leave the menu |
+
+### `artwork_sync.sh` — the artwork packs
+
+| Option | Meaning |
+|---|---|
+| `--status` | What's installed and whether it's current |
+| `--plan` | What an update would do; changes nothing |
+| `--sync` | Download, check and install |
+| `--verify` | Check what's installed and the cached archives |
+| `--rollback NAME` | Restore the previous version, e.g. `iGame_AGA/lores/Covers` |
+| `--for VARIANT` | Only what this build needs (`aga`, `aga-laced`, `ecs`, `ecs-laced`, `rtg`) |
+| `--all-artwork` | Everything the source offers |
+| `--tinylauncher` | Include TinyLauncher |
+| `--force` | Re-download and re-install even if unchanged |
+| `--yes` | Don't ask; use the configured policies |
+
+### `artwork_fetch.sh` — artwork the packs don't have
+
+Off unless `ARTWORK_FETCH="yes"`; normally run for you by `all.sh`.
+
+| Option | Meaning |
+|---|---|
+| `--list FILE` | Games with no artwork (produced by the merge step) |
+| `--variant NAME` | Which collection they belong to |
+| `--dest DIR` | That collection's folder |
+| `--limit N` | Stop after N games this run |
+| `--dry-run` | Show what would happen; fetch nothing |
+
+### The stage scripts
+
+Run these directly only if you want one job done. Each works out which collection you mean from the variant you name, or uses the only one you have.
+
+| Script | Options |
+|---|---|
+| `merge.sh` | variant options, `-d DIR`, `--art LIST`, `--demo-art LIST`, `--only-missing`, `--refresh-artwork`, `--report-missing FILE`, `--why NAME`, `--a314`, `--custom`, `--debug` |
+| `sort.sh` | `-d DIR`, `--ffs`, `--pfs`, `--skipchk`, `--skip-variant-sort`, `--detox`/`--no-detox`, `--custom` |
+| `extract.sh` | `-d DIR`, `-u` (unattended), `--exclude-tags LIST`, `--only-tags LIST`, `--debug` |
+| `update.sh` | `--dry-run` |
+| `quick.sh` | variant options, `-d DIR`, `--art LIST`, `--demo-art LIST`, `--skip-update`, `--no-detox` |
+
+`merge.sh --why NAME` is the one to reach for when a game reports no artwork: it lists every set and section it looked in, and anything in `artwork/` with a similar name.
+
+### Setup and housekeeping
+
+| Command | Options |
+|---|---|
+| `setup.sh` | `--yes`, `--dry-run`, `--cron`, `--no-cron` |
+| `install_cron.sh` (`start.sh --schedule`) | `--time HH:MM`, `--daily`, `--show`, `--disable`, `--dry-run`, `--yes` |
+| `uninstall_deps.sh` | `--dry-run`, `--yes` |
+| `doctor.sh` | *(no options)* |
+
+### Exit codes
+
+`0` done · `2` nothing to do · `3` network or server problem · `4` setup or option problem · `5` some archives couldn't be extracted · `130` interrupted
 
 ## For developers
 
@@ -367,6 +466,8 @@ MATRIX_SECTIONS="1 2" tests/option_matrix.sh    # just some sections
 ```
 
 Both run offline against mock tools and a mock server, so a full run takes minutes and touches nothing outside its temporary folder. GitHub Actions runs them on Ubuntu and macOS (bash 3.2), plus ShellCheck.
+
+Released as `whdsync.zip` (unpack and run `./setup.sh`) and `whdsync.bundle` (a complete Git repository in one file: `git clone whdsync.bundle whdsync`).
 
 The layout: `all.sh` is the engine; `start.sh` is the front end; `update.sh`, `extract.sh`, `merge.sh`, `sort.sh` and `artwork_sync.sh` each do one job; `lib.sh` holds everything shared. All scripts carry a version stamp and refuse to run as a mixed set.
 
