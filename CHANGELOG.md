@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026.09.25 (packaging and docs)
+### Added
+- `whdsync.zip`: every script, the tests and the docs in one archive. Save it where you want the tool to live, unpack, run `./setup.sh`.
+- The README command reference now covers every option of every script - checked mechanically against the scripts' own option parsers, so it cannot drift.
+
 ## 2026.09.25 (final message, README)
 ### Changed
 - The PFS `setfnsize` warning is now printed after the run summary, so it is the last thing on the screen.
