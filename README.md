@@ -62,7 +62,7 @@ chmod +x *.sh to_ilbm.py   # usually already set
 Prefer Git?
 
 ```bash
-git clone https://github.com/<your-account>/whdsync.git
+git clone https://github.com/craziazkowboi/whdsync.git
 cd whdsync
 ```
 
