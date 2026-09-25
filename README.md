@@ -361,7 +361,7 @@ Every script supports `--help`. Useful extras: `--rebuild` (rebuild from archive
 ## For developers
 
 ```bash
-tests/run_tests.sh                    # 157 end-to-end tests, no network needed
+tests/run_tests.sh                    # 213 end-to-end tests, no network needed
 tests/option_matrix.sh                # every option of every script
 MATRIX_SECTIONS="1 2" tests/option_matrix.sh    # just some sections
 ```
