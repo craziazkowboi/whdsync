@@ -13,9 +13,9 @@ VARIANTS="aga ecs rtg"
 OUTPUT_ROOT="."
 
 # Artwork priority. ART_ORDER_<VARIANT> overrides it for one variant.
-ART_ORDER="Covers,Screens,Titles"
+ART_ORDER="Screens,Covers,Titles"
 DEMO_ART_ORDER="Titles,Screens,Covers"
-# ART_ORDER_RTG="Screens,Covers,Titles"
+# ART_ORDER_RTG="Covers,Screens,Titles"
 
 # Artwork packs matched ONLY by the standard layout
 #   <Covers|Screens|Titles>/<Games|Demos|Magazines>/<letter>/<game>/iGame.iff
