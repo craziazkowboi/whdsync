@@ -780,7 +780,7 @@ rp_step() {
 rp_done() { rp_quiet && return 0; printf '      %s%s%s %s\n' "$RP_C_OK" "done" "$RP_C_OFF" "$*"; }
 rp_ts()    { date '+%Y-%m-%d %H:%M:%S'; }
 rp_log()   { printf '[%s] %s\n' "$(rp_ts)" "$*"; }
-rp_warn()  { printf 'WARNING: %s\n' "$*" >&2; }
+rp_warn()  { printf '%sWARNING: %s\n' "$(rp_stamp2 2>/dev/null || true)" "$*" >&2; }
 rp_debug() { [ "${RP_DEBUG:-0}" = "1" ] && printf '[debug] %s\n' "$*" >&2; return 0; }
 rp_die()   {   # rp_die <exit-code> <message...>
     local code="$1"; shift
@@ -1136,6 +1136,10 @@ rp_exit_meaning() {
 # The second argument matters for a download still named "<name>.lha.part":
 # without it the format would be unknown and the file would go untested.
 rp_test_archive() {
+    # A zero-length file is never a valid archive, whatever its name, and
+    # every tool below reports it differently (or not at all). Rejected here
+    # once, so a truncated download cannot reach the extractor.
+    [ -s "$1" ] || return 1
     case "${2:-$1}" in
         *.lha|*.LHA|*.lzh|*.LZH)
             command -v lha >/dev/null 2>&1 || return 0
@@ -1145,8 +1149,13 @@ rp_test_archive() {
             elif command -v 7z >/dev/null 2>&1; then 7z t "$1" >/dev/null 2>&1
             else return 0; fi ;;
         *.lzx|*.LZX)
-            command -v lsar >/dev/null 2>&1 || return 0
-            lsar -t "$1" >/dev/null 2>&1 ;;
+            # unlzx is the tool this suite installs; lsar is a bonus. Trying
+            # unlzx first means LZX is actually verified on a normal setup
+            # instead of being waved through.
+            if command -v unlzx >/dev/null 2>&1; then unlzx -v "$1" >/dev/null 2>&1
+            elif command -v lsar >/dev/null 2>&1; then lsar -t "$1" >/dev/null 2>&1
+            elif command -v 7z >/dev/null 2>&1; then 7z t "$1" >/dev/null 2>&1
+            else return 0; fi ;;
         *) return 0 ;;
     esac
 }
@@ -1154,14 +1163,24 @@ rp_test_archive() {
 # =============================================================================
 # 14. Downloads, checksums, fingerprints (used by the artwork engine)
 # =============================================================================
+# A timestamp, but only where it earns its place. On a terminal a person can
+# see what is happening as it happens, and "[INFO] 2026-09-29 21:14:02 - " in
+# front of every line is noise. In a log or a cron mail, it is the first thing
+# anyone wants: which of the night's lines came before the failure.
+#
+# Inputs:       none. Outputs: the prefix, or nothing on a terminal.
+# Side effects: none.
+rp_stamp()  { [ -t 1 ] && return 0; printf '%s ' "$(date '+%Y-%m-%d %H:%M:%S')"; }
+rp_stamp2() { [ -t 2 ] && return 0; printf '%s ' "$(date '+%Y-%m-%d %H:%M:%S')"; }
+
 # Normal status. Silent under --quiet; warnings and errors never are.
-rp_info()    { rp_quiet && return 0; printf '%s\n' "$*"; }
-rp_ok()      { rp_quiet && return 0; printf '      %sok%s %s\n' "$RP_C_OK" "$RP_C_OFF" "$*"; }
-rp_verbose() { rp_verbose_on || return 0; printf '%s\n' "$*"; }
+rp_info()    { rp_quiet && return 0; printf '%s%s\n' "$(rp_stamp)" "$*"; }
+rp_ok()      { rp_quiet && return 0; printf '%s      %sok%s %s\n' "$(rp_stamp)" "$RP_C_OK" "$RP_C_OFF" "$*"; }
+rp_verbose() { rp_verbose_on || return 0; printf '%s%s\n' "$(rp_stamp)" "$*"; }
 # Failure. rp_error says what went wrong, rp_action gives the one command to
 # run next - together with "what was not changed" they are the shape every
 # failure message in the suite takes.
-rp_error()   { printf '%sERROR:%s %s\n' "$RP_C_ERR" "$RP_C_OFF" "$*" >&2; }
+rp_error()   { printf '%s%sERROR:%s %s\n' "$(rp_stamp2)" "$RP_C_ERR" "$RP_C_OFF" "$*" >&2; }
 rp_action()  { printf '\nNext:  %s\n' "$*" >&2; }
 rp_print_usage_error() {   # <script> <message>
     printf 'ERROR: %s\n' "$2" >&2
@@ -1182,12 +1201,26 @@ rp_have_sha256() { command -v sha256sum >/dev/null 2>&1 || command -v shasum >/d
 rp_fetch() {
     # On a terminal, show the transfer meter; in a log, stay quiet (the
     # caller prints one line per file instead).
+    #
+    # Two different limits, and the difference matters: the CONNECT timeout is
+    # short, because a host that will not answer should be given up on in
+    # seconds, while the overall limit stays long, because an artwork pack is
+    # hundreds of megabytes and a Pi on a slow link genuinely needs the time.
+    # (A 60-second overall cap - a common suggestion - would abandon every
+    # large pack part-way and look like a corrupt download.)
+    local ct="${RP_CONNECT_TIMEOUT:-15}" mt="${RP_FETCH_TIMEOUT:-1800}"
     if command -v curl >/dev/null 2>&1; then
-        if [ -t 1 ] && [ -z "${RP_FETCH_QUIET:-}" ]; then curl -fL --progress-bar -m 1800 -o "$2" "$1"
-        else curl -fsSL -m 1800 -o "$2" "$1"; fi
+        if [ -t 1 ] && [ -z "${RP_FETCH_QUIET:-}" ]; then
+            curl -fL --progress-bar --connect-timeout "$ct" -m "$mt" -o "$2" "$1"
+        else
+            curl -fsSL --connect-timeout "$ct" -m "$mt" -o "$2" "$1"
+        fi
     elif command -v wget >/dev/null 2>&1; then
-        if [ -t 1 ] && [ -z "${RP_FETCH_QUIET:-}" ]; then wget -T 1800 --progress=bar:force -O "$2" "$1"
-        else wget -q -T 1800 -O "$2" "$1"; fi
+        if [ -t 1 ] && [ -z "${RP_FETCH_QUIET:-}" ]; then
+            wget --connect-timeout="$ct" -T "$mt" --progress=bar:force -O "$2" "$1"
+        else
+            wget -q --connect-timeout="$ct" -T "$mt" -O "$2" "$1"
+        fi
     else return 1; fi
 }
 
@@ -1220,6 +1253,93 @@ rp_dir_fingerprint() {
 # beside the collection (so the swap is a rename in one folder, which is
 # instant and atomic) and both start with a dot, so they can never be mistaken
 # for a collection by the retro_* globs in rp_default_collection and friends.
+# ------------------------------------------------------- stopping workers ---
+# Purpose:       stop everything this script started - children AND their
+#                children - when a run is interrupted or fails.
+# Assumptions:   called from a cleanup/EXIT handler in the script that owns
+#                those processes.
+# Inputs:        none (works from $$).
+# Outputs:       none.
+# Side effects:  sends TERM, then KILL to anything still alive.
+#
+# NOT `kill 0`: that signals the whole PROCESS GROUP, which includes the
+# parent. An extract.sh finishing normally under all.sh would take all.sh
+# down with it. `pkill -P $$` is the other extreme - it reaches direct
+# children only, so the lha/wget/7z that a worker subshell actually launched
+# survives a Ctrl-C and keeps writing. This walks the tree instead.
+rp_child_pids() {   # direct children of <pid>, one per line
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -P "$1" 2>/dev/null
+    else
+        # BSD and GNU ps both understand this form.
+        ps -ax -o pid=,ppid= 2>/dev/null | awk -v p="$1" '$2 == p { print $1 }'
+    fi
+}
+
+rp_kill_tree() {   # rp_kill_tree <pid> [signal]
+    local pid="$1" sig="${2:-TERM}" child
+    [ -n "$pid" ] || return 0
+    # Depth first: a worker's own children go before the worker, so nothing
+    # is reparented to init and left running.
+    for child in $(rp_child_pids "$pid"); do
+        rp_kill_tree "$child" "$sig"
+    done
+    kill -"$sig" "$pid" 2>/dev/null || true
+    return 0
+}
+
+rp_reap_children() {
+    local child pids
+    pids="$(rp_child_pids $$)"
+    [ -n "$pids" ] || return 0
+    for child in $pids; do rp_kill_tree "$child" TERM; done
+    # A moment to finish tidily, then insist.
+    sleep 1
+    for child in $pids; do rp_kill_tree "$child" KILL; done
+    wait 2>/dev/null || true
+    return 0
+}
+
+# ------------------------------------------------------- symlink hygiene ---
+# Purpose:       remove any symlink under <root> whose target leaves <root>.
+# Assumptions:   <root> is the downloads folder (or one folder inside it).
+#                A link pointing INSIDE the tree is left alone - some packs
+#                use those deliberately.
+# Inputs:        one or more folders.
+# Outputs:       one line per link removed, on stderr via rp_warn.
+# Side effects:  deletes the link itself, never what it points at.
+#
+# Why: --retr-symlinks tells wget to fetch the file instead of recreating the
+# link, but not every wget build has it, and an FTP listing can carry a link
+# that resolves to somewhere else entirely on the server. Extraction later
+# follows links, so one pointing at / or $HOME is how a mirror turns into a
+# write outside the collection. This is the belt to that option's braces.
+rp_prune_escaping_symlinks() {
+    local root real_root link target n=0
+    for root in "$@"; do
+        [ -d "$root" ] || continue
+        real_root="$(cd "$root" 2>/dev/null && pwd -P)" || continue
+        # -type l finds the links themselves; a broken link is still found.
+        while IFS= read -r link; do
+            [ -n "$link" ] || continue
+            # Where does it actually land? A link whose target does not exist
+            # cannot be resolved, and is removed as well: nothing here should
+            # be a dangling link.
+            target="$(cd "$(dirname "$link")" 2>/dev/null && pwd -P)/$(basename "$link")"
+            target="$(readlink -f "$target" 2>/dev/null || true)"
+            case "$target" in
+                "$real_root"|"$real_root"/*) continue ;;    # stays inside: fine
+            esac
+            rm -f -- "$link" && n=$((n + 1))
+            rp_warn "removed a symlink pointing outside the downloads folder: ${link#$real_root/}"
+        done <<EOF
+$(find "$real_root" -type l 2>/dev/null)
+EOF
+    done
+    [ "$n" -gt 0 ] && rp_info "  removed $n symlink(s) that pointed outside the downloads folder"
+    return 0
+}
+
 # --------------------------------------------------------------- locales ---
 # Pick a locale that this machine actually has.
 #

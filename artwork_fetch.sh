@@ -115,8 +115,7 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/artfetch.XXXXXX")" || exit 1
 cleanup_fetch() {
     local st=$?
     trap - EXIT INT TERM
-    pkill -P $$ 2>/dev/null || true     # the fetch command may still be running
-    wait 2>/dev/null || true
+    rp_reap_children            # the fetch command and whatever it launched
     rm -rf -- "$TMP"
     exit "$st"
 }
@@ -145,6 +144,13 @@ while IFS= read -r rel; do
         printf ' nothing found\n'
         FAILED=$((FAILED + 1)); continue
     fi
+    # Smaller than any real image header: a stub, a "not found" page saved as
+    # a file, or a transfer that stopped early. Checked before Pillow, which
+    # does not reliably reject every such file.
+    if [ "$(rp_file_size "$img")" -lt 128 ] 2>/dev/null; then
+        printf ' what came back was not an image (too small to be one) - ignored\n'
+        FAILED=$((FAILED + 1)); continue
+    fi
     # Make sure it really is a picture before doing anything with it.
     # Pillow's verify() raises for anything that is not a readable image; the
     # traceback is of no use to the person watching, so only the verdict is kept.
@@ -155,7 +161,17 @@ while IFS= read -r rel; do
 
     iff="$TMP/$TRIED.iff"
     if ! python3 "$SCRIPT_DIR/to_ilbm.py" "$img" "$iff" "${GEOM[@]}" > "$TMP/conv.log" 2>&1; then
-        printf ' found a picture, but converting it to IFF failed (see %s)\n' "${TMP##*/}/conv.log"
+        printf ' found a picture, but converting it to IFF failed\n'
+        # The temp folder goes when this script ends, so the reason is copied
+        # into the log that survives rather than pointed at where it was.
+        sed 's/^/      /' "$TMP/conv.log" >> "$RP_LOG_ROOT/artwork_fetch.log" 2>/dev/null || true
+        rp_verbose "      $(tail -1 "$TMP/conv.log" 2>/dev/null)"
+        FAILED=$((FAILED + 1)); continue
+    fi
+    # 32 bytes is FORM + length + ILBM + the start of BMHD. Anything shorter
+    # is not a file iGame can show, however the converter exited.
+    if [ ! -s "$iff" ] || [ "$(rp_file_size "$iff")" -lt 32 ] 2>/dev/null; then
+        printf ' converted, but the IFF came out empty - ignored\n'
         FAILED=$((FAILED + 1)); continue
     fi
 

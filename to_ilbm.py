@@ -1,29 +1,59 @@
 #!/usr/bin/env python3
-"""to_ilbm.py - convert an ordinary image into an Amiga IFF ILBM file.
+"""Convert an ordinary image into an Amiga IFF ILBM file.
 
-Used by artwork_fetch.sh when a game has no artwork in any pack. The output
-matches the artwork already in use: same width, height and colour depth as an
-existing iGame.iff, so iGame shows it exactly like the rest.
+PURPOSE
+    whdsync's artwork packs do not cover every game. When artwork_fetch.sh
+    finds a picture for one that has none, this turns it into the format
+    iGame and TinyLauncher actually read on the Amiga: a FORM/ILBM file with
+    BMHD, CMAP and a ByteRun1-compressed BODY.
 
-  to_ilbm.py <input image> <output .iff> --like <existing .iff>
-  to_ilbm.py <input image> <output .iff> --width 320 --height 128 --planes 8
+    ImageMagick cannot write ILBM, which is why this exists.
 
-Writes a standard FORM/ILBM file: BMHD, CMAP and a ByteRun1-compressed BODY,
-which is what iGame and TinyLauncher expect. Needs Pillow (python3-pil).
+DEPENDENCIES
+    python3 and Pillow (Debian/Raspberry Pi OS: python3-pil, macOS:
+    pip3 install pillow). Nothing else.
+
+USAGE
+    to_ilbm.py IN.png OUT.iff --like artwork/iGame_AGA/lores/.../iGame.iff
+    to_ilbm.py IN.jpg OUT.iff --width 320 --height 128 --planes 8
+
+    --like copies the size and colour depth from artwork already installed,
+    so what is added looks like the rest of the collection. Failing that,
+    the defaults are 320x128 in 8 bitplanes (256 colours), which is what the
+    iGame packs use.
+
+EXIT STATUS
+    0  the file was written
+    1  the picture could not be read, converted or written
+    2  the command line was wrong (argparse's own code)
+    4  Pillow is not installed
 """
 
-import sys
+from __future__ import annotations
+
+import argparse
+import os
 import struct
+import sys
+from typing import List, Tuple
 
 try:
     from PIL import Image
 except ImportError:                                    # pragma: no cover
-    sys.stderr.write("to_ilbm: Pillow is not installed (sudo apt install python3-pil)\n")
+    sys.stderr.write(
+        "to_ilbm: Pillow is not installed "
+        "(Linux: sudo apt install python3-pil, macOS: pip3 install pillow)\n")
     sys.exit(4)
 
 
-def read_bmhd(path):
-    """Width, height and bitplane count of an existing IFF ILBM file."""
+def read_bmhd(path: str) -> Tuple[int, int, int]:
+    """Width, height and bitplane count of an existing IFF ILBM file.
+
+    IFF is a chunked format: "FORM", a 4-byte big-endian length, the form
+    type ("ILBM"), then chunks of <4-byte id><4-byte length><payload>, each
+    padded to an even length. BMHD is the bitmap header; its bitplane count
+    sits at offset 8 within the payload.
+    """
     with open(path, "rb") as fh:
         data = fh.read(64)
     if data[0:4] != b"FORM" or data[8:12] != b"ILBM":
@@ -36,12 +66,19 @@ def read_bmhd(path):
             w, h = struct.unpack(">HH", data[pos + 8:pos + 12])
             planes = data[pos + 16]
             return w, h, planes
-        pos += 8 + size + (size & 1)
+        pos += 8 + size + (size & 1)                   # chunks are word aligned
     raise ValueError("no BMHD chunk in %s" % path)
 
 
-def pack_bitplanes(img, width, height, planes):
-    """Interleaved bitplane rows, as ILBM stores them."""
+def pack_bitplanes(img: "Image.Image", width: int, height: int,
+                   planes: int) -> bytes:
+    """Interleaved bitplane rows, as ILBM stores them.
+
+    The Amiga's display hardware reads bitplanes, not chunky pixels: for each
+    row, all the bit-0 values come first as a bitstream, then all the bit-1
+    values, and so on. Each plane's row is padded to a whole number of
+    16-bit words, because that is the unit the blitter works in.
+    """
     row_bytes = ((width + 15) // 16) * 2
     pixels = img.load()
     out = bytearray()
@@ -56,8 +93,12 @@ def pack_bitplanes(img, width, height, planes):
     return bytes(out)
 
 
-def byterun1(data):
-    """ILBM's run-length compression."""
+def byterun1(data: bytes) -> bytes:
+    """ILBM's ByteRun1 (PackBits) compression.
+
+    A control byte n means: 0..127 -> the next n+1 bytes are literal;
+    129..255 -> repeat the next byte 257-n times. 128 is unused.
+    """
     out = bytearray()
     i, n = 0, len(data)
     while i < n:
@@ -80,57 +121,111 @@ def byterun1(data):
     return bytes(out)
 
 
-def chunk(cid, payload):
+def chunk(cid: bytes, payload: bytes) -> bytes:
+    """One IFF chunk: id, big-endian length, payload, pad to an even length."""
     out = cid + struct.pack(">I", len(payload)) + payload
     if len(payload) & 1:
-        out += b"\0"                                   # chunks are word aligned
+        out += b"\0"
     return out
 
 
-def main():
-    args = sys.argv[1:]
-    if len(args) < 2:
-        sys.stderr.write(__doc__)
-        return 4
-    src, dst = args[0], args[1]
-    width = height = planes = None
-    i = 2
-    while i < len(args):
-        if args[i] == "--like":
-            width, height, planes = read_bmhd(args[i + 1]); i += 2
-        elif args[i] == "--width":
-            width = int(args[i + 1]); i += 2
-        elif args[i] == "--height":
-            height = int(args[i + 1]); i += 2
-        elif args[i] == "--planes":
-            planes = int(args[i + 1]); i += 2
-        else:
-            sys.stderr.write("to_ilbm: unknown option %s\n" % args[i])
-            return 4
-    width = width or 320
-    height = height or 128
-    planes = planes or 8
-    colours = 1 << planes
+def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="to_ilbm.py",
+        description="Convert an image into an Amiga IFF ILBM file.",
+        epilog="Example: to_ilbm.py cover.png iGame.iff --like existing.iff")
+    parser.add_argument("source", help="the image to convert (PNG, JPEG, ...)")
+    parser.add_argument("dest", help="the .iff file to write")
+    parser.add_argument("--like", metavar="IFF",
+                        help="copy the size and colour depth from this IFF")
+    parser.add_argument("--width", type=int, help="width in pixels (default 320)")
+    parser.add_argument("--height", type=int, help="height in pixels (default 128)")
+    parser.add_argument("--planes", type=int,
+                        help="bitplanes, 1-8; 8 = 256 colours (default 8)")
+    return parser.parse_args(argv)
 
-    img = Image.open(src)
-    img = img.convert("RGB")
-    # Fit inside the target, keeping the shape, then centre it on black -
-    # a stretched cover looks wrong on the Amiga.
+
+def convert(source: str, dest: str, width: int, height: int, planes: int) -> None:
+    """Read `source`, fit it to width x height, and write `dest` as ILBM."""
+    colours = 1 << planes
+    with Image.open(source) as opened:
+        img = opened.convert("RGB")
+    # Fit inside the target, keeping the shape, then centre it on black:
+    # a stretched cover looks wrong on the Amiga, and the packs' own artwork
+    # is letterboxed the same way.
     img.thumbnail((width, height), Image.LANCZOS)
     canvas = Image.new("RGB", (width, height), (0, 0, 0))
     canvas.paste(img, ((width - img.width) // 2, (height - img.height) // 2))
+    # The Amiga has a hardware palette, so the picture must be reduced to at
+    # most 2^planes colours before it can be stored as bitplanes.
     pal = canvas.quantize(colors=colours, method=Image.MEDIANCUT)
 
     table = pal.getpalette()[:colours * 3]
-    table += [0] * (colours * 3 - len(table))
+    table += [0] * (colours * 3 - len(table))          # CMAP is always full
 
     body = byterun1(pack_bitplanes(pal, width, height, planes))
+    # BMHD: w, h, x, y, planes, mask, compression(1=ByteRun1), pad,
+    #       transparent colour, x/y aspect, page width, page height
     bmhd = struct.pack(">HHhhBBBBHBBhh",
-                       width, height, 0, 0, planes, 0, 1, 0, 0, 1, 1, width, height)
-    form = b"ILBM" + chunk(b"BMHD", bmhd) + chunk(b"CMAP", bytes(table)) + chunk(b"BODY", body)
-    with open(dst, "wb") as fh:
+                       width, height, 0, 0, planes, 0, 1, 0, 0, 1, 1,
+                       width, height)
+    form = (b"ILBM" + chunk(b"BMHD", bmhd) + chunk(b"CMAP", bytes(table))
+            + chunk(b"BODY", body))
+    with open(dest, "wb") as fh:
         fh.write(b"FORM" + struct.pack(">I", len(form)) + form)
-    print("%s: %dx%d, %d colours" % (dst, width, height, colours))
+    print("%s: %dx%d, %d colours" % (dest, width, height, colours))
+
+
+def main(argv: List[str] | None = None) -> int:
+    args = parse_args(argv)
+
+    width, height, planes = args.width, args.height, args.planes
+    if args.like:
+        try:
+            like_w, like_h, like_p = read_bmhd(args.like)
+        except (OSError, ValueError, struct.error, IndexError) as exc:
+            sys.stderr.write("to_ilbm: could not read %s: %s\n" % (args.like, exc))
+            return 1
+        width = width or like_w
+        height = height or like_h
+        planes = planes or like_p
+
+    width = width or 320
+    height = height or 128
+    planes = planes or 8
+    if not 1 <= planes <= 8:
+        sys.stderr.write("to_ilbm: --planes must be between 1 and 8, not %d\n" % planes)
+        return 1
+    if width < 1 or height < 1:
+        sys.stderr.write("to_ilbm: --width and --height must be positive\n")
+        return 1
+
+    # Checked here rather than caught below, so a missing SOURCE cannot be
+    # reported with the same message as an unwritable DESTINATION.
+    if not os.path.isfile(args.source):
+        sys.stderr.write("to_ilbm: no such image: %s\n" % args.source)
+        return 1
+
+    try:
+        convert(args.source, args.dest, width, height, planes)
+    except IsADirectoryError:
+        sys.stderr.write("to_ilbm: %s is a folder, not a file\n" % args.dest)
+        return 1
+    except FileNotFoundError:
+        sys.stderr.write("to_ilbm: cannot write %s - the folder does not exist\n"
+                         % args.dest)
+        return 1
+    except PermissionError as exc:
+        sys.stderr.write("to_ilbm: %s\n" % exc)
+        return 1
+    except OSError as exc:
+        # Pillow raises OSError for a file it cannot decode, and so does a
+        # failed write (a full disk, a read-only drive).
+        sys.stderr.write("to_ilbm: could not convert %s: %s\n" % (args.source, exc))
+        return 1
+    except (ValueError, MemoryError, struct.error) as exc:
+        sys.stderr.write("to_ilbm: could not convert %s: %s\n" % (args.source, exc))
+        return 1
     return 0
 
 

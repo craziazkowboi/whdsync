@@ -85,6 +85,22 @@ if [ -z "$flock_bin" ] && [ "$OS_TYPE" = "darwin" ] && command -v brew >/dev/nul
 fi
 if [ -n "$flock_bin" ]; then good "flock (prevents overlapping runs): $flock_bin"
 else warn "flock is missing - two runs could overlap" "$(install_hint util-linux util-linux)"; fi
+# unzip is only used to test .zip downloads for damage; 7z covers the same
+# job, so this is a nicety rather than a requirement.
+if command -v unzip >/dev/null 2>&1; then good "unzip (integrity checks on .zip downloads)"
+else warn "unzip is missing - .zip downloads are checked with 7z instead" "$(install_hint unzip unzip)"; fi
+# python3 + Pillow only matter when the last-resort artwork search is on.
+if [ "${RP_ARTWORK_FETCH:-no}" = "yes" ]; then
+    if ! command -v python3 >/dev/null 2>&1; then
+        prob "ARTWORK_FETCH=yes but python3 is not installed" "$(install_hint python3 python3)"
+    elif ! python3 -c 'import PIL' >/dev/null 2>&1; then
+        prob "ARTWORK_FETCH=yes but Pillow is not installed for python3" "$(install_hint python3-pil python3-pil)"
+    else
+        good "python3 with Pillow (makes IFF artwork for games the packs miss)"
+    fi
+else
+    good "python3/Pillow not needed (ARTWORK_FETCH=no)"
+fi
 if [ "$RP_USE_DETOX" = "yes" ]; then
     if command -v detox >/dev/null 2>&1; then good "detox ($(detox -V 2>&1 | head -1))"
     else prob "USE_DETOX=yes but detox is not installed" "$(install_hint detox 'detox (or build 3.0.1 from source - start.sh offers to)')"; fi

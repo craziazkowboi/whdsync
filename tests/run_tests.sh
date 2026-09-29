@@ -1731,6 +1731,183 @@ check "rp_pick_locale returns one the machine has" \
 check "...and nothing at all when none of them exist" \
   '[ -z "$(cd "$ROOT" && bash -c "SCRIPT_DIR=. . ./lib.sh; rp_pick_locale zz_ZZ.UTF-8 qq_QQ.ISO-8859-9" 2>/dev/null)" ] && [ -n "$(cd "$ROOT" && bash -c "SCRIPT_DIR=. . ./lib.sh; rp_pick_locale qq_QQ.X C.UTF-8" 2>/dev/null)" ]'
 
+
+section "63. Strict mode, temp files and the IFF converter"
+# set -u is on for the pipeline scripts (NOT -e: this pipeline tolerates
+# non-zero from some commands on purpose and checks the codes itself).
+check "the pipeline scripts run under set -u" \
+  '( for f in all.sh extract.sh merge.sh update.sh start.sh; do
+        grep -qE "^set -u" "$ROOT/$f" || exit 1; done )'
+check "...and none of them turn on errexit, which would abort a partial build" \
+  '! grep -qE "^set -e|^set -[a-z]*e[a-z]* " "$ROOT/all.sh" "$ROOT/extract.sh" "$ROOT/merge.sh" "$ROOT/update.sh"'
+# (written as a fixed-string grep for the FIX, not the bug: naming the old
+# variable inside an eval'd check would expand it and trip set -u)
+check "the OS name is read from /etc/os-release, not left empty" \
+  'grep -qF "_osr PRETTY_NAME" "$ROOT/extract.sh"'
+run osname ./extract.sh -u -d "$T/osname_out"
+check "...so the banner names the system instead of printing nothing" \
+  '! grep -qE "^Operating System: *$" "$T/osname.log"'
+# merge.sh used to put its logs at a guessable /tmp path
+check "merge.sh makes a private temp folder instead of /tmp/artwork_merger_*" \
+  '! sed -e "s/[[:space:]]#.*$//" -e "s/^[[:space:]]*#.*$//" "$ROOT/merge.sh" | grep -q "/tmp/artwork_merger" &&
+   grep -q "mktemp -d" "$ROOT/merge.sh"'
+run mtemp ./merge.sh --aga -d "$ROOT/build/retro_aga"
+check "...and leaves nothing behind when it finishes" \
+  '[ -z "$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name "whdsync_merge.*" 2>/dev/null | head -1)" ]'
+# rp_fetch: a short connect timeout, but a long overall one for big packs
+check "downloads give up quickly on a dead host" \
+  'grep -q "connect-timeout" "$ROOT/lib.sh"'
+check "...but still allow time for a pack of hundreds of megabytes" \
+  'grep -qE "RP_FETCH_TIMEOUT:-1800" "$ROOT/lib.sh"'
+# Logs get a timestamp; terminals do not.
+check "a redirected line carries the date and time" \
+  '(cd "$ROOT" && bash -c "SCRIPT_DIR=. . ./lib.sh; rp_info hello") 2>&1 |
+     grep -qE "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} hello$"'
+
+section "64. to_ilbm.py: argument handling and failure paths"
+if python3 -c 'import PIL' >/dev/null 2>&1; then
+    python3 - "$T/in.png" <<'PYGEN'
+import sys
+from PIL import Image
+Image.new("RGB", (640, 480), (120, 30, 200)).save(sys.argv[1])
+PYGEN
+    ( cd "$ROOT" && python3 to_ilbm.py "$T/in.png" "$T/out.iff" --width 320 --height 128 --planes 8 ) > "$T/ilbm.log" 2>&1; st=$?
+    check "it writes an IFF ILBM and exits 0" \
+      '[ "$st" -eq 0 ] && [ -s "$T/out.iff" ] &&
+       [ "$(head -c 4 "$T/out.iff")" = "FORM" ] &&
+       [ "$(dd if="$T/out.iff" bs=1 skip=8 count=4 2>/dev/null)" = "ILBM" ]'
+    ( cd "$ROOT" && python3 to_ilbm.py "$T/in.png" "$T/out2.iff" --like "$T/out.iff" ) >/dev/null 2>&1; st=$?
+    check "--like copies the size and depth of artwork already installed" \
+      '[ "$st" -eq 0 ] && [ -s "$T/out2.iff" ] &&
+       [ "$(wc -c < "$T/out.iff")" -gt 100 ]'
+    ( cd "$ROOT" && python3 to_ilbm.py "$T/nope.png" "$T/x.iff" ) > "$T/ilbm_miss.log" 2>&1; st=$?
+    check "a missing picture fails with 1 and says which file" \
+      '[ "$st" -eq 1 ] && grep -q "no such image" "$T/ilbm_miss.log"'
+    echo "not an image" > "$T/junk.bin"
+    ( cd "$ROOT" && python3 to_ilbm.py "$T/junk.bin" "$T/x.iff" ) > "$T/ilbm_junk.log" 2>&1; st=$?
+    check "something that is not a picture fails with 1, not a traceback" \
+      '[ "$st" -eq 1 ] && ! grep -q "Traceback" "$T/ilbm_junk.log"'
+    ( cd "$ROOT" && python3 to_ilbm.py "$T/in.png" "$T/x.iff" --like "$T/junk.bin" ) > "$T/ilbm_like.log" 2>&1; st=$?
+    check "--like pointed at something that is not an IFF fails cleanly" \
+      '[ "$st" -eq 1 ] && ! grep -q "Traceback" "$T/ilbm_like.log"'
+    ( cd "$ROOT" && python3 to_ilbm.py "$T/in.png" "$T/nodir/x.iff" ) > "$T/ilbm_dest.log" 2>&1; st=$?
+    check "a destination folder that does not exist says so, not 'no such image'" \
+      '[ "$st" -eq 1 ] && grep -q "cannot write" "$T/ilbm_dest.log"'
+    ( cd "$ROOT" && python3 to_ilbm.py "$T/in.png" "$T/x.iff" --planes 99 ) > "$T/ilbm_planes.log" 2>&1; st=$?
+    check "an impossible bitplane count is refused" \
+      '[ "$st" -eq 1 ] && grep -q "between 1 and 8" "$T/ilbm_planes.log"'
+    ( cd "$ROOT" && python3 to_ilbm.py ) > "$T/ilbm_noargs.log" 2>&1; st=$?
+    check "no arguments prints the usage argparse builds" \
+      '[ "$st" -eq 2 ] && grep -qi "usage:" "$T/ilbm_noargs.log"'
+else
+    echo "  (skipped: python3 with Pillow is not installed)"
+fi
+
+
+section "65. Bash 3.2 stays possible everywhere except merge.sh"
+# merge.sh is allowed bash 4 (it re-execs itself under it). Everything else
+# has to run on macOS's stock bash 3.2, and the way that breaks is silent:
+# ${x^^} expands to nothing rather than failing. This is a grep with comments
+# and here-documents stripped, so a comment ABOUT the feature does not trip it.
+bash4_hits() {   # bash4_hits <file>  -> prints offending lines, if any
+    sed -e 's/[[:space:]]#.*$//' -e 's/^[[:space:]]*#.*$//' "$1" |
+        grep -nE '\$\{[A-Za-z_][A-Za-z0-9_]*(\^\^|,,)|declare -A|local -A|\breadarray\b|\bmapfile\b|wait -n'
+}
+b4_bad=""
+for f in "$ROOT"/*.sh; do
+    case "${f##*/}" in merge.sh) continue ;; esac
+    [ -n "$(bash4_hits "$f")" ] && b4_bad="$b4_bad ${f##*/}"
+done
+check "no bash 4+ feature outside merge.sh" '[ -z "$b4_bad" ]'
+check "merge.sh is the one exception, and re-execs under bash 4" \
+  'grep -q "declare -A" "$ROOT/merge.sh" && grep -q "BASH_VERSINFO" "$ROOT/merge.sh" &&
+   grep -qE "^ *exec " "$ROOT/merge.sh"'
+# ...and the check itself has to work, or it proves nothing.
+printf 'x=${foo^^}\n' > "$T/b4probe.sh"
+check "the check would actually catch one" '[ -n "$(bash4_hits "$T/b4probe.sh")" ]'
+printf '# a comment mentioning ${foo^^} and declare -A\n' > "$T/b4comment.sh"
+check "...and does not trip over a comment that mentions one" \
+  '[ -z "$(bash4_hits "$T/b4comment.sh")" ]'
+
+section "66. Interrupting a run stops the whole tree, not just its children"
+# pkill -P $$ reaches direct children only: the lha/wget a worker launched
+# would carry on writing after Ctrl-C. kill 0 would be worse - it signals the
+# process group, so a finishing extract.sh would take all.sh down with it.
+check "no script signals its whole process group" \
+  '( for f in "$ROOT"/*.sh; do
+        sed -e "s/[[:space:]]#.*$//" -e "s/^[[:space:]]*#.*$//" "$f" | grep -q "kill 0" && exit 1
+     done; exit 0 )'
+check "the stage scripts reap the tree instead" \
+  '( for f in extract.sh merge.sh sort.sh artwork_sync.sh artwork_fetch.sh; do
+        grep -q "rp_reap_children" "$ROOT/$f" || exit 1; done )'
+cat > "$T/reap.sh" <<REAPEOF
+#!/usr/bin/env bash
+SCRIPT_DIR="$ROOT"
+. "$ROOT/lib.sh"
+cleanup() { rp_reap_children; }
+trap cleanup EXIT
+( bash -c 'sleep 4242' ) &
+sleep 1
+exit 0
+REAPEOF
+chmod +x "$T/reap.sh"
+"$T/reap.sh" >/dev/null 2>&1
+sleep 2
+check "a grandchild of an interrupted run does not survive it" \
+  '[ "$(pgrep -f "sleep 4242" 2>/dev/null | grep -c . )" -eq 0 ]'
+
+section "67. Nothing damaged reaches the collection"
+check "a zero-length archive is never treated as valid" \
+  ': > "$T/empty.lha"; ! (cd "$ROOT" && bash -c "SCRIPT_DIR=. . ./lib.sh; rp_test_archive \"$T/empty.lha\"")'
+check "...and a real one still passes" \
+  'printf "B\nx.lha\n" > "$T/ok.lha"; (cd "$ROOT" && bash -c "SCRIPT_DIR=. . ./lib.sh; rp_test_archive \"$T/ok.lha\"")'
+check "an IFF shorter than its own header is rejected, not installed" \
+  'grep -q "came out empty" "$ROOT/artwork_fetch.sh" && grep -qE "lt 32" "$ROOT/artwork_fetch.sh"'
+check "a picture too small to be one is rejected before conversion" \
+  'grep -q "too small to be one" "$ROOT/artwork_fetch.sh"'
+check "the reason a conversion failed outlives the temp folder" \
+  'grep -q "artwork_fetch.log" "$ROOT/artwork_fetch.sh"'
+check ".lzx is verified with unlzx, not only when lsar happens to be there" \
+  'grep -q "unlzx -v" "$ROOT/lib.sh"'
+
+section "68. The crontab is edited by exact text, never by pattern"
+check "both marker names are matched" \
+  'grep -q "retroplay-all-sh" "$ROOT/install_cron.sh" && grep -q "whdsync-all-sh" "$ROOT/install_cron.sh"'
+check "every crontab filter uses -F (plain text, not a regex)" \
+  '! grep -nE "grep +-v +\"" "$ROOT/install_cron.sh" && grep -q "grep -v -F" "$ROOT/install_cron.sh"'
+check "it never filters on the bare word whdsync, which would eat other lines" \
+  '! grep -nE "grep +-v.*[\"'"'"']whdsync[\"'"'"']" "$ROOT/install_cron.sh"'
+printf '0 5 * * * /usr/bin/backup.sh\n30 2 * * * cd /x && ./all.sh --cron # retroplay-all-sh-cron\n' > "$T/crontab.txt"
+run cronre ./install_cron.sh --time 03:30 --yes
+check "re-running it leaves exactly one of our lines, and the user's own line alone" \
+  '[ "$(grep -c "retroplay-all-sh" "$T/crontab.txt")" -eq 1 ] &&
+   grep -q "backup.sh" "$T/crontab.txt"'
+
+section "69. A mirrored symlink can never point outside downloads/"
+check "wget is asked to fetch the file rather than copy the link, when it can" \
+  'grep -q -- "--retr-symlinks" "$ROOT/update.sh"'
+mkdir -p "$T/symroot/inside/deep" "$T/symoutside"
+echo secret > "$T/symoutside/secret.txt"
+echo real   > "$T/symroot/inside/real.lha"
+ln -sf "$T/symoutside/secret.txt" "$T/symroot/escape.lha"
+ln -sf inside/real.lha "$T/symroot/stays.lha"
+ln -sf /nowhere/at/all "$T/symroot/broken.lha"
+( cd "$ROOT" && bash -c "SCRIPT_DIR=. . ./lib.sh; rp_prune_escaping_symlinks '$T/symroot'" ) >/dev/null 2>&1
+check "a link pointing outside is removed" '[ ! -e "$T/symroot/escape.lha" ]'
+check "a link that stays inside is left alone" '[ -L "$T/symroot/stays.lha" ]'
+check "a dangling link is removed too" '[ ! -e "$T/symroot/broken.lha" ]'
+check "what the link pointed at is never touched" '[ -s "$T/symoutside/secret.txt" ]'
+check "the sweep runs after every mirror pass" 'grep -q "rp_prune_escaping_symlinks" "$ROOT/update.sh"'
+
+section "70. The Latin-1 locale reaches the extractor's subshell"
+# extract_archive runs inside `timeout bash -c ...` - a fresh bash, which sees
+# exported variables only. Without the export the Latin-1 passes silently ran
+# with no locale at all on every machine that has `timeout`.
+check "the chosen locales are exported, not just set" \
+  'grep -qE "^export RP_LC_LATIN1 RP_LC_UTF8" "$ROOT/extract.sh"'
+check "...and the function that uses them is exported too" \
+  'grep -q "export -f extract_archive" "$ROOT/extract.sh"'
+
 # ================================================================ summary ===
 echo
 if [ "$FAIL" -eq 0 ]; then

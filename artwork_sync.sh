@@ -139,8 +139,7 @@ WARNINGS=0; INSTALLED=0; SKIPPED=0; FAILED=0
 cleanup() {
     local st=$?
     trap - EXIT INT TERM
-    pkill -P $$ 2>/dev/null || true
-    wait 2>/dev/null || true
+    rp_reap_children            # the lha it launched, not just the shell
     [ -n "${MY_WORK:-}" ] && rm -rf "$MY_WORK"
     rp_lock_release 2>/dev/null || true
     exit "$st"

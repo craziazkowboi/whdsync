@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.4 - 2026-09-29 (hardening pass: strict mode, temp files, child processes)
+### Fixed
+- **The Latin-1 extraction passes still never ran on Linux.** Yesterday's
+  locale fix chose the right locale but did not export it, and
+  `extract_archive` runs inside `timeout bash -c ...` - a fresh shell that
+  sees exported variables only. `RP_LC_LATIN1`/`RP_LC_UTF8` are exported now.
+  This was a regression introduced by that fix; it only ever affected machines
+  with `timeout`, which is to say every Linux one.
+- The Linux banner printed `Operating System:` and nothing else:
+  `OS_NAME="$PRETTY_NAME"` was a leftover from when `/etc/os-release` was
+  sourced. It is read field by field like the others now.
+- `merge.sh` kept its logs at `/tmp/artwork_merger_*.$$` - a guessable name in
+  a world-writable folder, and one that ignored `TMPDIR`. One `mktemp -d`
+  folder per run instead, swept up like every other temp folder.
+- `.lzx` archives were only integrity-checked when `lsar` happened to be
+  installed, so on a normal setup (which installs `unlzx`) they never were.
+- A zero-length file is now rejected as an archive outright, whatever its name.
+
+### Changed
+- `set -u -o pipefail` on `extract.sh`, `merge.sh` and `update.sh`, which is
+  how the `PRETTY_NAME` bug would have been caught. **Not** `set -e`: adding
+  errexit everywhere fails 121 of the 386 tests, because the pipeline
+  deliberately tolerates non-zero from some commands and turns "3 archives
+  could not be extracted" into a completed build with a warning.
+- Interrupting a run now stops the whole child tree. `pkill -P $$` reached
+  direct children only, so the `lha`/`wget` a worker had launched carried on
+  writing after Ctrl-C. Not `kill 0`, which signals the process group: a
+  finishing `extract.sh` would take `all.sh` down with it.
+- Downloads give up on a host that will not answer after 15 seconds, while
+  still allowing 30 minutes for a pack that is genuinely large.
+- A symlink under `downloads/` that points outside it is removed after every
+  mirror pass, and `wget --retr-symlinks` is used where the build has it, so
+  extraction cannot follow a link out of the collection.
+- `install_cron.sh` edits the crontab with `grep -F` throughout and matches
+  both `retroplay-all-sh` and `whdsync-all-sh`, never the bare word.
+- Log output carries a timestamp; terminal output does not.
+- `to_ilbm.py` uses argparse, type hints and structured exception handling:
+  a missing picture, a file that is not one, a bad `--like`, an unwritable
+  destination and an impossible bitplane count each exit 1 with one sentence
+  instead of a traceback.
+- Artwork that converts to an empty or truncated IFF, or that came back too
+  small to be a picture, is rejected rather than installed. The reason a
+  conversion failed is copied into `logs/artwork_fetch.log`, which outlives
+  the temp folder it used to point at.
+
+### Tests
+- 386 automated tests (was 344) and 205 option checks.
+
 ## 0.4 - 2026-09-29 (reported from the Mac and the Pi)
 ### Fixed
 - **`--aga-laced` and `--ecs-laced` were never using the laced artwork.** The

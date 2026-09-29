@@ -72,7 +72,27 @@ if ! command -v crontab >/dev/null 2>&1; then
     exit 4
 fi
 
-current_entry() { crontab -l 2>/dev/null | grep "retroplay-all-sh" || true; }
+# Both names are matched: "retroplay-all-sh" is what earlier releases wrote,
+# "whdsync-all-sh" is what this one writes. -F throughout, so a marker is
+# matched as plain text and never as a pattern. Never a bare "whdsync": that
+# would also match any other line of the user's crontab mentioning the tool.
+CRON_MARKERS="retroplay-all-sh whdsync-all-sh"
+current_entry() {
+    local m
+    for m in $CRON_MARKERS; do
+        crontab -l 2>/dev/null | grep -F "$m" && return 0
+    done
+    return 0
+}
+# Everything EXCEPT our own lines. Each marker filtered in turn, with -F.
+crontab_without_ours() {
+    local m out
+    out="$(crontab -l 2>/dev/null || true)"
+    for m in $CRON_MARKERS; do
+        out="$(printf '%s\n' "$out" | grep -v -F "$m" || true)"
+    done
+    printf '%s\n' "$out"
+}
 
 MARKER="# retroplay-all-sh-cron"
 
@@ -93,7 +113,7 @@ if [ "$ACTION" = "disable" ]; then
         printf 'Remove the nightly run? [y/N] '; read -r reply
         case "$reply" in [Yy]*) ;; *) echo "Left as it is."; exit 2 ;; esac
     fi
-    { crontab -l 2>/dev/null | grep -v "retroplay-all-sh" || true; } | crontab -
+    crontab_without_ours | crontab -
     echo "Removed. Your other cron entries were left alone."
     exit 0
 fi
@@ -119,7 +139,7 @@ if [ "$DRY" -eq 1 ]; then
     [ -n "$(current_entry)" ] && { echo "replacing:"; current_entry | sed 's/^/  /'; }
     exit 0
 fi
-{ crontab -l 2>/dev/null | grep -v -F "retroplay-all-sh" || true; echo "$CRON_LINE"; } | crontab -
+{ crontab_without_ours; echo "$CRON_LINE"; } | crontab -
 
 echo "Installed: all.sh will run every day at $RUN_TIME."
 echo "  $CRON_LINE"

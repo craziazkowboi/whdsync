@@ -4,6 +4,13 @@
 # looked for there first (see lib.sh).
 RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
 RP_ORIG_ARGS="$*"      # remembered for the lock record and the logs
+# Unset variables are a bug (this is how the empty "Operating System:"
+# line went unnoticed for so long), and a pipeline reports the first
+# failure rather than the last. NOT -e: the pipeline deliberately
+# tolerates non-zero from some commands and checks exit codes itself,
+# and errexit would turn "3 archives could not be extracted" into
+# "the whole build stopped".
+set -u -o pipefail
 #
 # Purpose: Extracts archives in parallel.  Options: -d/--dest DIR -u (unattended)
 #            --exclude-tags LIST --only-tags LIST --debug --help
@@ -47,20 +54,24 @@ else
     BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m';
 fi
 
-# OS detection
+# OS detection.
+# /etc/os-release is read field by field rather than sourced: sourcing it
+# would run whatever the file contains. PRETTY_NAME is read the same way -
+# it used to be referenced as "$PRETTY_NAME", a leftover from when the file
+# WAS sourced, so the banner printed "Operating System:" with nothing after
+# it on every Linux machine.
+OS_TYPE="unknown"; OS_NAME="Unknown"
 if [ -f /etc/os-release ]; then
-    # Read the two fields we need instead of sourcing the file (which would
-    # run whatever it contains).
-    ID="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"'"'"'\"' | head -1)"
-    ID_LIKE="$(sed -n 's/^ID_LIKE=//p' /etc/os-release | tr -d '"'"'"'\"' | head -1)"
+    _osr() { sed -n "s/^$1=//p" /etc/os-release 2>/dev/null | tr -d "\"'" | head -1; }
+    ID="$(_osr ID)"
+    ID_LIKE="$(_osr ID_LIKE)"
     OS_TYPE="linux"
-    OS_NAME="$PRETTY_NAME"
-elif command -v uname >/dev/null; then
+    OS_NAME="$(_osr PRETTY_NAME)"
+    [ -n "$OS_NAME" ] || OS_NAME="${ID:-Linux}"
+    unset -f _osr
+elif command -v uname >/dev/null 2>&1; then
     OS_TYPE="$(uname -s | tr '[:upper:]' '[:lower:]')"
     [ "$OS_TYPE" = "darwin" ] && OS_NAME="macOS"
-else
-    OS_TYPE="unknown"
-    OS_NAME="Unknown"
 fi
 
 sanitize_amiga_names_macos() {
@@ -449,8 +460,7 @@ cleanup_extract() {
     local st=$?
     rp_lock_release
     trap - EXIT INT TERM
-    pkill -P $$ 2>/dev/null     # no-op on a normal finish: no jobs left
-    wait 2>/dev/null
+    rp_reap_children            # workers AND the lha/7z they launched
     if [ -d "${tmpdir:-}" ]; then
         [ -n "${ERROR_LOG:-}" ] && cat "$tmpdir"/dir_*.log 2>/dev/null >> "$ERROR_LOG"
         rm -rf -- "$tmpdir"
@@ -624,6 +634,11 @@ extract_archive() {
     return $((1 - success))
 }
 export -f extract_archive
+# extract_archive runs inside `timeout bash -c ...` when timeout exists - a
+# FRESH bash, which inherits exported variables only. Without these the
+# Latin-1 passes silently saw an empty locale and never ran, on exactly the
+# Linux machines where `timeout` is always present.
+export RP_LC_LATIN1 RP_LC_UTF8
 
 dir_index=0
 declare -a JOB_PIDS=()

@@ -79,8 +79,7 @@ cleanup_sort() {
     local st=$?
     rp_lock_release
     trap - EXIT
-    pkill -P $$ 2>/dev/null || true
-    wait 2>/dev/null || true
+    rp_reap_children            # workers AND anything they launched
     [ -n "${compliance_tmpdir:-}" ] && rm -rf -- "$compliance_tmpdir"
     exit "$st"
 }

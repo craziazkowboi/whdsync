@@ -4,6 +4,13 @@
 # looked for there first (see lib.sh).
 RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
 RP_ORIG_ARGS="$*"      # remembered for the lock record and the logs
+# Unset variables are a bug (this is how the empty "Operating System:"
+# line went unnoticed for so long), and a pipeline reports the first
+# failure rather than the last. NOT -e: the pipeline deliberately
+# tolerates non-zero from some commands and checks exit codes itself,
+# and errexit would turn "3 archives could not be extracted" into
+# "the whole build stopped".
+set -u -o pipefail
 #
 # Purpose: Adds iGame/TinyLauncher artwork to a collection.
 #   Options: --aga --ecs --rtg --aga-laced --ecs-laced --set NAME --custom
@@ -726,23 +733,24 @@ start_time="$(date +%s)"
 # (count printed once the game list is built, below)
 echo
 
-ERROR_LOG="/tmp/artwork_merger_errors.$$"
-IGAMEECS_LOG="/tmp/artwork_merger_igameecs.$$"
-TINYLAUNCHER_LOG="/tmp/artwork_merger_tinylauncher.$$"
+# One private folder per run, made by mktemp so the name cannot be guessed
+# and TMPDIR is honoured. These used to be /tmp/artwork_merger_*.$$ - a
+# predictable name in a world-writable folder, and one that ignored TMPDIR.
+# cleanup_merge (further down) removes the folder however the script ends.
+MERGE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/whdsync_merge.XXXXXX")" || {
+    rp_error "could not make a temporary folder in ${TMPDIR:-/tmp}"; exit "$RP_EXIT_CONFIG"; }
+rp_mark_temp_owner "$MERGE_TMP"     # so a killed run's folder is swept up later
+ERROR_LOG="$MERGE_TMP/errors"
+IGAMEECS_LOG="$MERGE_TMP/igame"
+TINYLAUNCHER_LOG="$MERGE_TMP/tinylauncher"
 
 : > "$ERROR_LOG"
 : > "$IGAMEECS_LOG"
 : > "$TINYLAUNCHER_LOG"
 
-# Temp files are removed however the script ends. Leftovers from earlier
-# runs that were killed outright (their process no longer exists) are
-# swept up here too.
-for _tf in /tmp/artwork_merger_*.*; do
-    [ -e "$_tf" ] || continue
-    _pid="${_tf##*.}"
-    case "$_pid" in *[!0-9]*|"") continue ;; esac
-    kill -0 "$_pid" 2>/dev/null || rm -f -- "$_tf"
-done
+# Folders left by runs that were killed outright are swept up here: each
+# carries the PID that made it, and one whose process is gone is fair game.
+rp_sweep_stale_temp "${TMPDIR:-/tmp}"/whdsync_merge.*
 unset _tf _pid
 # However this ends - finished, Ctrl-C, or killed outright (the OOM killer
 # on a small Pi) - stop and reap the background workers before removing the
@@ -753,9 +761,8 @@ cleanup_merge() {
     local st=$?
     rp_lock_release
     trap - EXIT INT TERM
-    pkill -P $$ 2>/dev/null || true
-    wait 2>/dev/null || true
-    rm -f -- "$ERROR_LOG" "$IGAMEECS_LOG" "$TINYLAUNCHER_LOG"
+    rp_reap_children            # workers AND anything they launched
+    [ -n "${MERGE_TMP:-}" ] && [ -d "$MERGE_TMP" ] && rm -rf -- "$MERGE_TMP"
     exit "$st"
 }
 # Run by hand? Then this is the run, and it takes the same lock all.sh

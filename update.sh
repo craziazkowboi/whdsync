@@ -4,6 +4,13 @@
 # looked for there first (see lib.sh).
 RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
 RP_ORIG_ARGS="$*"      # remembered for the lock record and the logs
+# Unset variables are a bug (this is how the empty "Operating System:"
+# line went unnoticed for so long), and a pipeline reports the first
+# failure rather than the last. NOT -e: the pipeline deliberately
+# tolerates non-zero from some commands and checks exit codes itself,
+# and errexit would turn "3 archives could not be extracted" into
+# "the whole build stopped".
+set -u -o pipefail
 #
 # Purpose: Mirrors the Retroplay archives into downloads/, queues what is new,
 #   retires superseded versions and tests new downloads.  Options: --dry-run --help
@@ -259,10 +266,22 @@ do
     # Transient failures are retried with a growing pause.
     dl_log="$RP_LOG_ROOT/.wget_download.log"
     : > "$dl_log"
+    # A mirrored symlink is a link into wherever the SERVER's filesystem
+    # pointed, which means nothing here and can point anywhere. With
+    # --retr-symlinks wget downloads the file itself instead. Older builds
+    # do not have the option, so it is probed once rather than assumed.
+    if [ -z "${WGET_SYMLINK_OPT+set}" ]; then
+        if wget --help 2>&1 | grep -q -- '--retr-symlinks'; then
+            WGET_SYMLINK_OPT="--retr-symlinks"
+        else
+            WGET_SYMLINK_OPT=""
+        fi
+    fi
     attempt=1
     while :; do
+        # shellcheck disable=SC2086
         wget -nv -a "$dl_log" --mirror -np -nH --cut-dirs=2 --tries=3 --waitretry=10 \
-             --timeout=60 "$FTP_BASE/$dirpath" > /dev/null 2>&1
+             $WGET_SYMLINK_OPT --timeout=60 "$FTP_BASE/$dirpath" > /dev/null 2>&1
         wget_status=$?
         [ "$wget_status" -eq 0 ] && break
         [ "$attempt" -ge "$RP_DOWNLOAD_RETRIES" ] && break
@@ -273,6 +292,12 @@ do
     done
 
     popd > /dev/null || exit 1
+
+    # Belt to --retr-symlinks' braces: whatever the mirror produced, no link
+    # under downloads/ may point outside it. Extraction follows links, so one
+    # pointing at $HOME or / is how a mirror becomes a write outside the
+    # collection. Runs per directory, so a link is gone before anything reads it.
+    rp_prune_escaping_symlinks "$RP_DOWNLOAD_ROOT/$dir"
 
     # Snapshot again AFTER downloading, so the before/after diff below
     # shows exactly what the mirror added.
