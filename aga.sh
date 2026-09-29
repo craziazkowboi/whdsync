@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.09.29   (every script in the set must carry the same stamp)
+# Remember where the user ran this from, before any cd: retroplay.conf is
+# looked for there first (see lib.sh).
+RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
 # Purpose: build or update the AGA variant (retro_aga) - a thin wrapper around start.sh.
 # Inputs:  any start.sh option, e.g. --rebuild, --clean, --skip-update
 # Outputs: whatever start.sh --sync does for this one variant

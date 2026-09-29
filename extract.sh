@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.09.29   (every script in the set must carry the same stamp)
+# Remember where the user ran this from, before any cd: retroplay.conf is
+# looked for there first (see lib.sh).
+RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
+RP_ORIG_ARGS="$*"      # remembered for the lock record and the logs
 #
 # Purpose: Extracts archives in parallel.  Options: -d/--dest DIR -u (unattended)
 #            --exclude-tags LIST --only-tags LIST --debug --help
@@ -7,7 +11,7 @@
 #
 
 # Amiga Retroplay Archive Extractor (OS-adaptive, encoding-robust)
-# Version: 1.4.0-bash32-compatible
+# Part of the whdsync suite - the one version is RP_SUITE_VERSION in lib.sh.
 #
 # WHAT THIS SCRIPT DOES:
 #   Finds every .lha/.lzx/.zip archive under the current directory and
@@ -31,9 +35,11 @@
 export LANG="${LANG:-en_AU.UTF-8}"
 export LC_ALL="${LC_ALL:-en_AU.UTF-8}"
 
-NO_COLOR="${NO_COLOR:-0}"
-
-if [ "$NO_COLOR" = "1" ] || [ ! -t 1 ]; then
+# Colour follows the same rule as lib.sh: any non-empty NO_COLOR turns it
+# off (that is the published convention - NO_COLOR=true must work, not just
+# NO_COLOR=1), and never on anything that isn't a terminal. Re-applied from
+# lib.sh once that is loaded, so --color=always|never wins.
+if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ]; then
     RED=""; GREEN=""; YELLOW=""; BLUE=""; BOLD=""; NC="";
 else
     RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m';
@@ -143,7 +149,10 @@ if [ ! -f "$SCRIPT_DIR/lib.sh" ]; then
     exit 1
 fi
 . "$SCRIPT_DIR/lib.sh"
+# One colour decision for the whole suite (NO_COLOR, --color, terminal or not).
+rp_set_colours
 rp_load_config
+rp_banner "extract.sh"
 DEFAULTDEST="$SCRIPT_DIR/retro"
 DESTOVERRIDE=""
 CUSTOM=0
@@ -151,6 +160,8 @@ UNATTENDED=0
 EXCLUDE_TAGS=""   # --exclude-tags AGA,CD32 : skip archives with any of these name fields
 ONLY_TAGS=""      # --only-tags AGA,CD32    : extract ONLY archives with one of them
 DEBUG=0
+# One stage of an all.sh pipeline: no banner or header block of its own.
+CALLED_FROM_ALL="${RP_CHILD:-0}"
 
 while [ $# -gt 0 ]; do
     opt_lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
@@ -160,6 +171,8 @@ while [ $# -gt 0 ]; do
     --exclude-tags) rp_require_option_value "$1" "$#" "${2-}"; EXCLUDE_TAGS="$2"; shift 2 ;;
     --only-tags) rp_require_option_value "$1" "$#" "${2-}"; ONLY_TAGS="$2"; shift 2 ;;
     --debug) DEBUG=1; shift ;;
+    --called-from-all) CALLED_FROM_ALL=1; shift ;;
+    --jobs) rp_require_option_value "$1" "$#" "${2-}"; RP_JOBS_OVERRIDE="$2"; shift 2 ;;
     -h|--help)
         echo "Usage: $(basename $0) [options]"
         echo "Options (case-insensitive):"
@@ -181,13 +194,15 @@ unset opt_lc
 
 DEST="${DESTOVERRIDE:-$DEFAULTDEST}"
 
+if [ "$CALLED_FROM_ALL" -eq 0 ]; then
 echo -e "${BOLD}========================================================${NC}"
-echo -e "${BOLD} Amiga Archive Extractor v1.4.0-bash32-compatible ${NC}"
+echo -e "${BOLD} Amiga Archive Extractor - whdsync ${RP_RELEASE} ${NC}"
 echo -e "${BOLD}========================================================${NC}"
 echo -e "Operating System: ${YELLOW}${OS_NAME}${NC}"
 echo -e "Destination: ${YELLOW}${DEST}${NC}"
 echo -e "Encoding: ${YELLOW}ASCII first, ISO-8859-1 second, system locale last${NC}"
 echo -e "${BOLD}========================================================${NC}"
+fi
 
 DEST_CREATED_THIS_RUN=0
 if [ ! -d "$DEST" ]; then
@@ -216,6 +231,7 @@ offer_install_pkg() {
         return 1
     fi
     if [[ "$OS_TYPE" == "darwin" ]]; then
+        rp_may_install_tools || { rp_tool_missing_hint "$tool_name"; return 1; }
         printf '%s is missing. Install it now via Homebrew (brew install %s)? [y/N] ' "$tool_name" "$brew_pkg"
     else
         printf '%s is missing. Install it now via apt (sudo apt install %s)? [y/N] ' "$tool_name" "$apt_pkg"
@@ -418,6 +434,7 @@ rp_mark_temp_owner "$tmpdir"
 # jobs still running and saving their error logs.
 cleanup_extract() {
     local st=$?
+    rp_lock_release
     trap - EXIT INT TERM
     pkill -P $$ 2>/dev/null     # no-op on a normal finish: no jobs left
     wait 2>/dev/null
@@ -427,6 +444,9 @@ cleanup_extract() {
     fi
     exit "$st"
 }
+# Run by hand? Then this is the run, and it takes the same lock all.sh
+# uses, so it cannot work on a collection a nightly build is midway through.
+rp_lock_for_stage "extract.sh ${RP_ORIG_ARGS:-}"
 trap cleanup_extract EXIT
 trap 'echo -e "\n${RED}Interrupted - stopping extraction jobs and cleaning up...${NC}"; exit 130' INT TERM
 
@@ -507,7 +527,7 @@ if [ -n "$mem_kb" ] && [ "$mem_kb" -gt 0 ]; then
     fi
 fi
 
-max_parallel="$CORES"
+max_parallel="$(rp_jobs extract "$CORES")"
 echo "Detected $CORES CPU core(s); using $max_parallel parallel extraction job(s)."
 
 # Per-archive timeout, so one hung/corrupt archive can't stall its whole
@@ -665,7 +685,7 @@ for srcdir in "${dirs[@]}"; do
 
         # exit status = number of errors in this dir (capped at 255)
         exit $(( local_errors > 255 ? 255 : local_errors ))
-    ) &
+    ) 9>&- &                  # 9>&-: a worker must not hold the run lock
     JOB_PIDS+=("$!")
     JOB_DIRS+=("$srcdir")
     JOB_LOGS+=("$dir_log")
@@ -735,6 +755,8 @@ extraction_end=$(date +%s)
 total_time=$((extraction_end - extraction_start))
 fmt_time=$(format_elapsed_time "$total_time")
 
+rp_child_result "stage=extract" "status=$([ "$errors" -eq 0 ] && echo ok || echo errors)" \
+    "seconds=$SECONDS" "errors=$errors" "killed=${#killed_dirs[@]}" "dest=$DEST"
 echo -e "\n${BOLD}=================== EXTRACT REPORT ===================${NC}"
 echo "Destination: $DEST"
 echo "Elapsed Time: $fmt_time"

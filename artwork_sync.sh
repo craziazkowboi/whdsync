@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.09.29   (every script in the set must carry the same stamp)
+# Remember where the user ran this from, before any cd: retroplay.conf is
+# looked for there first (see lib.sh).
+RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
 #
 # Purpose:
 #   The one place that downloads, validates and installs iGame_* / TinyLauncher
@@ -40,6 +43,7 @@ if [ ! -f "$SCRIPT_DIR/lib.sh" ]; then
 fi
 . "$SCRIPT_DIR/lib.sh"
 rp_load_config
+rp_banner "artwork_sync.sh"
 
 # =============================================================================
 # Configuration and argument parsing
@@ -304,8 +308,15 @@ download_archive() {   # <archive>; leaves a validated file in the cache
         fi
     fi
 
-    rp_info "  downloading $archive"
-    rp_fetch "$url" "$part" || { rm -f "$part"; rp_warn "could not download $archive - the current artwork is unchanged"; return 3; }
+    printf '  downloading %s ... ' "$archive"
+    # Quiet: the transfer meter used to interleave with the overall progress
+    # bar and made it look as if files were only half downloading.
+    if RP_FETCH_QUIET=1 rp_fetch "$url" "$part"; then
+        printf 'done (%s MB)\n' "$(( $(rp_file_size "$part") / 1048576 ))"
+    else
+        printf 'failed\n'
+        rm -f "$part"; rp_warn "could not download $archive - the current artwork is unchanged"; return 3
+    fi
     if [ "$RP_ARTWORK_VERIFY_DOWNLOADS" = "yes" ] && ! rp_test_archive "$part" "$archive"; then
         rm -f "$part"
         rp_warn "$archive failed its integrity check - the cached archive and the live folder were left unchanged"
@@ -357,9 +368,17 @@ _is_category_set() {
 }
 
 install_pack() {   # <archive> <target path, may contain />
-    local archive="$1" target="$2" live="$RP_ARTWORK_ROOT/$2" key state cand backup ts
+    local archive="$1" target="$2" live="$RP_ARTWORK_ROOT/$2" key state cand backup ts owned=0
     key="$(target_key "$target")"
     state="$(target_state "$target")"
+    # iGame_AGA, iGame_ECS, iGame_RTG (with their laced/lores subfolders) and
+    # TinyLauncher are this tool's own packs: always replaced with the current
+    # version, no backup kept. Only packs of your own (iGame_art, anything you
+    # added yourself) are protected from being overwritten.
+    case "$target" in
+        iGame_AGA/*|iGame_ECS/*|iGame_RTG/*|iGame_AGA|iGame_ECS|iGame_RTG|TinyLauncher|TinyLauncher/*)
+            owned=1; state=managed ;;
+    esac
     case "$state" in
         modified|unmanaged)
             case "$RP_ARTWORK_LOCAL_CHANGE_POLICY" in
@@ -382,12 +401,15 @@ install_pack() {   # <archive> <target path, may contain />
 
     MY_WORK="$WORK_DIR/$key.$$"
     rm -rf "$MY_WORK"; mkdir -p "$MY_WORK/x" || return 1
-    rp_info "  unpacking $archive -> ${RP_ARTWORK_ROOT##*/}/$target"
+    printf '  unpacking %s -> %s\n' "$archive" "${RP_ARTWORK_ROOT##*/}/$target"
     ( cd "$MY_WORK/x" && lha x "$CACHE_DIR/$archive" ) > /dev/null 2>&1 || {
         rp_warn "$target: could not unpack $archive - the live folder is unchanged"; FAILED=$((FAILED + 1)); return 5; }
     cand="$(validate_staging "$MY_WORK/x" "$target")" || { FAILED=$((FAILED + 1)); return 5; }
 
     ts="$(date '+%Y%m%d-%H%M%S')"; backup="$BACKUP_DIR/$key/$ts"
+    if [ "$owned" -eq 1 ]; then
+        backup="$MY_WORK/discard"          # replaced outright, nothing kept
+    fi
     if ! rp_replace_tree "$cand" "$live" "$backup"; then
         rp_warn "$target: installing failed; restoring the previous folder"
         [ -d "$backup" ] && [ ! -d "$live" ] && mv "$backup" "$live"
@@ -405,7 +427,11 @@ install_pack() {   # <archive> <target path, may contain />
     : > "$CHANGED_LIST/$key"
     rm -rf "$MY_WORK"; MY_WORK=""
     INSTALLED=$((INSTALLED + 1))
-    rp_info "  $target: installed (previous version kept in ${backup#$SCRIPT_DIR/})"
+    if [ "$owned" -eq 1 ]; then
+        rp_info "  $target: installed"
+    else
+        rp_info "  $target: installed (previous version kept)"
+    fi
     return 0
 }
 
@@ -424,6 +450,10 @@ cmd_status() {
     local a t st
     for a in $(selected_archives); do
         t="$(target_for "$a")"; st="$(target_state "$t")"
+        case "$t" in
+            iGame_AGA/*|iGame_ECS/*|iGame_RTG/*|TinyLauncher*)
+                { [ "$st" = modified ] || [ "$st" = unmanaged ]; } && st=managed ;;
+        esac
         case "$st" in
             absent)    st="not installed" ;;
             managed)   st="installed $(manifest_get "$t" installed_at), unchanged" ;;
@@ -432,6 +462,10 @@ cmd_status() {
         esac
         printf '  %-18s %s\n' "$t:" "$st"
     done
+    if [ -f "$FAIL_RECORD" ]; then
+        echo "  Last failure:  $(sed -n 's/^items=//p' "$FAIL_RECORD" | head -1) (at $(sed -n 's/^at=//p' "$FAIL_RECORD" | head -1))"
+        echo "                 not recorded as up to date - the next run will try again"
+    fi
     echo "  Policy:        ARTWORK_SYNC=$RP_ARTWORK_SYNC, local changes: $RP_ARTWORK_LOCAL_CHANGE_POLICY, on failure: $RP_ARTWORK_FAILURE_POLICY"
     echo "  Next:          ./start.sh --artwork-plan   (see what would change)"
     return 0
@@ -464,13 +498,31 @@ cmd_plan() {
     return 0
 }
 
+# Remembers which packs did NOT finish, so nothing that failed is left looking
+# current. The record is cleared as soon as a run completes without failures.
+FAIL_RECORD="$ART_STATE/last_failure"
+note_failure() {   # <what> ; appended, written at the end of the run
+    ART_FAILED="${ART_FAILED:-} $1"
+}
+save_failure_record() {
+    mkdir -p "$ART_STATE" 2>/dev/null
+    if [ -n "${ART_FAILED:-}" ]; then
+        printf 'at=%s\nitems=%s\n' "$(rp_ts)" "${ART_FAILED# }" | rp_atomic_write "$FAIL_RECORD"
+        rp_warn "not recorded as up to date - will be tried again on the next run:${ART_FAILED}"
+    else
+        rm -f "$FAIL_RECORD"
+    fi
+}
+
 cmd_sync() {
-    fetch_listing || { rp_warn "could not read the artwork source listing ($SOURCE_URL) - the current artwork is unchanged"; return 3; }
+    ART_FAILED=""
+    fetch_listing || {
+        rp_warn "could not read the artwork source listing ($SOURCE_URL) - the current artwork is unchanged"
+        note_failure "the source listing"; save_failure_record; return 3; }
     local a t act rc=0 worked=0 total done_n=0
     total="$(selected_archives | grep -c .)"
     for a in $(selected_archives); do
         done_n=$((done_n + 1))
-        rp_progress "$done_n" "$total" "Artwork"
         t="$(target_for "$a")"; act="$(planned_action "$a" "$t")"
         case "$act" in
             current)     rp_debug "$t up to date"; continue ;;
@@ -480,11 +532,13 @@ cmd_sync() {
             printf '  Re-install %s from %s? [y/N] ' "$t" "$a"; read -r reply
             case "$reply" in [Yy]*) ;; *) continue ;; esac
         fi
-        rp_info "$t:"
-        if ! download_archive "$a"; then WARNINGS=$((WARNINGS + 1)); rc=3; continue; fi
-        install_pack "$a" "$t" || rc=5
+        printf '\n%s\n' "$(rp_progress_line "$done_n" "$total" "Artwork")"
+        printf '%s:\n' "$t"
+        if ! download_archive "$a"; then WARNINGS=$((WARNINGS + 1)); rc=3; note_failure "$a"; continue; fi
+        install_pack "$a" "$t" || { rc=5; note_failure "$a"; }
         worked=1
     done
+    save_failure_record
     if [ "$INSTALLED" -gt 0 ]; then
         if [ "$SKIPPED" -gt 0 ]; then rp_info "Artwork: $INSTALLED pack(s) updated, $SKIPPED left alone"
         else rp_info "Artwork: $INSTALLED pack(s) updated"; fi

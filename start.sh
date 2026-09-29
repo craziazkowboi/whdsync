@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.09.29   (every script in the set must carry the same stamp)
+# Remember where the user ran this from, before any cd: retroplay.conf is
+# looked for there first (see lib.sh).
+RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
 #
 # Purpose: The front end: a menu, and one place to reach every command.
 #   Options: --sync/--auto --plan --update --extract --merge --sort --quick
@@ -36,65 +39,96 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # --help is answered before any tool or locale checks (see below).
 SHOW_HELP_ONLY=0
-case "${1:-}" in -h|--help) SHOW_HELP_ONLY=1 ;; esac
+INSTALL_MISSING_TOOLS=0
+for _a in "$@"; do [ "$_a" = "--install-missing-tools" ] && { INSTALL_MISSING_TOOLS=1; RP_ALLOW_TOOL_INSTALL=1; export RP_ALLOW_TOOL_INSTALL; }; done
+unset _a
+
+case "${1:-}" in
+    -h|--help)    SHOW_HELP_ONLY=1; HELP_TOPIC="${2:-}" ;;
+esac
 
 show_usage_and_exit() {
-
-      echo
-      echo "Amiga Retroplay Archive Minimal CLI Dispatcher"
-      echo "Version: ${RP_SUITE_VERSION}"
-      echo
-      echo "Usage: $(basename "$0") [options]"
-      echo
-      echo "Options (case-insensitive - --AGA and --aga both work):"
-      echo "  -h, --help            Show this help and exit."
-      echo "  --auto                Run full automation: update, extract, merge, sort."
-      echo "  --update              Only update archives."
-      echo "  --extract             Only extract archives."
-      echo "  --merge               Only merge artwork."
-      echo "  --sort                Only sort languages."
-      echo "  --quick               Only process new files (quick.sh)."
-      echo "  --ecs                 Run merge.sh with --ecs."
-      echo "  --aga                 Run merge.sh with --aga."
-      echo "  --rtg                 Run merge.sh with --rtg."
-      echo "  --ecs-laced           Run merge.sh with --ecs-laced (matches iGame_ECS_Laced)."
-      echo "  --aga-laced           Run merge.sh with --aga-laced (matches iGame_AGA_Laced)."
-      echo "  --set [name]          Run merge.sh with --set NAME (any iGame_NAME directory)."
-      echo "  --ffs                 Run sort.sh with --ffs (FFS filename limits)."
-      echo "  --pfs                 Run sort.sh with --pfs (PFS filename limits, default)."
-      echo "  --dest [path]         Set custom destination directory."
-      echo "  --art [order]         Set merge priority order for non-demos (e.g., Screens,Covers,Titles)."
-      echo "  --demo-art [order]    Set merge priority order for demos (e.g., Titles,Screens,Covers)."
-      echo "  --no-detox            Skip detox entirely - the startup dependency check and"
-      echo "                        the pre-clean step in sort.sh."
-      echo "  --skipchk             Run sort.sh with --skipchk (skip the Amiga filesystem"
-      echo "                        compliance check entirely)."
-      echo "  --skip-variant-sort   Run sort.sh with --skip-variant-sort (skip moving games"
-      echo "                        into CD32/AGA/NTSC/MT32/CDTV and language subfolders -"
-      echo "                        for when that reorganization was already done earlier"
-      echo "                        on a shared base tree)."
-      echo "  --rebuild             Rebuild from the archives already downloaded, without"
-      echo "                        checking for updates (with --auto's variant options)."
-      echo "  --clean               With --auto: check for updates, then rebuild from scratch."
-      echo "  --skip-update         With --auto: don't download; process what's already queued."
-      echo "  --force               With --auto: also fill in missing artwork when up to date."
-      echo "  --detox               Use detox even if retroplay.conf says USE_DETOX=no."
-      echo "  --report-missing FILE With --merge: list games that got no artwork in FILE."
-      echo "  --sync                Update and build (same as --auto)."
-      echo "  --plan                Show what a sync would do; changes nothing."
-      echo "  --setup               Run the setup helper."
-      echo "  --schedule [options]  Set up the nightly run (see install_cron.sh --help)."
-      echo "  --artwork-status      What artwork is installed and whether it's current."
-      echo "  --artwork-plan        What an artwork update would do; changes nothing."
-      echo "  --artwork-sync        Download and install newer artwork packs safely."
-      echo "  --artwork-verify      Check installed artwork (read-only)."
-      echo "  --artwork-rollback N  Put back the previous version of pack N."
-      echo "  --doctor              Check the setup and explain how to fix any problems."
-      echo "  --status              Show the last run, each variant's state, drive and schedule."
-      echo "  --test-notify         Send a test notification (ntfy/email from retroplay.conf)."
-      echo "  --debug               Enable debug output (also passed to extract.sh/merge.sh)."
+  # Everyday commands first, in the order someone actually reaches for them;
+  # everything else grouped underneath. "--help advanced" prints the long
+  # form. Every option that ever worked still works.
+  echo
+  echo "whdsync - Amiga Retroplay collection builder"
+  echo "Version: ${RP_SUITE_VERSION} (release ${RP_RELEASE})"
+  echo
+  echo "Usage: $(basename "$0") [command] [options]"
+  echo
+  echo "Everyday"
+  echo "  (no options)          Menu."
+  echo "  --sync                Update and build.  (--auto is the old name.)"
+  echo "  --plan                Show what a sync would do; changes nothing."
+  echo "  --status              Last run, each collection, the drive, the schedule."
+  echo "  --doctor              Check the setup and explain how to fix problems."
+  echo "  --setup               First-time setup."
+  echo "  --schedule [options]  Set up or change the nightly run."
+  echo
+  echo "Choosing what to build"
+  echo "  --aga --ecs --rtg --aga-laced --ecs-laced --set NAME"
+  echo "  --dest PATH           Build somewhere other than the configured folder."
+  echo "  --ffs --pfs           Amiga filename limits (PFS is the default)."
+  echo
+  echo "Artwork"
+  echo "  --artwork-status --artwork-plan --artwork-sync --artwork-verify"
+  echo "  --artwork-rollback NAME     Put back the previous version of one pack."
+  echo "  --refresh-artwork           Rewrite artwork for every game, not just gaps."
+  echo
+  echo "When something looks wrong"
+  echo "  --why-build VARIANT   Why this collection would (or would not) be rebuilt."
+  echo "  --why-artwork NAME    Where artwork for one game was looked for."
+  echo "  --why-space           Where the disk space has gone."
+  echo "  --show-failed         Archives that would not extract, and games with no artwork."
+  echo "  --retry-failed        Try the set-aside archives once more."
+  echo "  --unlock-stale        Clear a lock left by a run that no longer exists."
+  echo
+  echo "Advanced"
+  echo "  --rebuild --clean --skip-update --force --preview-new"
+  echo "  --extract --merge --sort     One stage only, outside the queue."
+  echo "  --art LIST --demo-art LIST --report-missing FILE"
+  echo "  --skipchk --skip-variant-sort --detox --no-detox"
+  echo "  --install-missing-tools --check-update --test-notify"
+  echo "  --quiet --verbose --debug --color=auto|always|never --version"
+  echo
+  echo "  $(basename "$0") --help advanced      what each advanced option does"
+  echo
+  if [ "${1:-}" = "advanced" ]; then
+      echo "Advanced options in full"
+      echo "  --auto                Same as --sync (the older name)."
+      echo "  --update              Only download new archives."
+      echo "  --extract             Only extract; does not queue or install."
+      echo "  --merge               Only add artwork to a folder (--dest)."
+      echo "  --sort                Only sort/clean names in a folder (--dest)."
+      echo "  --preview-new         Build the dated folder of just the new games and"
+      echo "                        leave the collection alone. (--quick is the old name.)"
+      echo "  --rebuild             Rebuild from the archives already downloaded."
+      echo "  --clean               Check for updates, then rebuild from scratch."
+      echo "  --skip-update         Process what is already queued; do not download."
+      echo "  --force               Also fill artwork gaps on collections already up to date."
+      echo "  --art LIST            Artwork order for games and magazines,"
+      echo "                        e.g. Screens,Covers,Titles."
+      echo "  --demo-art LIST       Artwork order for demos."
+      echo "  --report-missing FILE With --merge: list games that got no artwork."
+      echo "  --skipchk             Skip the Amiga filename compliance check."
+      echo "  --skip-variant-sort   Skip moving games into CD32/AGA/NTSC/MT32/CDTV"
+      echo "                        and language folders."
+      echo "  --detox / --no-detox  Force the detox pre-clean on or off."
+      echo "  --install-missing-tools  Install missing archive tools now."
+      echo "  --check-update        Ask GitHub whether a newer release exists."
+      echo "                        It only reports; it never downloads or runs anything."
+      echo "  --test-notify         Send a test notification."
+      echo "  --quiet               Errors, warnings and the final result only."
+      echo "  --verbose             More detail about what each stage is doing."
+      echo "  --debug               Everything, including the sub-scripts' own debug."
+      echo "  --color=MODE          auto (default), always, or never."
+      echo "  --version             Print the version and exit."
       echo "  --exit                Exit immediately."
       echo
+      echo "Options are case-insensitive: --AGA and --aga both work."
+      echo
+  fi
   exit 0
 }
 
@@ -115,7 +149,18 @@ if [ ! -f "$SCRIPT_DIR/lib.sh" ]; then
     exit 1
 fi
 . "$SCRIPT_DIR/lib.sh"
+# One colour decision for the whole suite (NO_COLOR, --color, terminal or not).
+rp_set_colours
 rp_load_config
+
+# --version answers before anything else is printed (no banner, no checks).
+for _a in "$@"; do
+    case "$_a" in
+        --version|-V) printf 'whdsync %s (suite %s)\n' "$RP_RELEASE" "$RP_SUITE_VERSION"; exit 0 ;;
+    esac
+done
+unset _a
+rp_banner "start.sh"
 cd "$SCRIPT_DIR" || { echo "ERROR: cannot cd to script directory: $SCRIPT_DIR" >&2; exit 1; }
 NEW_DIR="${SCRIPT_DIR}/new"
 
@@ -143,6 +188,8 @@ CLEAN_OPT=0
 MERGE_EXTRA_ARGS=()  # extra options passed straight to merge.sh
 REBUILD_OPT=0        # --rebuild: rebuild from downloaded archives, no update check
 PLAN_ONLY=0          # --plan: show what would happen, change nothing
+PREVIEW_NEW=0        # --preview-new: hand --preview-new to the engine
+JOBS_OPT=""          # --jobs N: how many things to do at once
 FORCE_OPT=0          # --force: also run the artwork gap-fill on up-to-date variants
 REPORT_MISSING_OPT=""  # --report-missing FILE (passed to merge.sh)
 DETOX_EXPLICIT=""    # "yes"/"no" when --detox/--no-detox was given
@@ -258,7 +305,7 @@ offer_build_detox() {
 # checking (or offering to install) tools is a poor welcome for someone just
 # reading --help.
 if [ "${SHOW_HELP_ONLY:-0}" = "1" ]; then
-    show_usage_and_exit
+    show_usage_and_exit "${HELP_TOPIC:-}"
 fi
 
 # ----- Tool dependency check (lha, 7z, unar detox) -----
@@ -272,18 +319,28 @@ done
 if [ ${#missing[@]} -ne 0 ]; then
     echo "Missing tools: ${missing[*]}"
     still_missing=()
-    for tool in "${missing[@]}"; do
-        case "$tool" in
-            lha)  apt_pkg="lhasa";      brew_pkg="lha" ;;
-            7z)   apt_pkg="p7zip-full"; brew_pkg="p7zip" ;;
-            unar) apt_pkg="unar";       brew_pkg="unar" ;;
-        esac
-        if offer_install_pkg "$tool" "$apt_pkg" "$brew_pkg"; then
-            echo "  $tool is now available."
-        else
-            still_missing+=("$tool")
-        fi
-    done
+    # Installing packages is setup.sh's job. A build or a nightly run must
+    # never surprise you with a sudo prompt or a package manager, so the
+    # default here is to say what is missing and how to fix it.
+    # --install-missing-tools asks to install them from here, as before.
+    if [ "${INSTALL_MISSING_TOOLS:-0}" -eq 1 ]; then
+        for tool in "${missing[@]}"; do
+            case "$tool" in
+                lha)  apt_pkg="lhasa";      brew_pkg="lha" ;;
+                7z)   apt_pkg="p7zip-full"; brew_pkg="p7zip" ;;
+                unar) apt_pkg="unar";       brew_pkg="unar" ;;
+            esac
+            if offer_install_pkg "$tool" "$apt_pkg" "$brew_pkg"; then
+                echo "  $tool is now available."
+            else
+                still_missing+=("$tool")
+            fi
+        done
+    else
+        still_missing=("${missing[@]}")
+        echo "  Run ./setup.sh to install everything that's needed,"
+        echo "  or ./start.sh --install-missing-tools to install just these now."
+    fi
     if [ ${#still_missing[@]} -ne 0 ]; then
         echo
         echo "Still missing: ${still_missing[*]}"
@@ -484,7 +541,23 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --quick)
-      ACTION="quick"
+      # The old name for --preview-new. Kept working, pointed at the engine.
+      ACTION="auto"
+      PREVIEW_NEW=1
+      shift
+      ;;
+    --jobs)
+      rp_require_option_value "$1" "$#" "${2:-}"
+      RP_JOBS_OVERRIDE="$2"; export RP_JOBS_OVERRIDE
+      JOBS_OPT="$2"
+      shift 2
+      ;;
+    --preview-new)
+      # The modern preview: the engine builds the dated batch of new games
+      # and leaves the collection alone. Same lock, drive check, queue and
+      # report as an ordinary run.
+      ACTION="auto"
+      PREVIEW_NEW=1
       shift
       ;;
     --ecs)
@@ -568,6 +641,9 @@ while [ $# -gt 0 ]; do
       REPORT_MISSING_OPT="$2"
       shift 2
       ;;
+    --install-missing-tools)
+      shift    # handled before the checks above; nothing more to do here
+      ;;
     --doctor)
       exec "$SCRIPT_DIR/doctor.sh"
       ;;
@@ -575,9 +651,72 @@ while [ $# -gt 0 ]; do
       rp_print_status
       exit 0
       ;;
+    --check-update)
+      rp_check_for_update force
+      echo "(Asked $RP_UPDATE_CHECK_URL - nothing was downloaded.)"
+      exit 0
+      ;;
     --test-notify)
       rp_test_notify
       exit $?
+      ;;
+    --why-build)
+      rp_require_option_value "$1" "$#" "${2:-}"
+      rp_why_build "$2"
+      exit 0
+      ;;
+    --show-failed)
+      rp_show_failed
+      exit 0
+      ;;
+    --retry-failed)
+      rp_retry_failed
+      exit $?
+      ;;
+    --why-space)
+      rp_why_space
+      exit 0
+      ;;
+    --why-artwork)
+      # merge.sh already explains artwork matching; this is just the name
+      # people look for, pointed at the same code.
+      rp_require_option_value "$1" "$#" "${2:-}"
+      exec "$SCRIPT_DIR/merge.sh" --why "$2"
+      ;;
+    --unlock-stale)
+      # Shows who holds the run lock and removes it ONLY when the run that
+      # took it is provably gone from this machine. A live lock, or one from
+      # another machine, is never removed - it is reported and left alone.
+      if [ ! -e "$RP_LOCK_FILE.d" ] && [ ! -f "$RP_LOCK_FILE.info" ]; then
+        rp_ok "no lock is in place - nothing to unlock"
+        exit 0
+      fi
+      echo "Run lock"
+      echo "  File:     $RP_LOCK_FILE"
+      [ -e "$RP_LOCK_FILE.d" ] && echo "  Folder:   $RP_LOCK_FILE.d"
+      echo "  Held by:  $(rp_lock_holder || echo 'unknown - no record file')"
+      _lpid="$(rp_lock_field pid)"; _lhost="$(rp_lock_field host)"
+      if [ "$_lhost" != "$RP_LOCK_HOST" ]; then
+        rp_warn "that lock was taken on '$_lhost', not on this machine ($RP_LOCK_HOST)"
+        rp_info "  Nothing was removed. Check that machine before unlocking by hand."
+        exit "$RP_EXIT_CONFIG"
+      fi
+      if [ -n "$_lpid" ] && kill -0 "$_lpid" 2>/dev/null; then
+        rp_warn "process $_lpid is still running - that run is alive, not stale"
+        rp_info "  Nothing was removed. Wait for it to finish, or stop it yourself."
+        exit "$RP_EXIT_CONFIG"
+      fi
+      if [ ! -e "$RP_LOCK_FILE.d" ]; then
+        rp_info "  There is only a leftover record file; flock itself holds no lock now."
+      fi
+      if rp_is_interactive; then
+        printf 'That run is gone. Remove the lock? [y/N] '
+        read -r _reply
+        case "$_reply" in [Yy]*) ;; *) echo "Left alone."; exit 0 ;; esac
+      fi
+      rm -rf "$RP_LOCK_FILE.d"; rm -f "$RP_LOCK_FILE.info"
+      rp_ok "stale lock removed - the next run can start"
+      exit 0
       ;;
     --skipchk)
       SKIPCHK_OPT=1
@@ -597,6 +736,25 @@ while [ $# -gt 0 ]; do
       ;;
     --debug)
       DEBUG_MODE=1
+      RP_VERBOSITY=3; RP_DEBUG=1; export RP_VERBOSITY RP_DEBUG; rp_set_colours
+      shift
+      ;;
+    --quiet)
+      RP_VERBOSITY=0; export RP_VERBOSITY
+      shift
+      ;;
+    --verbose)
+      [ "$RP_VERBOSITY" -lt 2 ] && RP_VERBOSITY=2
+      export RP_VERBOSITY
+      shift
+      ;;
+    --color|--colour)
+      rp_require_option_value "$1" "$#" "${2-}"
+      RP_COLOR="$2"; export RP_COLOR; rp_set_colours
+      shift 2
+      ;;
+    --color=*|--colour=*)
+      RP_COLOR="${1#*=}"; export RP_COLOR; rp_set_colours
       shift
       ;;
     --exit)
@@ -641,7 +799,7 @@ if [ -z "$ACTION" ]; then
   echo "  3) Extract only"
   echo "  4) Merge artwork"
   echo "  5) Sort languages"
-  echo "  6) Quick (process new files)"
+  echo "  6) Preview the new games (collection left alone)"
   echo "  7) Rebuild from downloaded archives (no update check)"
   echo "  8) Check setup (doctor)"
   echo "  9) Show full status"
@@ -683,7 +841,8 @@ if [ -z "$ACTION" ]; then
       ACTION="sort"
       ;;
     6)
-      ACTION="quick"
+      ACTION="auto"
+      PREVIEW_NEW=1
       ;;
     7)
       ACTION="auto"
@@ -904,6 +1063,8 @@ if [ "$ACTION" = "auto" ]; then
   [ "$REBUILD_OPT" -eq 1 ] && engine_args+=(--rebuild)
   [ "$FORCE_OPT" -eq 1 ] && engine_args+=(--force)
   [ "$PLAN_ONLY" -eq 1 ] && engine_args+=(--dry-run)
+  [ "$PREVIEW_NEW" -eq 1 ] && engine_args+=(--preview-new)
+  [ -n "$JOBS_OPT" ] && engine_args+=(--jobs "$JOBS_OPT")
 
   DELEGATED_AUTO=1
   if ./all.sh "${engine_args[@]}"; then AUTO_EXIT=0; else AUTO_EXIT=$?; fi

@@ -12,7 +12,7 @@ downloads/            →  extract  →  artwork  →  sort  →  build/retro_ag
 
 - **Runs on** a Raspberry Pi (including a Pi Zero 2 W) or a Mac. Linux and macOS, nothing else needed.
 - **Safe by design.** It never deletes a collection until its replacement is ready, never overwrites artwork you changed yourself, and stops rather than guessing.
-- **Tested.** 213 automated tests plus 205 option checks, run offline on every change. GitHub Actions runs them on Ubuntu and on macOS (bash 3.2), with ShellCheck.
+- **Tested.** 333 automated tests plus 205 option checks, run offline on every change. GitHub Actions runs them on Ubuntu and on macOS (bash 3.2), with ShellCheck.
 
 ---
 
@@ -62,7 +62,7 @@ chmod +x *.sh to_ilbm.py   # usually already set
 Prefer Git?
 
 ```bash
-git clone https://github.com/craziazkowboi/whdsync.git
+git clone https://github.com/<your-account>/whdsync.git
 cd whdsync
 ```
 
@@ -83,7 +83,7 @@ That is the whole install: save the zip where you want it, unpack, run `./setup.
 It will:
 
 1. install the tools it needs (`apt` on Linux, Homebrew on macOS);
-2. download and compile `unlzx`, which has no package anywhere;
+2. download and compile `unlzx`, which has no package anywhere (the source is 1990s C and leaves out the headers a modern compiler insists on — setup adds them, so it builds on a current Raspberry Pi OS and on macOS);
 3. add the two text encodings Linux needs for Amiga filenames;
 4. ask three questions — which machines you build for, where the collection should go, and whether you want failure notifications;
 5. offer to set up the nightly update;
@@ -126,8 +126,12 @@ When it finishes, your collections are in `build/retro_aga/`, `build/retro_ecs/`
 ./all.sh                   # update and rebuild everything
 ./aga.sh                   # just the AGA collection (also ecs.sh, rtg.sh)
 ./start.sh --plan          # what a run would do; changes nothing
+./start.sh --preview-new   # build just the new games; leave the collection alone
 ./doctor.sh                # check the setup, and be told how to fix anything wrong
 ```
+
+`./start.sh --help` lists the everyday commands first; `./start.sh --help advanced`
+explains the rest.
 
 After the first run, a nightly update usually takes a few minutes: only newly published games are downloaded and added.
 
@@ -185,6 +189,8 @@ Artwork comes from the Turran FTP mirror and is installed where the merge step e
 
 A plain `--aga` or `--ecs` build uses the **LoRes** artwork; `--aga-laced` and `--ecs-laced` use the **Laced** artwork; `--rtg` uses the RTG packs.
 
+**When a download fails.** The artwork host is sometimes busy and answers with an error (`503`). The build carries on with the artwork you already have, and the pack that failed is *not* recorded as up to date: its entry in `.retroplay` is left exactly as it was, and the "checked recently" stamp is cleared, so the next run tries again straight away instead of waiting out `ARTWORK_CHECK_INTERVAL_HOURS`. `./start.sh --artwork-status` lists anything still outstanding under **Last failure**.
+
 **Refreshing artwork.** Every merge writes artwork from the packs' current version — `iGame.iff`, `iGame.data` and the rest — so updating a pack refreshes your collection. (Checking each file first was measured *slower* than simply writing it: 23 s against 11 s over 1500 games.)
 
 The nightly gap-fill only visits games that have no artwork yet. To refresh **every** game, including those:
@@ -199,7 +205,7 @@ Each merge reports what it did: which mode it is in, and how many artwork files 
 
 **Artwork you already have is not downloaded twice.** Before fetching anything, the size of your cached archive is compared with the size the source reports (from its listing, or an HTTP header request — no download either way). Unchanged archives are reused.
 
-**Your own artwork is safe.** If you change a folder, or drop in a pack this tool didn't install, it is never overwritten automatically — see `ARTWORK_LOCAL_CHANGE_POLICY`. Put your own images in `artwork/iGame_art/` in whatever structure you like; they're used whenever a game has no artwork in the main packs.
+**Which packs are replaced, and which are yours.** `iGame_AGA`, `iGame_ECS`, `iGame_RTG` (with their `laced`/`lores` folders) and `TinyLauncher` are this tool's own: they are always replaced with the source's current version, and no backup is kept. A pack you added yourself — `iGame_art`, or anything else — is never overwritten automatically (`ARTWORK_LOCAL_CHANGE_POLICY`), and keeps a backup so `--artwork-rollback` can undo an update. Put your own images in `artwork/iGame_art/` in whatever structure you like; they're used whenever a game has no artwork in the main packs.
 
 ### When no pack has the artwork
 
@@ -244,9 +250,21 @@ Two things are added to these automatically:
 - **Artwork you installed the older flat way** (`iGame_AGA/Covers/…` rather than `iGame_AGA/lores/…`) is tried immediately after the pack it belongs to, so nothing is lost.
 - **Any other `iGame_*` pack you have** is tried last, after TinyLauncher — so a pack the list doesn't mention still gets used rather than ignored.
 
-Within each pack, sections are tried in `ART_ORDER` (`Covers,Screens,Titles` by default), and demos use `DEMO_ART_ORDER`.
+Within each pack, sections are tried in `ART_ORDER` — `Screens,Covers,Titles` by default, and `Covers,Screens,Titles` for RTG. Demos use `DEMO_ART_ORDER`.
 
 ---
+
+## Staying up to date
+
+Once a day, a run will tell you if a newer release exists:
+
+```
+ A newer release is available: 0.5   (you are running 0.4)
+ Nothing has been downloaded - have a look and decide yourself:
+   https://github.com/craziazkowboi/whdsync/releases
+```
+
+Check it yourself any time with `./start.sh --check-update`. It is deliberately limited: it reads **one version number** over HTTPS and nothing else. It never downloads an archive, writes a script or runs anything — a tag that isn't plain digits and dots is ignored, and a non-HTTPS address is refused. Turn it off with `UPDATE_CHECK="no"`.
 
 ## The nightly run
 
@@ -269,18 +287,24 @@ Output from each night goes to `logs/all_cron.log`, and a summary to `reports/`.
 
 ## Settings
 
-Settings live in `retroplay.conf` beside the scripts. Copy `retroplay.conf.example` if you don't have one; every setting is commented there. The ones people change most:
+Settings live in `retroplay.conf`, looked for in this order: **the folder you ran the script from**, then the folder the scripts are in, then the folder above it (so it works whether the scripts sit in `scripts/` or not). With none, the built-in defaults are used and every run says so. `./start.sh --status` shows which file is in force.
+
+**Artwork order.** The default is `Screens,Covers,Titles`. RTG uses `Covers,Screens,Titles` (set by `ART_ORDER_RTG`), because covers read better on an RTG display. Any variant can be overridden with `ART_ORDER_<VARIANT>`, and `--art` overrides everything for one run. Copy `retroplay.conf.example` if you don't have one; every setting is commented there. The ones people change most:
 
 | Setting | Default | What it does |
 |---|---|---|
 | `VARIANTS` | `aga ecs rtg` | Which collections to build |
 | `OUTPUT_ROOT` | `.` | Where `build/` goes — point this at a USB SSD |
-| `ART_ORDER` | `Covers,Screens,Titles` | Which artwork iGame shows first |
+| `ART_ORDER` | `Screens,Covers,Titles` | Which artwork iGame shows first |
+| `ART_ORDER_RTG` | `Covers,Screens,Titles` | Overrides the order for RTG (`ART_ORDER_<VARIANT>` works for any variant) |
 | `FILESYSTEM` | `pfs` | Use `ffs` for the 30-character filename limit. With `pfs`, every run ends with a reminder to run `setfnsize <drive:> 107` on the Amiga first |
 | `ARTWORK_SYNC` | `ask` | `auto` also updates artwork in the nightly run |
 | `LOG_RETENTION_DAYS` | `1` | Delete logs after this many days; `0` keeps them for ever |
+| `UPDATE_CHECK` | `yes` | Say when a newer release exists (reads a version number only) |
+| `PROGRESS_STYLE` | `auto` | `auto` = blocks on macOS, ASCII on Linux/A314; or `smooth`/`ascii` |
 | `ARTWORK_KEEP_BACKUPS` | `2` | Previous artwork versions kept for rollback |
 | `STATE_BACKUP` | `no` | Keep rolling copies of the state folder (queue and markers only) |
+| `JOBS` | `auto` | How many things to do at once. `auto` is what each stage works out from the CPU count and the memory; `EXTRACT_JOBS`, `MERGE_JOBS` and `SORT_JOBS` set one stage, and `--jobs N` overrides them all for one run |
 | `NTFY_TOPIC` | *(empty)* | Get told when a run fails |
 
 See what's in force with `./start.sh --status`, and the full list in `retroplay.conf.example`.
@@ -304,6 +328,27 @@ It checks the whole setup and, for anything wrong, tells you the command that fi
 | "network or server problem" (exit 3) | The server was unreachable. It tries again next run |
 | "scripts are not from the same version" | Some files weren't updated. Copy the whole set across |
 | A game has no artwork | Ask why: `./merge.sh --why SuperSkidmarks -d build/retro_aga`. It lists every set and section it looked in, and anything in `artwork/` with a similar name |
+
+**Ask it why:**
+
+```bash
+./start.sh --why-build aga     # why this collection would (or wouldn't) be rebuilt
+./start.sh --why-artwork NAME  # where artwork for one game was looked for
+./start.sh --why-space         # where the disk space has gone
+./start.sh --show-failed       # archives that wouldn't extract, games with no artwork
+./start.sh --retry-failed      # try the set-aside archives once more
+./start.sh --unlock-stale      # clear a lock left by a run that no longer exists
+```
+
+Each answers from what the run actually recorded — the queues, the build markers
+and each collection's own manifest — not from a guess.
+
+**Only one run at a time.** A build takes a lock, and the stage scripts
+(`merge.sh`, `sort.sh`, `extract.sh`, `update.sh`) take the same one when you run
+them by hand, so nothing can work on a collection a nightly build is halfway
+through. If a run is killed outright, the next one takes the lock over by itself;
+`--unlock-stale` is there for the rare case where it can't, and it never removes a
+lock whose run is still alive or which was taken on another machine.
 
 **Exit codes**, if you script around it: `0` done, `2` nothing to do, `3` network, `4` setup problem, `5` some archives failed, `130` interrupted.
 
@@ -358,6 +403,8 @@ Every script takes `-h` / `--help`. Options are case-insensitive where a variant
 | `./aga.sh` `./ecs.sh` `./rtg.sh` | Build one variant (pass any `start.sh` option) |
 | `./start.sh` | Menu |
 | `./doctor.sh` | Check the setup and explain any fixes |
+| `./start.sh --version` | The one suite version and release |
+| `./start.sh --install-missing-tools` | Install missing archive tools now (normally `setup.sh`'s job) |
 
 ### `all.sh` — the engine
 
@@ -379,7 +426,10 @@ Every script takes `-h` / `--help`. Options are case-insensitive where a variant
 | `--status` | Last run, what's queued, drive, schedule |
 | `--test-notify` | Send a test notification |
 | `--cron` | Unattended mode: full `PATH`, own log, no prompts |
-| `--debug` | Verbose output |
+| `--preview-new` | Build the dated folder of just the new games; leave the collection alone |
+| `--jobs N` | How many things to do at once (overrides `JOBS` in the config) |
+| `--quiet` / `--verbose` / `--debug` | How much to print |
+| `--color=auto\|always\|never` | Colour, regardless of whether output is a terminal |
 
 ### `start.sh` — the front end
 
@@ -438,9 +488,12 @@ Run these directly only if you want one job done. Each works out which collectio
 |---|---|
 | `merge.sh` | variant options, `-d DIR`, `--art LIST`, `--demo-art LIST`, `--only-missing`, `--refresh-artwork`, `--report-missing FILE`, `--why NAME`, `--a314`, `--custom`, `--debug` |
 | `sort.sh` | `-d DIR`, `--ffs`, `--pfs`, `--skipchk`, `--skip-variant-sort`, `--detox`/`--no-detox`, `--custom` |
-| `extract.sh` | `-d DIR`, `-u` (unattended), `--exclude-tags LIST`, `--only-tags LIST`, `--debug` |
+| `extract.sh` | `-d DIR`, `-u` (unattended), `--exclude-tags LIST`, `--only-tags LIST`, `--jobs N`, `--debug` |
 | `update.sh` | `--dry-run` |
-| `quick.sh` | variant options, `-d DIR`, `--art LIST`, `--demo-art LIST`, `--skip-update`, `--no-detox` |
+| `quick.sh` | **deprecated** — it now runs `./start.sh --preview-new` and passes your options through. It will be removed in a later release |
+
+`merge.sh`, `sort.sh` and `extract.sh` also take `--jobs N`. Run by hand, each
+takes the same lock a build does, so they cannot clash with a nightly run.
 
 `merge.sh --why NAME` is the one to reach for when a game reports no artwork: it lists every set and section it looked in, and anything in `artwork/` with a similar name.
 
@@ -460,7 +513,7 @@ Run these directly only if you want one job done. Each works out which collectio
 ## For developers
 
 ```bash
-tests/run_tests.sh                    # 213 end-to-end tests, no network needed
+tests/run_tests.sh                    # 250 end-to-end tests, no network needed
 tests/option_matrix.sh                # every option of every script
 MATRIX_SECTIONS="1 2" tests/option_matrix.sh    # just some sections
 ```

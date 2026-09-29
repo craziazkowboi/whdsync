@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.09.29   (every script in the set must carry the same stamp)
+# Remember where the user ran this from, before any cd: retroplay.conf is
+# looked for there first (see lib.sh).
+RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
 #
 # Purpose:
 #   Last resort for games that have no artwork in any pack. For each one it
@@ -42,6 +45,7 @@ cd "$SCRIPT_DIR" || exit 1
 [ -f "$SCRIPT_DIR/lib.sh" ] || { echo "ERROR: lib.sh is missing from $SCRIPT_DIR" >&2; exit 4; }
 . "$SCRIPT_DIR/lib.sh"
 rp_load_config
+rp_banner "artwork_fetch.sh"
 
 LIST=""; VARIANT=""; DEST=""; LIMIT=""; DRY=0
 while [ $# -gt 0 ]; do
@@ -154,6 +158,15 @@ echo
 echo "  Artwork found and installed: $FOUND"
 echo "  Still without artwork:       $FAILED"
 [ "$FOUND" -gt 0 ] && echo "  Saved in artwork/iGame_art/ so later artwork updates keep them."
-printf 'ARTWORK_FETCH_RESULT found=%d failed=%d tried=%d\n' "$FOUND" "$FAILED" "$TRIED" > "$RP_STATE_DIR/artwork_fetch_last" 2>/dev/null
+# Results go in a key=value file, never scraped back out of the text above:
+# rewording a console message must not be able to change a reported figure.
+# RP_RESULT_FILE is set by the caller (all.sh); the copy in the state folder
+# is kept so --status and doctor.sh can see the last run.
+_rp_write_result() {
+    printf 'stage=artwork_fetch\nstatus=%s\nfound=%d\nfailed=%d\ntried=%d\n' \
+        "$([ "$FOUND" -gt 0 ] && echo ok || echo none)" "$FOUND" "$FAILED" "$TRIED"
+}
+_rp_write_result > "$RP_STATE_DIR/artwork_fetch_last" 2>/dev/null
+[ -n "${RP_RESULT_FILE:-}" ] && _rp_write_result > "$RP_RESULT_FILE" 2>/dev/null
 [ "$FOUND" -gt 0 ] && exit 0
 exit 2

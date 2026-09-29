@@ -29,7 +29,21 @@ else
 fi
 
 RP_STATE_DIR="$RP_BASE_DIR/.retroplay"
-RP_CONF_FILE="$RP_BASE_DIR/retroplay.conf"
+# retroplay.conf is looked for in this order:
+#   1. the folder you ran the script from
+#   2. the folder the scripts are in
+#   3. the folder above that (when the scripts live in scripts/)
+# RP_INVOKED_FROM is set by each script before it changes directory.
+RP_CONF_FILE=""
+for _c in "${RP_INVOKED_FROM:-$PWD}/retroplay.conf" "$SCRIPT_DIR/retroplay.conf" "$RP_BASE_DIR/retroplay.conf"; do
+    if [ -f "$_c" ]; then RP_CONF_FILE="$_c"; break; fi
+done
+RP_CONF_FOUND=1
+if [ -z "$RP_CONF_FILE" ]; then
+    RP_CONF_FILE="$RP_BASE_DIR/retroplay.conf"     # where one would be created
+    RP_CONF_FOUND=0
+fi
+unset _c
 DEP_TRACK_FILE="$RP_BASE_DIR/.retroplay_installed_deps.log"
 
 # ============================================================================
@@ -42,7 +56,8 @@ rp_load_config() {
     # Built-in defaults (used when there is no config file, or a key is absent)
     RP_VARIANTS="aga ecs rtg"
     RP_OUTPUT_ROOT="."
-    RP_ART_ORDER="Covers,Screens,Titles"
+    RP_ART_ORDER="Screens,Covers,Titles"        # default for every variant...
+    RP_ART_ORDER_RTG="Covers,Screens,Titles"    # ...except RTG
     RP_DEMO_ART_ORDER="Titles,Screens,Covers"
     RP_FILESYSTEM="pfs"
     RP_USE_DETOX="no"
@@ -72,6 +87,7 @@ rp_load_config() {
     RP_ARTWORK_VERIFY_DOWNLOADS="yes"
     RP_ARTWORK_FAILURE_POLICY="warn-and-continue"
     RP_ARTWORK_CHECK_INTERVAL_HOURS="24"
+    RP_JOBS="auto"; RP_EXTRACT_JOBS="auto"; RP_MERGE_JOBS="auto"; RP_SORT_JOBS="auto"
     RP_ARTWORK_FETCH="no"          # look elsewhere for artwork the packs lack?
     RP_ARTWORK_FETCH_COMMAND=""    # your command: <cmd> "<game>" "<output image>"
     RP_ARTWORK_FETCH_LIMIT="25"    # at most this many searches per run
@@ -81,6 +97,10 @@ rp_load_config() {
     RP_LOG_DIR="logs"
     RP_LOG_RETENTION_DAYS="1"     # delete logs older than this; 0 = keep forever
     RP_STATE_BACKUP="no"          # keep rolling copies of .retroplay? (yes/no)
+    RP_UPDATE_CHECK="yes"         # say when a newer release exists (never downloads)
+    RP_REPO_URL="https://github.com/craziazkowboi/whdsync"
+    RP_UPDATE_CHECK_URL="https://api.github.com/repos/craziazkowboi/whdsync/releases/latest"
+    RP_UPDATE_CHECK_INTERVAL_HOURS="24"
     RP_STATE_BACKUP_MAX_MB="50"   # if yes: skip when it would exceed this
     RP_CONFIG_WARNINGS=""
 
@@ -112,7 +132,9 @@ rp_load_config() {
             ARTWORK_OPTIONAL_PACKS|ARTWORK_KEEP_BACKUPS|ARTWORK_LOCAL_CHANGE_POLICY|\
             ARTWORK_VERIFY_DOWNLOADS|ARTWORK_FAILURE_POLICY|ARTWORK_CHECK_INTERVAL_HOURS|\
             ARTWORK_FETCH|ARTWORK_FETCH_COMMAND|ARTWORK_FETCH_LIMIT|\
-            ARTWORK_DIR|BUILD_DIR|DOWNLOAD_DIR|LOG_DIR|LOG_RETENTION_DAYS|STATE_BACKUP_MAX_MB|STATE_BACKUP)
+            ARTWORK_DIR|BUILD_DIR|DOWNLOAD_DIR|LOG_DIR|LOG_RETENTION_DAYS|STATE_BACKUP_MAX_MB|STATE_BACKUP|PROGRESS_STYLE|\
+            JOBS|EXTRACT_JOBS|MERGE_JOBS|SORT_JOBS|\
+            UPDATE_CHECK|UPDATE_CHECK_URL|UPDATE_CHECK_INTERVAL_HOURS|REPO_URL)
                 printf -v "RP_$key" '%s' "$val" ;;
             ART_ORDER_[A-Z0-9_]*|EXCLUDE_TAGS_[A-Z0-9_]*)
                 printf -v "RP_$key" '%s' "$val" ;;
@@ -126,7 +148,13 @@ rp_load_config() {
 
 rp_finish_config() {
     local n ref
-    for n in MIN_FREE_MB SPACE_FACTOR KEEP_NEW_BATCHES OLD_ARCHIVE_DAYS LOG_MAX_MB LOG_KEEP MAX_EXTRACT_ATTEMPTS DOWNLOAD_RETRIES GAPFILL_DAYS LOG_RETENTION_DAYS; do
+    # Every setting used in arithmetic or in a -mtime/-mmin test is checked
+    # here. A value that isn't a whole number is reported and the default is
+    # used - left unchecked, "soon" in ARTWORK_CHECK_INTERVAL_HOURS silently
+    # became 0 and turned the daily artwork check into an every-run check.
+    for n in MIN_FREE_MB SPACE_FACTOR KEEP_NEW_BATCHES OLD_ARCHIVE_DAYS LOG_MAX_MB LOG_KEEP \
+             MAX_EXTRACT_ATTEMPTS DOWNLOAD_RETRIES GAPFILL_DAYS LOG_RETENTION_DAYS \
+             ARTWORK_CHECK_INTERVAL_HOURS ARTWORK_KEEP_BACKUPS ARTWORK_FETCH_LIMIT STATE_BACKUP_MAX_MB; do
         ref="RP_$n"
         case "${!ref}" in
             ''|*[!0-9]*)
@@ -190,6 +218,7 @@ rp_finish_config() {
     RP_ARTWORK_ROOT="${RP_ARTWORK_ROOT%/}"; RP_DOWNLOAD_ROOT="${RP_DOWNLOAD_ROOT%/}"
     RP_LOG_ROOT="${RP_LOG_ROOT%/}"; RP_BUILD_ROOT="${RP_BUILD_ROOT%/}"
     RP_REPORT_ROOT="$RP_BASE_DIR/reports"
+    rp_set_bar_style                  # PROGRESS_STYLE has been read by now
     # Downloaded artwork archives live with the other downloads.
     RP_ARTWORK_CACHE="$RP_DOWNLOAD_ROOT/artwork_archive"
 }
@@ -202,6 +231,11 @@ rp_yesno() {
 }
 
 rp_print_config_warnings() {
+    if [ "${RP_CONF_FOUND:-1}" -eq 0 ]; then
+        rp_warn "no retroplay.conf found - using the built-in defaults."
+        echo "         Looked in: ${RP_INVOKED_FROM:-$PWD}, $SCRIPT_DIR, $RP_BASE_DIR" >&2
+        echo "         Copy retroplay.conf.example to retroplay.conf to change anything." >&2
+    fi
     [ -n "${RP_CONFIG_WARNINGS:-}" ] || return 0
     echo "Warnings from $RP_CONF_FILE:" >&2
     printf '%s' "$RP_CONFIG_WARNINGS" | sed 's/^/  /' >&2
@@ -304,6 +338,44 @@ rp_mark_complete() {
     rp_state_init
     printf '%s\n' "$2" | rp_atomic_write "$RP_STATE_DIR/complete/$1"
     rm -f "$RP_STATE_DIR/building/$1"
+}
+
+# --------------------------------------------------------------- manifest ---
+# What a finished collection actually is, recorded at the moment it is
+# finished: safe key=value, written atomically, next to the completion
+# marker. It costs nothing extra - the game count and size are the same two
+# numbers the summary table already works out - and it is what lets --status
+# and --why-build answer fromthe record rather than by walking the tree again.
+#
+# A collection built by an older release simply has no manifest. That means
+# "built, details unknown", never "needs rebuilding".
+rp_manifest_file() { printf '%s/manifest/%s\n' "$RP_STATE_DIR" "$1"; }
+rp_manifest_get()  { sed -n "s/^$2=//p" "$(rp_manifest_file "$1")" 2>/dev/null | head -1; }
+
+# The settings that change what a collection CONTAINS. A changed notification
+# topic or log setting is deliberately not in here: it is not a reason to
+# think the collection is out of date.
+rp_config_fingerprint() {
+    local v excl="" ref
+    for v in $(printf '%s' "${RP_VARIANTS:-}" | tr ',' ' '); do
+        ref="RP_EXCLUDE_TAGS_$(printf '%s' "$v" | tr '[:lower:]-' '[:upper:]_')"
+        excl="$excl,$v=${!ref:-}"
+    done
+    printf '%s|%s|%s|%s|%s|%s' \
+        "${RP_VARIANTS:-}" "${RP_ART_ORDER:-}" "${RP_ART_ORDER_RTG:-}" \
+        "${RP_DEMO_ART_ORDER:-}" "${RP_FILESYSTEM:-}" "$excl" \
+        | cksum | awk '{print $1}'
+}
+
+# rp_write_manifest <key> <dest> <kind: full|update> <games> <size kb> <art order> [artwork stamp]
+rp_write_manifest() {
+    rp_state_init
+    mkdir -p "$RP_STATE_DIR/manifest" 2>/dev/null || return 0
+    printf 'suite_version=%s\nrelease=%s\nvariant=%s\ncollection_path=%s\ncompleted_at=%s\nkind=%s\ngame_count=%s\nsize_kb=%s\nart_order=%s\nartwork=%s\nfilesystem=%s\nconfig_fingerprint=%s\n' \
+        "$RP_SUITE_VERSION" "$RP_RELEASE" "$1" "$2" "$(rp_ts)" "$3" \
+        "${4:-0}" "${5:-0}" "${6:-}" "${7:-}" "${RP_FILESYSTEM:-pfs}" "$(rp_config_fingerprint)" \
+        | rp_atomic_write "$(rp_manifest_file "$1")"
+    return 0
 }
 
 # Prints: fresh | incomplete | ready
@@ -629,7 +701,8 @@ rp_layout_problems() {
 # can do real damage - e.g. an older extract.sh recreating
 # Users/<you>/Downloads/Amiga/... inside retro_* - so the set is checked as
 # a whole. Prints each script whose stamp doesn't match this lib.sh.
-RP_SUITE_VERSION="2026.09.22"
+RP_SUITE_VERSION="2026.09.29"
+RP_RELEASE="0.4"                  # the release these scripts belong to
 RP_SUITE_FILES="all.sh start.sh extract.sh merge.sh sort.sh update.sh quick.sh aga.sh ecs.sh rtg.sh doctor.sh install_cron.sh uninstall_deps.sh setup.sh artwork_sync.sh artwork_fetch.sh"
 
 rp_suite_mismatches() {
@@ -654,29 +727,64 @@ RP_EXIT_INTERRUPTED=130 # stopped by Ctrl-C or a signal
 
 rp_is_interactive() { [ -t 0 ] && [ -t 1 ]; }
 
-# Consistent output styling. Colour only on a terminal, never in a log.
-if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
-    RP_C_HEAD=$'\033[1m'; RP_C_OK=$'\033[32m'; RP_C_WARN=$'\033[33m'; RP_C_ERR=$'\033[31m'; RP_C_DIM=$'\033[2m'; RP_C_OFF=$'\033[0m'
-else
-    RP_C_HEAD=""; RP_C_OK=""; RP_C_WARN=""; RP_C_ERR=""; RP_C_DIM=""; RP_C_OFF=""
-fi
+# ---------------------------------------------------------------- output ---
+# How much to print. 0 = --quiet (errors, warnings and the final result only),
+# 1 = normal, 2 = --verbose (more operational detail), 3 = --debug. Set once
+# by start.sh/all.sh and exported, so every child of a run says as much as the
+# run was asked for.
+RP_VERBOSITY="${RP_VERBOSITY:-1}"
+case "$RP_VERBOSITY" in 0|1|2|3) ;; *) RP_VERBOSITY=1 ;; esac
+[ "${RP_DEBUG:-0}" = "1" ] && RP_VERBOSITY=3
+[ "$RP_VERBOSITY" -ge 3 ] && RP_DEBUG=1
+rp_quiet()   { [ "$RP_VERBOSITY" -le 0 ]; }
+rp_verbose_on() { [ "$RP_VERBOSITY" -ge 2 ]; }
+
+# Colour: auto (a terminal, with NO_COLOR empty), always, never.
+# NO_COLOR follows the published convention - ANY non-empty value turns
+# colour off, not only "1". --color=always is a deliberate per-run choice
+# (piping into "less -R"), so it wins over the environment.
+RP_COLOR="${RP_COLOR:-auto}"
+case "$RP_COLOR" in auto|always|never) ;; *) RP_COLOR=auto ;; esac
+rp_colour_on() {
+    case "$RP_COLOR" in
+        always) return 0 ;;
+        never)  return 1 ;;
+    esac
+    [ -n "${NO_COLOR:-}" ] && return 1
+    [ "${RP_FORCE_TTY:-0}" = "1" ] && return 0     # set only by the test suite
+    [ -t 1 ]
+}
+# Sets both the RP_C_* names used by the library and the older RED/GREEN/...
+# names the leaf scripts were written with, so there is one decision, not six.
+rp_set_colours() {
+    if rp_colour_on; then
+        RP_C_HEAD=$'\033[1m'; RP_C_OK=$'\033[32m'; RP_C_WARN=$'\033[33m'
+        RP_C_ERR=$'\033[31m'; RP_C_DIM=$'\033[2m'; RP_C_INFO=$'\033[34m'; RP_C_OFF=$'\033[0m'
+    else
+        RP_C_HEAD=""; RP_C_OK=""; RP_C_WARN=""; RP_C_ERR=""; RP_C_DIM=""; RP_C_INFO=""; RP_C_OFF=""
+    fi
+    RED="$RP_C_ERR"; GREEN="$RP_C_OK"; YELLOW="$RP_C_WARN"
+    BLUE="$RP_C_INFO"; BOLD="$RP_C_HEAD"; NC="$RP_C_OFF"
+}
+rp_set_colours
 
 # rp_heading <text>       - a titled section
 # rp_step <n> <of> <text> - "[2/6] Checking for updates" with the time
 # rp_done <text>          - a finished step
-rp_heading() { printf '\n%s== %s ==%s\n' "$RP_C_HEAD" "$*" "$RP_C_OFF"; }
+rp_heading() { rp_quiet && return 0; printf '\n%s== %s ==%s\n' "$RP_C_HEAD" "$*" "$RP_C_OFF"; }
 rp_step() {
+    rp_quiet && return 0
     local n="$1" of="$2"; shift 2
     printf '\n%s[%s/%s]%s %s %s(%s)%s\n' "$RP_C_HEAD" "$n" "$of" "$RP_C_OFF" "$*" "$RP_C_DIM" "$(date '+%H:%M:%S')" "$RP_C_OFF"
 }
-rp_done() { printf '      %s%s%s %s\n' "$RP_C_OK" "done" "$RP_C_OFF" "$*"; }
+rp_done() { rp_quiet && return 0; printf '      %s%s%s %s\n' "$RP_C_OK" "done" "$RP_C_OFF" "$*"; }
 rp_ts()    { date '+%Y-%m-%d %H:%M:%S'; }
 rp_log()   { printf '[%s] %s\n' "$(rp_ts)" "$*"; }
 rp_warn()  { printf 'WARNING: %s\n' "$*" >&2; }
 rp_debug() { [ "${RP_DEBUG:-0}" = "1" ] && printf '[debug] %s\n' "$*" >&2; return 0; }
 rp_die()   {   # rp_die <exit-code> <message...>
     local code="$1"; shift
-    printf 'ERROR: %s\n' "$*" >&2
+    printf '%sERROR:%s %s\n' "${RP_C_ERR:-}" "${RP_C_OFF:-}" "$*" >&2
     exit "$code"
 }
 
@@ -710,15 +818,36 @@ rp_format_duration() {   # seconds -> H:MM:SS
 # place. Anywhere else (cron, logs, pipes): a plain timestamped line at 0,
 # 25, 50, 75 and 100% - no carriage returns or escape codes in log files.
 RP_PROGRESS_LAST=""
+# Smooth Unicode blocks on macOS, ASCII on Linux and the A314 (plain Pi
+# consoles and the Amiga side do not render the block characters).
+# PROGRESS_STYLE in retroplay.conf overrides it: smooth | ascii.
+# The bars are pre-built strings and sliced, because "tr" cannot map a space
+# to a multi-byte character.
+rp_set_bar_style() {
+    local style
+    style="$(printf '%s' "${RP_PROGRESS_STYLE:-auto}" | tr '[:upper:]' '[:lower:]')"
+    if [ "$style" = "auto" ]; then
+        if [ "$(uname -s)" = "Darwin" ]; then style=smooth; else style=ascii; fi
+    fi
+    if [ "$style" = "smooth" ]; then
+        RP_BAR_FULL_LINE="████████████████████████████████████████████████████████████████"
+        RP_BAR_EMPTY_LINE="░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░"
+    else
+        RP_BAR_FULL_LINE="################################################################"
+        RP_BAR_EMPTY_LINE="                                                                "
+    fi
+}
+rp_set_bar_style
+rp_bar() { printf '%s%s' "${RP_BAR_FULL_LINE:0:$1}" "${RP_BAR_EMPTY_LINE:0:$(( $2 - $1 ))}"; }
 rp_progress() {   # rp_progress <current> <total> [label]
+    rp_quiet && return 0
     local cur="$1" tot="$2" label="${3:-Progress}" pct width=40 fill bar
     [ "$tot" -gt 0 ] 2>/dev/null || return 0
     [ "$cur" -gt "$tot" ] && cur="$tot"
     pct=$((cur * 100 / tot))
     if [ -t 1 ]; then
         fill=$((pct * width / 100))
-        bar="$(printf '%*s' "$fill" '' | tr ' ' '#')"
-        printf '\r%s %3d%% [%-*s] %d/%d' "$label" "$pct" "$width" "$bar" "$cur" "$tot"
+        printf '\r%s %3d%% [%s] %d/%d' "$label" "$pct" "$(rp_bar "$fill" "$width")" "$cur" "$tot"
         [ "$cur" -ge "$tot" ] && printf '\n'
     else
         local bucket=$((pct / 25))
@@ -757,8 +886,9 @@ rp_test_notify() {
 
 # rp_print_status [short]: what the collection looks like right now.
 rp_print_status() {
-    local short="${1:-}" v key dest q st last code when result ls free drive
-    echo "Amiga Retroplay status"
+    local short="${1:-}" v key dest q st last code when result ls free drive _mg _ms
+    printf 'Amiga Retroplay status  %s(v%s, release %s)%s\n' "$RP_C_DIM" "$RP_SUITE_VERSION" "$RP_RELEASE" "$RP_C_OFF"
+    echo "  Settings:      $(rp_conf_in_use)"
     if [ -f "$RP_STATE_DIR/last_run" ]; then
         code="$(sed -n 's/^code=//p' "$RP_STATE_DIR/last_run")"
         when="$(sed -n 's/^time=//p' "$RP_STATE_DIR/last_run")"
@@ -774,6 +904,11 @@ rp_print_status() {
             incomplete) st="a full build was interrupted - the next run redoes it" ;;
             *)          st="built"
                         [ -f "$RP_STATE_DIR/last_success/$key" ] && st="built, last updated $(cat "$RP_STATE_DIR/last_success/$key")"
+                        # From the manifest when there is one; a collection
+                        # from an older release simply has no details.
+                        _mg="$(rp_manifest_get "$key" game_count)"
+                        _ms="$(rp_manifest_get "$key" size_kb)"
+                        [ -n "$_mg" ] && st="$st - $_mg games${_ms:+, $(( _ms / 1024 )) MB}"
                         [ "$q" -gt 0 ] && st="$st - $q new archive(s) waiting" ;;
         esac
         printf '  %-14s %s
@@ -1019,7 +1154,15 @@ rp_test_archive() {
 # =============================================================================
 # 14. Downloads, checksums, fingerprints (used by the artwork engine)
 # =============================================================================
-rp_info() { printf '%s\n' "$*"; }
+# Normal status. Silent under --quiet; warnings and errors never are.
+rp_info()    { rp_quiet && return 0; printf '%s\n' "$*"; }
+rp_ok()      { rp_quiet && return 0; printf '      %sok%s %s\n' "$RP_C_OK" "$RP_C_OFF" "$*"; }
+rp_verbose() { rp_verbose_on || return 0; printf '%s\n' "$*"; }
+# Failure. rp_error says what went wrong, rp_action gives the one command to
+# run next - together with "what was not changed" they are the shape every
+# failure message in the suite takes.
+rp_error()   { printf '%sERROR:%s %s\n' "$RP_C_ERR" "$RP_C_OFF" "$*" >&2; }
+rp_action()  { printf '\nNext:  %s\n' "$*" >&2; }
 rp_print_usage_error() {   # <script> <message>
     printf 'ERROR: %s\n' "$2" >&2
     printf "Try '%s --help'.\n" "$1" >&2
@@ -1040,18 +1183,23 @@ rp_fetch() {
     # On a terminal, show the transfer meter; in a log, stay quiet (the
     # caller prints one line per file instead).
     if command -v curl >/dev/null 2>&1; then
-        if [ -t 1 ]; then curl -fL --progress-bar -m 1800 -o "$2" "$1"
+        if [ -t 1 ] && [ -z "${RP_FETCH_QUIET:-}" ]; then curl -fL --progress-bar -m 1800 -o "$2" "$1"
         else curl -fsSL -m 1800 -o "$2" "$1"; fi
     elif command -v wget >/dev/null 2>&1; then
-        if [ -t 1 ]; then wget -T 1800 --progress=bar:force -O "$2" "$1"
+        if [ -t 1 ] && [ -z "${RP_FETCH_QUIET:-}" ]; then wget -T 1800 --progress=bar:force -O "$2" "$1"
         else wget -q -T 1800 -O "$2" "$1"; fi
     else return 1; fi
 }
 
 # rp_fetch_listing <url>: print a directory listing page (HTML or FTP style).
+# A listing is a few KB, so a long timeout only turns an unreachable server
+# into a silent wait: update.sh checks five folders, so 120s each meant ten
+# minutes of nothing before --dry-run said anything. RP_LISTING_TIMEOUT and
+# RP_CONNECT_TIMEOUT are overridable for testing.
 rp_fetch_listing() {
-    if command -v curl >/dev/null 2>&1; then curl -fsSL -m 120 "$1"
-    elif command -v wget >/dev/null 2>&1; then wget -q -T 120 -O - "$1"
+    local m="${RP_LISTING_TIMEOUT:-60}" c="${RP_CONNECT_TIMEOUT:-15}"
+    if command -v curl >/dev/null 2>&1; then curl -fsSL --connect-timeout "$c" -m "$m" "$1"
+    elif command -v wget >/dev/null 2>&1; then wget -q -T "$c" --read-timeout="$m" -O - "$1"
     else return 1; fi
 }
 
@@ -1066,6 +1214,284 @@ rp_dir_fingerprint() {
         | awk '{ size = $5; name = $9; for (i = 10; i <= NF; i++) name = name " " $i; print size "\t" name }' \
         | LC_ALL=C sort ) \
         | { if rp_have_sha256; then rp_sha256 /dev/stdin; else cksum | awk '{print $1"-"$2}'; fi; }
+}
+
+# Where a collection is built before it replaces the finished one. Both sit
+# beside the collection (so the swap is a rename in one folder, which is
+# instant and atomic) and both start with a dot, so they can never be mistaken
+# for a collection by the retro_* globs in rp_default_collection and friends.
+# ----------------------------------------------------------------- jobs ---
+# How many things to do at once. "auto" keeps exactly what each stage worked
+# out for itself before this setting existed (CPU count, capped, then capped
+# again by memory on a small Pi); a number overrides it. --jobs N on the
+# command line beats the config, and the config beats auto.
+#
+# CPU count alone is a poor guide for small-file work on one USB SSD queue,
+# but the right numbers per platform have to be measured, not guessed - so
+# auto is deliberately unchanged until there are stage timings to look at.
+rp_jobs() {   # rp_jobs <stage: extract|merge|sort> <what the stage worked out>
+    local stage="$1" fallback="$2" want="" ref
+    if [ -n "${RP_JOBS_OVERRIDE:-}" ]; then
+        want="$RP_JOBS_OVERRIDE"                       # --jobs N
+    else
+        ref="RP_$(printf '%s' "$stage" | tr '[:lower:]' '[:upper:]')_JOBS"
+        want="${!ref:-}"
+        if [ -z "$want" ] || [ "$want" = auto ]; then want="${RP_JOBS:-}"; fi
+    fi
+    case "$want" in
+        ''|auto) printf '%s' "$fallback"; return 0 ;;
+        *[!0-9]*) rp_warn "JOBS setting '$want' is not a whole number - using $fallback"
+                  printf '%s' "$fallback"; return 0 ;;
+        0)        printf '%s' "$fallback"; return 0 ;;
+    esac
+    printf '%s' "$want"
+    return 0
+}
+
+# --------------------------------------------------- explaining decisions ---
+# These answer from the state the run actually kept - queues, build markers,
+# manifests and the attempt list - never from a guess.
+
+# Why would (or wouldn't) this variant be rebuilt next run?
+rp_why_build() {
+    local v="$1" key dest q state fp mfp
+    key="retro_$(rp_variant_suffix "$v")"; dest="$RP_BUILD_ROOT/$key"
+    printf '%s\n' "$key"
+    if [ ! -d "$dest" ]; then
+        printf '  Not built yet, so the next run builds it in full.\n'
+        printf '  Folder:   %s (does not exist)\n' "$dest"
+        return 0
+    fi
+    state="$(rp_build_state "$key" "$dest")"
+    printf '  Folder:   %s\n' "$dest"
+    case "$state" in
+        incomplete)
+            printf '  State:    a full build was interrupted - the next run redoes it from scratch\n' ;;
+        *)  printf '  State:    built' ;;
+    esac
+    if [ -f "$(rp_manifest_file "$key")" ]; then
+        printf ' (%s games, %s MB, %s build, %s)\n' \
+            "$(rp_manifest_get "$key" game_count)" \
+            "$(( $(rp_manifest_get "$key" size_kb) / 1024 ))" \
+            "$(rp_manifest_get "$key" kind)" "$(rp_manifest_get "$key" completed_at)"
+        printf '  Artwork:  %s (order %s)\n' \
+            "$(rp_manifest_get "$key" artwork)" "$(rp_manifest_get "$key" art_order)"
+        mfp="$(rp_manifest_get "$key" config_fingerprint)"; fp="$(rp_config_fingerprint)"
+        if [ -n "$mfp" ] && [ "$mfp" != "$fp" ]; then
+            printf '  Settings: retroplay.conf has changed since this was built\n'
+            printf '            (variants, art order, filesystem or exclusions)\n'
+        else
+            printf '  Settings: unchanged since it was built\n'
+        fi
+    else
+        [ "$state" = incomplete ] || printf '\n'
+        printf '  Details:  built by an older version - no record kept, which is not a reason to rebuild\n'
+    fi
+    q="$(rp_queue_count "$key")"
+    if [ "$q" -gt 0 ]; then
+        printf '  Queue:    %s archive(s) waiting - the next run adds them\n' "$q"
+    else
+        printf '  Queue:    empty - nothing waiting for this collection\n'
+    fi
+    return 0
+}
+
+# Archives that could not be extracted, and games left without artwork.
+rp_show_failed() {
+    local n=0 line count target newest
+    printf 'Archives that failed to extract\n'
+    if [ -s "$RP_STATE_DIR/extract_attempts.list" ]; then
+        while IFS="$(printf '\t')" read -r count target; do
+            [ -n "$target" ] || continue
+            n=$((n + 1))
+            printf '  %-4s %s\n' "${count}x" "$target"
+        done < "$RP_STATE_DIR/extract_attempts.list"
+    fi
+    if [ "$n" -eq 0 ]; then
+        printf '  none\n'
+    else
+        printf '  (%s attempts each and they are set aside; ./start.sh --retry-failed clears the count)\n' \
+            "$RP_MAX_EXTRACT_ATTEMPTS"
+    fi
+    printf '\nGames without artwork, from the newest run\n'
+    newest="$(ls -1 "$RP_REPORT_ROOT"/*_no_artwork.txt 2>/dev/null | sort | tail -1)"
+    if [ -n "$newest" ]; then
+        printf '  %s (%s games)\n' "reports/${newest##*/}" "$(grep -c . "$newest" 2>/dev/null || echo 0)"
+        sed -n '1,10p' "$newest" | sed 's/^/    /'
+        [ "$(grep -c . "$newest")" -gt 10 ] && printf '    ...\n'
+    else
+        printf '  none recorded\n'
+    fi
+    return 0
+}
+
+# Forget the attempt counts so set-aside archives are tried once more.
+rp_retry_failed() {
+    if [ ! -s "$RP_STATE_DIR/extract_attempts.list" ]; then
+        rp_ok "nothing has been set aside - there is nothing to retry"
+        return 0
+    fi
+    local n; n="$(grep -c . "$RP_STATE_DIR/extract_attempts.list")"
+    rm -f "$RP_STATE_DIR/extract_attempts.list"
+    rp_ok "cleared the attempt count for $n archive(s) - the next run tries them again"
+    rp_action "./start.sh --sync"
+    return 0
+}
+
+# Where the space goes, using the same numbers the space check uses.
+rp_why_space() {
+    local free v key dest kb total=0
+    printf 'Disk space\n'
+    free="$(rp_free_kb "$RP_OUTPUT_ROOT")"
+    printf '  Output drive:   %s\n' "$RP_OUTPUT_ROOT"
+    [ -n "$free" ] && printf '  Free now:       %s MB\n' "$(( free / 1024 ))"
+    printf '  Kept spare:     %s MB (MIN_FREE_MB)\n' "$RP_MIN_FREE_MB"
+    printf '\nWhat is using it\n'
+    for v in $(printf '%s' "$RP_VARIANTS" | tr ',' ' '); do
+        key="retro_$(rp_variant_suffix "$v")"; dest="$RP_BUILD_ROOT/$key"
+        [ -d "$dest" ] || continue
+        kb="$(rp_du_kb "$dest")"; total=$(( total + ${kb:-0} ))
+        printf '  %-16s %s MB\n' "$key" "$(( ${kb:-0} / 1024 ))"
+    done
+    for dest in "$RP_DOWNLOAD_ROOT" "$RP_ARTWORK_ROOT" "$RP_BUILD_ROOT/new_"*; do
+        [ -d "$dest" ] || continue
+        kb="$(rp_du_kb "$dest")"
+        printf '  %-16s %s MB\n' "${dest##*/}" "$(( ${kb:-0} / 1024 ))"
+    done
+    printf '\n  A full rebuild needs room for one collection twice over while the\n'
+    printf '  new one is built beside the old: about %s MB on top of what is free.\n' \
+        "$(( total / 1024 / $(printf '%s' "$RP_VARIANTS" | tr ',' ' ' | wc -w | tr -d ' ') ))"
+    return 0
+}
+
+# ----------------------------------------------------------------- lock ---
+# One pipeline run at a time. all.sh takes this for a whole build; the stage
+# scripts (merge/sort/extract/update/quick) take it when a person runs them
+# by hand, so an interactive ./merge.sh cannot work on a collection a
+# nightly all.sh is halfway through. A stage started BY all.sh never takes it
+# - RP_CHILD=1 says the parent already holds it.
+RP_LOCK_FILE="${RP_LOCK_FILE:-$SCRIPT_DIR/.all.lock}"
+RP_LOCK_HELD=0          # 0 = not held, 1 = flock on fd 9, 2 = lock folder
+RP_LOCK_HOST="$(hostname 2>/dev/null || uname -n)"
+
+# flock, including macOS's keg-only Homebrew util-linux (Homebrew doesn't
+# symlink it into PATH there), checked before concluding it is missing.
+rp_flock_bin() {
+    if command -v flock >/dev/null 2>&1; then printf 'flock'; return 0; fi
+    if [ "$(uname -s)" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
+        local prefix; prefix="$(brew --prefix util-linux 2>/dev/null)"
+        if [ -n "$prefix" ] && [ -x "$prefix/bin/flock" ]; then
+            printf '%s/bin/flock' "$prefix"; return 0
+        fi
+    fi
+    return 1
+}
+
+rp_lock_field()  { sed -n "s/^$1=//p" "$RP_LOCK_FILE.info" 2>/dev/null | head -1; }
+rp_lock_holder() {
+    [ -f "$RP_LOCK_FILE.info" ] || return 1
+    tr '\n' ' ' < "$RP_LOCK_FILE.info" | sed 's/ $//'
+}
+rp_lock_write_info() {
+    printf 'pid=%s\nhost=%s\nstarted=%s\nrun_id=%s\ncommand=%s\n' \
+        "$$" "$RP_LOCK_HOST" "$(rp_ts)" "${RP_RUN_ID:-$$}" "$1" \
+        | rp_atomic_write "$RP_LOCK_FILE.info"
+}
+
+# True when the lock folder was left behind by a run that no longer exists ON
+# THIS MACHINE. A lock written by another machine (a shared drive) is never
+# assumed stale, however old it is.
+rp_lock_is_stale() {
+    local lpid lhost
+    lpid="$(rp_lock_field pid)"; lhost="$(rp_lock_field host)"
+    [ "$lhost" = "$RP_LOCK_HOST" ] && [ -n "$lpid" ] && ! kill -0 "$lpid" 2>/dev/null
+}
+
+# rp_lock_take "<command line>"  - 0 = taken (or not needed), 1 = someone else
+rp_lock_take() {
+    [ "${RP_CHILD:-0}" = "1" ] && return 0
+    local fb; fb="$(rp_flock_bin || true)"
+    if [ -n "$fb" ]; then
+        # flock releases when the holder exits or dies, so a lock that cannot
+        # be taken is always an ACTIVE run, never a leftover.
+        exec 9>"$RP_LOCK_FILE" || return 1
+        "$fb" -n 9 || return 1
+        RP_LOCK_HELD=1; rp_lock_write_info "$1"; return 0
+    fi
+    if ! mkdir "$RP_LOCK_FILE.d" 2>/dev/null; then
+        if rp_lock_is_stale; then
+            rp_info "Removing a stale lock left by a run that no longer exists ($(rp_lock_holder))"
+            rm -rf "$RP_LOCK_FILE.d"
+            mkdir "$RP_LOCK_FILE.d" 2>/dev/null || return 1
+        else
+            return 1
+        fi
+    fi
+    RP_LOCK_HELD=2; rp_lock_write_info "$1"; return 0
+}
+
+# Only ever removes a lock this process took.
+rp_lock_release() {
+    case "$RP_LOCK_HELD" in
+        1) exec 9>&- 2>/dev/null ;;
+        2) rm -rf "$RP_LOCK_FILE.d" ;;
+        *) return 0 ;;
+    esac
+    [ "$(rp_lock_field pid)" = "$$" ] && rm -f "$RP_LOCK_FILE.info"
+    RP_LOCK_HELD=0
+    return 0
+}
+
+# The standard refusal: what is running, and what to do about it.
+rp_lock_refuse() {
+    rp_error "another run is already running - not starting $1 at the same time"
+    [ -n "$(rp_lock_holder)" ] && printf '  Held by: %s\n' "$(rp_lock_holder)" >&2
+    printf '  Nothing was changed.\n' >&2
+    rp_action "wait for it to finish, or:  ./start.sh --unlock-stale"
+    exit "$RP_EXIT_CONFIG"
+}
+
+# Used by the stage scripts: take the lock unless all.sh is driving.
+rp_lock_for_stage() {
+    [ "${CALLED_FROM_ALL:-0}" -eq 1 ] && return 0
+    [ "${RP_CHILD:-0}" = "1" ] && return 0
+    rp_lock_take "$1" || rp_lock_refuse "$1"
+    return 0
+}
+
+rp_staged_path()   { printf '%s/.new_%s\n' "$(dirname "$1")" "$(basename "$1")"; }
+rp_previous_path() { printf '%s/.previous_%s\n' "$(dirname "$1")" "$(basename "$1")"; }
+
+# rp_swap_collection <live>: put the staged build at <live>, keeping the
+# previous collection until the new one is in place. The old code removed the
+# collection first and then spent minutes copying and merging artwork into the
+# gap, so an interruption left nothing there at all.
+rp_swap_collection() {
+    local live="$1" new old
+    new="$(rp_staged_path "$live")"; old="$(rp_previous_path "$live")"
+    [ -d "$new" ] || return 1
+    rm -rf -- "$old"
+    if [ -d "$live" ] && ! mv -- "$live" "$old"; then return 1; fi
+    if ! mv -- "$new" "$live"; then
+        # Put the previous collection back rather than leaving nothing there.
+        [ -d "$old" ] && [ ! -e "$live" ] && mv -- "$old" "$live"
+        return 1
+    fi
+    rm -rf -- "$old"
+    return 0
+}
+
+# rp_recover_swap <live>: called at the start of a run. If a swap was cut in
+# half, the previous collection is still under its .previous_ name - put it
+# back. Anything else left over is a partial build and is removed.
+rp_recover_swap() {
+    local live="$1" new old
+    new="$(rp_staged_path "$live")"; old="$(rp_previous_path "$live")"
+    if [ ! -e "$live" ] && [ -d "$old" ]; then
+        mv -- "$old" "$live" 2>/dev/null && rp_warn "a build was interrupted while swapping $(basename "$live") - the previous collection was put back"
+    fi
+    rm -rf -- "$new" "$old" 2>/dev/null
+    return 0
 }
 
 # rp_same_filesystem <path a> <path b>: 0 if both are on one filesystem, so a
@@ -1248,6 +1674,13 @@ rp_file_size() { [ -f "$1" ] && wc -c < "$1" 2>/dev/null | tr -d ' '; }
 # characters can CORRUPT it.
 rp_pfs_reminder() {
     [ "$(printf '%s' "${RP_FILESYSTEM:-pfs}" | tr '[:upper:]' '[:lower:]')" = "pfs" ] || return 0
+    # A partition can be corrupted by getting this wrong, so --quiet shortens
+    # the warning rather than removing it.
+    if rp_quiet; then
+        printf '%sPFS: run "setfnsize <drive:> 107" on the Amiga before copying this collection.%s\n' \
+            "$RP_C_WARN" "$RP_C_OFF" >&2
+        return 0
+    fi
     printf '\n%s' "$RP_C_WARN"
     echo "============================================================"
     echo " IMPORTANT - before copying this collection to your Amiga"
@@ -1294,3 +1727,189 @@ rp_list_collections() {
     done
     printf '%s' "$found"
 }
+
+# Printed once at the start of every script, so it is obvious which version
+# is running - mixing old and new scripts has caused real confusion.
+# rp_child_result <key=value>... : how a stage reports back to all.sh when it
+# was run as part of a pipeline. Written only when the parent named a file in
+# RP_RESULT_FILE, so a stage run by hand behaves exactly as it always did.
+rp_child_result() {
+    [ -n "${RP_RESULT_FILE:-}" ] || return 0
+    printf '%s\n' "$@" | rp_atomic_write "$RP_RESULT_FILE"
+    return 0
+}
+
+rp_banner() {   # rp_banner <script name>
+    # A stage run by all.sh is part of one job, not a tool of its own: the
+    # parent owns the banner, the phase headings and the summary.
+    [ "${RP_CHILD:-0}" = "1" ] && return 0
+    rp_quiet && return 0
+    printf '%s%s%s v%s (release %s)\n' "$RP_C_DIM" "$1" "$RP_C_OFF" "$RP_SUITE_VERSION" "$RP_RELEASE"
+}
+
+# Which config file is in use, for --status and doctor.
+rp_conf_in_use() {
+    if [ "${RP_CONF_FOUND:-1}" -eq 1 ]; then printf '%s' "$RP_CONF_FILE"
+    else printf 'not in use (built-in defaults)'; fi
+}
+
+# rp_artwork_missing [variant ...]
+# Prints the artwork that is not installed, one per line, e.g.
+#   iGame_AGA/lores   iGame_ECS/laced   iGame_RTG   TinyLauncher
+# A pack counts as installed when it holds a section folder (Covers/Screens/
+# Titles) - an empty iGame_AGA folder is NOT artwork, which is why the old
+# check reported only the pack whose folder happened to be absent.
+rp_artwork_missing() {
+    local want="$*" v base p found
+    [ -n "$want" ] || want="$RP_VARIANTS"
+    for v in $(printf '%s' "$want" | tr ',' ' '); do
+        case "$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]')" in
+            aga)        base="iGame_AGA/lores" ;;
+            aga-laced)  base="iGame_AGA/laced" ;;
+            ecs)        base="iGame_ECS/lores" ;;
+            ecs-laced)  base="iGame_ECS/laced" ;;
+            rtg)        base="iGame_RTG" ;;
+            *) continue ;;
+        esac
+        found=""
+        for p in Covers Screens Titles; do
+            [ -d "$RP_ARTWORK_ROOT/$base/$p" ] && found=1 && break
+        done
+        # artwork installed the older flat way counts too
+        if [ -z "$found" ]; then
+            case "$base" in
+                */lores|*/laced)
+                    for p in Covers Screens Titles; do
+                        [ -d "$RP_ARTWORK_ROOT/${base%/*}/$p" ] && found=1 && break
+                    done ;;
+            esac
+        fi
+        [ -n "$found" ] || printf '%s\n' "$base"
+    done
+}
+
+# rp_progress_line <current> <total> <label>: the same bar as rp_progress,
+# returned as a string so a caller can print it once per item instead of
+# redrawing it in place (which interleaves badly with other output).
+rp_progress_line() {
+    rp_quiet && return 0
+    local cur="$1" tot="$2" label="$3" pct width=32 fill
+    [ "$tot" -gt 0 ] 2>/dev/null || return 0
+    pct=$((cur * 100 / tot))
+    # Off a terminal (cron, a redirected log) a drawn bar is just noise, so
+    # print the same information as a plain timestamped line instead - the
+    # same rule rp_progress already follows.
+    if [ ! -t 1 ]; then
+        printf '[%s] %s: %d%% (%d/%d)' "$(rp_ts)" "$label" "$pct" "$cur" "$tot"
+        return 0
+    fi
+    fill=$((pct * width / 100))
+    printf '%s %3d%% [%s] %d/%d' "$label" "$pct" "$(rp_bar "$fill" "$width")" "$cur" "$tot"
+}
+
+
+# =============================================================================
+# 17. "Is there a newer release?" - a check that only ever reads a number
+# =============================================================================
+# Deliberately limited, because auto-updating a shell tool is how machines get
+# compromised:
+#   * it asks GitHub's API over HTTPS only (TLS 1.2+), with a short timeout
+#   * it reads ONE field, the release tag, and accepts it only if it looks
+#     like a version number (digits and dots) - anything else is ignored
+#   * it NEVER downloads an archive, writes a file, or runs anything
+#   * it prints the address and the commands, and you decide
+# The result is cached so a nightly run doesn't call out every time.
+rp_check_for_update() {   # rp_check_for_update [force]
+    local stamp="$RP_STATE_DIR/update_last_check" body tag latest
+    [ "${RP_UPDATE_CHECK:-yes}" = "yes" ] || return 0
+    case "$RP_UPDATE_CHECK_URL" in https://*) ;; *) return 0 ;; esac      # HTTPS only
+    if [ "${1:-}" != "force" ] && [ -f "$stamp" ] \
+       && [ -z "$(find "$stamp" -mmin "+$(( ${RP_UPDATE_CHECK_INTERVAL_HOURS:-24} * 60 ))" 2>/dev/null)" ]; then
+        return 0
+    fi
+    if command -v curl >/dev/null 2>&1; then
+        body="$(curl --proto '=https' --tlsv1.2 -fsSL -m 10 -H 'Accept: application/vnd.github+json' "$RP_UPDATE_CHECK_URL" 2>/dev/null)"
+    elif command -v wget >/dev/null 2>&1; then
+        body="$(wget --https-only -q -T 10 -O - "$RP_UPDATE_CHECK_URL" 2>/dev/null)"
+    else
+        return 0
+    fi
+    rp_state_init; : > "$stamp"
+    [ -n "$body" ] || return 0
+    # one field, then a strict check: digits and dots only, at most 12 chars
+    tag="$(printf '%s' "$body" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]\{1,12\}\)".*/\1/p' | head -1)"
+    latest="${tag#v}"
+    case "$latest" in
+        ""|*[!0-9.]*) rp_debug "update check: ignoring an unexpected tag"; return 0 ;;
+    esac
+    [ "$(rp_version_cmp "$latest" "$RP_RELEASE")" = "1" ] || return 0
+    printf '\n%s' "$RP_C_WARN"
+    echo "-------------------------------------------------------------"
+    echo " A newer release is available: $latest   (you are running $RP_RELEASE)"
+    echo "-------------------------------------------------------------"
+    echo " Nothing has been downloaded - have a look and decide yourself:"
+    echo "   $RP_REPO_URL/releases"
+    echo
+    echo " To update, from the folder holding the scripts:"
+    echo "   curl -fL -o whdsync.zip $RP_REPO_URL/releases/latest/download/whdsync.zip"
+    echo "   unzip -o whdsync.zip && ./setup.sh"
+    echo " (Check the release notes first. Turn this check off with"
+    echo "  UPDATE_CHECK=\"no\" in retroplay.conf.)"
+    printf '%s\n' "$RP_C_OFF"
+    return 0
+}
+
+# merge.sh needs bash 4 (associative arrays); everything else runs on the
+# bash 3.2 macOS ships. Checked BEFORE a run starts, so nobody waits through
+# a long download only to fail at the artwork stage.
+rp_find_bash4() {
+    local b
+    [ "${BASH_VERSINFO[0]}" -ge 4 ] && { command -v bash; return 0; }
+    for b in /opt/homebrew/bin/bash /usr/local/bin/bash /usr/bin/bash; do
+        [ -x "$b" ] && "$b" -c '[ "${BASH_VERSINFO[0]}" -ge 4 ]' 2>/dev/null && { printf '%s\n' "$b"; return 0; }
+    done
+    return 1
+}
+rp_require_bash4() {
+    rp_find_bash4 >/dev/null 2>&1 && return 0
+    rp_warn "bash 4 or newer is needed to add artwork (merge.sh); this system has ${BASH_VERSION}."
+    if [ "$(uname -s)" = "Darwin" ]; then
+        echo "         Fix: brew install bash    (then run ./setup.sh again)" >&2
+    else
+        echo "         Fix: sudo apt install bash" >&2
+    fi
+    return 1
+}
+
+# May a script install packages while a run is in progress? No, unless the
+# user explicitly asked (start.sh --install-missing-tools, or setup.sh).
+# A build or a cron run must never stop at a sudo prompt.
+rp_may_install_tools() { [ "${RP_ALLOW_TOOL_INSTALL:-0}" = "1" ]; }
+rp_tool_missing_hint() {   # <tool>
+    echo "$1 is missing. Install everything that's needed with:  ./setup.sh" >&2
+    echo "   (or just this one now:  ./start.sh --install-missing-tools)" >&2
+}
+
+# rp_require_tools <tool>... : every archive tool a build needs must be on
+# PATH before the run starts. Installing them is setup.sh's job, so this only
+# reports - a build, and especially a cron job, never stops at a package
+# prompt. The engine checks this itself now that the stage scripts are run
+# directly rather than through start.sh.
+rp_require_tools() {
+    local t missing=""
+    for t in "$@"; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done
+    [ -z "$missing" ] && return 0
+    {
+        echo
+        printf 'Still missing:%s\n' "$missing"
+        if [ ! -t 0 ]; then
+            echo "Note: this is an unattended run (e.g. cron), which starts with a minimal PATH."
+            echo "If the tool works in your terminal, run ./install_cron.sh again from that"
+            echo "terminal (or any script once, interactively) so its folder is remembered."
+        fi
+        echo "Run ./setup.sh to install everything that's needed,"
+        echo "or ./start.sh --install-missing-tools to install just these now."
+    } >&2
+    return 1
+}
+

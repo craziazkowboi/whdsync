@@ -150,6 +150,13 @@ if [ -z "\$name" ]; then
     echo "</pre></body></html>"
     exit 0
 fi
+# simulated server-side failure (503) for any archive matching this pattern
+pat="\$(cat "$MOCK/art_503" 2>/dev/null)"
+if [ -n "\$pat" ]; then
+    case "\$name" in *"\$pat"*)
+        echo "curl: (22) The requested URL returned error: 503" >&2; exit 22 ;;
+    esac
+fi
 [ -f "$ARTSRC/\$name" ] || exit 22
 echo "download \$name" >> "$MOCK/art_downloads"
 if [ -n "\$out" ]; then cp "$ARTSRC/\$name" "\$out"; else cat "$ARTSRC/\$name"; fi
@@ -1120,6 +1127,21 @@ sys.exit(0 if (w,h,p) == (320,128,8) else 1)"'
       '[ -d "$FA/artwork/iGame_art/NoArtGame" ]'
     check "the totals are reported" \
       'grep -q "Artwork found and installed: 1" "$T/fetch.log" && grep -q "Still without artwork:       2" "$T/fetch.log"'
+    # Counts reach all.sh through a key=value file, never by grepping the
+    # console text: rewording a message must not change a reported figure.
+    cat > "$FA/retroplay.conf" << EOF
+ARTWORK_FETCH="yes"
+ARTWORK_FETCH_COMMAND="$MOCK/findart"
+ARTWORK_FETCH_LIMIT=10
+EOF
+    sed 's/Artwork found and installed:/Pictures we managed to dig up:/' "$FA/artwork_fetch.sh" > "$FA/artwork_fetch_reworded.sh"
+    chmod +x "$FA/artwork_fetch_reworded.sh"
+    ( cd "$FA" && RP_RESULT_FILE="$T/fetch_result" ./artwork_fetch_reworded.sh --list missing.txt --variant retro_aga --dest build/retro_aga ) > "$T/fetch2.log" 2>&1
+    check "the counts come from a result file, not from the wording" \
+      'grep -qx "found=1" "$T/fetch_result" && grep -qx "failed=2" "$T/fetch_result" && grep -q "Pictures we managed" "$T/fetch2.log"'
+    check "...and all.sh reads that file rather than the child's output" \
+      '! grep -q "sed -n .s/.*Artwork found and installed" "$ROOT/all.sh" && grep -q "RP_RESULT_FILE=" "$ROOT/all.sh"'
+
     # off by default
     printf 'ARTWORK_FETCH="no"\n' > "$FA/retroplay.conf"
     ( cd "$FA" && ./artwork_fetch.sh --list missing.txt --variant retro_aga --dest build/retro_aga ) > "$T/fetchoff.log" 2>&1
@@ -1182,20 +1204,26 @@ check "once installed, nothing is reported missing" \
 
 
 section "47. Progress bar style, summary table and setup reruns"
+# the drawn bar itself (rp_bar); rp_progress_line only draws it on a terminal
 check "the progress bar is ASCII on Linux and blocks on macOS" \
-  'bash -c "SCRIPT_DIR=$ROOT; . $ROOT/lib.sh; RP_PROGRESS_STYLE=ascii; rp_set_bar_style; rp_progress_line 8 16 X" | grep -q "#" &&
-   bash -c "SCRIPT_DIR=$ROOT; . $ROOT/lib.sh; RP_PROGRESS_STYLE=smooth; rp_set_bar_style; rp_progress_line 8 16 X" | grep -qv "#####"'
+  'bash -c "SCRIPT_DIR=$ROOT; . $ROOT/lib.sh; RP_PROGRESS_STYLE=ascii; rp_set_bar_style; rp_bar 8 16" | grep -q "#" &&
+   bash -c "SCRIPT_DIR=$ROOT; . $ROOT/lib.sh; RP_PROGRESS_STYLE=smooth; rp_set_bar_style; rp_bar 8 16" | grep -qv "#####"'
 setup mkdir -p "$T/styledir"; printf 'PROGRESS_STYLE="smooth"\n' > "$T/styledir/retroplay.conf"
 check "PROGRESS_STYLE in the config is honoured (blocks, not #)" \
   'bash -c "SCRIPT_DIR=$ROOT; RP_INVOKED_FROM=$T/styledir; . $ROOT/lib.sh; rp_load_config >/dev/null 2>&1; rp_progress_line 8 16 X" | grep -q "50%" &&
-   ! bash -c "SCRIPT_DIR=$ROOT; RP_INVOKED_FROM=$T/styledir; . $ROOT/lib.sh; rp_load_config >/dev/null 2>&1; rp_progress_line 8 16 X" | grep -q "#"'
+   ! bash -c "SCRIPT_DIR=$ROOT; RP_INVOKED_FROM=$T/styledir; . $ROOT/lib.sh; rp_load_config >/dev/null 2>&1; rp_bar 8 16" | grep -q "#"'
+# a log is not a terminal: the artwork bar degrades the way rp_progress does
+check "artwork progress is a plain timestamped line in a log, not a drawn bar" \
+  'out="$(bash -c "SCRIPT_DIR=$ROOT; . $ROOT/lib.sh; RP_PROGRESS_STYLE=ascii; rp_set_bar_style; rp_progress_line 8 16 Artwork")";
+   case "$out" in *"Artwork: 50% (8/16)"*) ;; *) false ;; esac &&
+   case "$out" in *"#"*) false ;; *) true ;; esac'
 run tbl ./all.sh --skip-update --variants aga --refresh-artwork
 check "the summary lists each collection with games, size, time and artwork" \
   'grep -q "Collection" "$T/tbl.log" && grep -qE "retro_aga +[0-9]+ +[0-9]+ +[0-9]+:[0-9][0-9]:[0-9][0-9] +(Screens|Covers|Titles)" "$T/tbl.log"'
 check "...and the overall time is still shown" 'grep -q "Total time:" "$T/tbl.log"'
 # an interrupted setup starts clean next time
 SU="$T/setupagain"; setup mkdir -p "$SU"
-cp "$ROOT"/*.sh "$REPO/to_ilbm.py" "$ROOT/retroplay.conf.example" "$SU/"
+cp "$ROOT"/*.sh "$REPO/to_ilbm.py" "$REPO/retroplay.conf.example" "$SU/"
 printf 'wrote_conf\n' > "$SU/.retroplay_setup_state"        # as if interrupted
 printf 'VARIANTS="half written"\n' > "$SU/retroplay.conf"
 ( cd "$SU" && env PATH="$MOCK:$PATH" RP_SETUP_OS=linux ./setup.sh --yes --no-cron ) > "$T/setupagain.log" 2>&1
@@ -1282,6 +1310,378 @@ check "start.sh says how to fix missing tools instead of installing them" \
 check "the config is parsed, never sourced" \
   '! grep -nE "^\s*(\.|source) .*retroplay\.conf" "$ROOT"/*.sh'
 check "no eval anywhere in the suite" '! grep -nw eval "$ROOT"/*.sh'
+
+
+section "50. A failed artwork download is never recorded as up to date"
+# The Retroplay artwork host sometimes answers 503. When that happens the pack
+# must keep its previous state: nothing written to .retroplay saying it is
+# current, and the next run must try again instead of waiting out the 24 hour
+# interval.
+ART_ST="$ROOT/.retroplay/artwork"
+COVERS_MAN="$ART_ST/manifests/iGame_AGA_lores_Covers.meta"
+acfg ARTWORK_SYNC '"auto"'
+acfg ARTWORK_FAILURE_POLICY '"warn-and-continue"'
+rm -f "$MOCK/art_503"
+run art503pre ./artwork_sync.sh --sync --for aga --yes
+check "(setting the scene) the AGA artwork installs and is recorded as current" \
+  '[ -s "$COVERS_MAN" ] && grep -q "^remote_size=" "$COVERS_MAN"'
+man_before="$(cksum < "$COVERS_MAN")"
+# the source republishes that pack, so an update is now due...
+printf 'B\nIGame_Covers_AGA_LoRes.lha\nrepublished, so an update is due\n' > "$ARTSRC/IGame_Covers_AGA_LoRes.lha"
+rm -f "$ROOT/.retroplay/artwork_last_check"
+printf 'Covers_AGA_LoRes' > "$MOCK/art_503"       # ...but the host answers 503
+: > "$MOCK/art_downloads"
+run art503 ./all.sh --skip-update --variants aga; st=$?
+check "the run carries on and says the previous artwork was kept" \
+  '{ [ "$st" -eq 0 ] || [ "$st" -eq 2 ]; } && grep -q "previous artwork was kept" "$T/art503.log"'
+check "the pack is NOT stamped as checked - the next run tries again" \
+  '[ ! -f "$ROOT/.retroplay/artwork_last_check" ]'
+check "...and that pack's record in .retroplay still says what it said before" \
+  '[ -s "$COVERS_MAN" ] && [ "$(cksum < "$COVERS_MAN")" = "$man_before" ]'
+check "the failure is recorded, naming the archive" \
+  '[ -f "$ART_ST/last_failure" ] && grep -q "IGame_Covers_AGA_LoRes.lha" "$ART_ST/last_failure"'
+run art503st ./artwork_sync.sh --status --for aga
+check "--artwork-status shows it as still to do, not as up to date" \
+  'grep -q "Last failure" "$T/art503st.log" && grep -q "try again" "$T/art503st.log"'
+# the source comes back
+rm -f "$MOCK/art_503"; : > "$MOCK/art_downloads"
+run art503ok ./all.sh --skip-update --variants aga; st=$?
+check "the very next run retries the failed pack straight away" \
+  '{ [ "$st" -eq 0 ] || [ "$st" -eq 2 ]; } && grep -q "download IGame_Covers_AGA_LoRes.lha" "$MOCK/art_downloads"'
+check "now that it worked, it is stamped as checked and the failure is cleared" \
+  '[ -f "$ROOT/.retroplay/artwork_last_check" ] && [ ! -f "$ART_ST/last_failure" ]'
+: > "$MOCK/art_downloads"
+run art503skip ./all.sh --skip-update --variants aga
+check "a second run inside the interval does not re-check" '[ ! -s "$MOCK/art_downloads" ]'
+acfg ARTWORK_SYNC '"no"'
+
+
+section "51. unlzx builds from source on compilers that reject old C"
+# unlzx.c calls mkdir() and getopt() without including their headers. GCC 14
+# (Raspberry Pi OS trixie) and current clang make that a hard error, so
+# setup.sh adds the headers before compiling. The compiler here is a stand-in
+# that fails exactly the way GCC 14 does, so the test needs no toolchain.
+UB="$T/unlzxbuild"; setup mkdir -p "$UB"
+cat > "$UB/unlzx.c" << 'EOF'
+/* stands in for the Aminet unlzx.c: 1990s C, no sys/stat.h, no unistd.h */
+#include <stdio.h>
+int main(int argc, char **argv) { getopt(argc, argv, "x"); mkdir("d", 0777); return 0; }
+EOF
+cat > "$UB/withheaders.c" << 'EOF'
+#include <stdio.h>
+#include <sys/stat.h>
+#include <unistd.h>
+int main(int argc, char **argv) { getopt(argc, argv, "x"); mkdir("d", 0777); return 0; }
+EOF
+cat > "$UB/cc" << 'EOF'
+#!/bin/sh
+# stand-in for GCC 14: an implicit declaration is an error that -w cannot hide
+src=""; out=""; prev=""; permissive=0
+for a in "$@"; do
+    case "$prev" in -o) out="$a" ;; esac
+    case "$a" in -fpermissive|-Wno-implicit-function-declaration) permissive=1 ;; *.c) src="$a" ;; esac
+    prev="$a"
+done
+[ -e "${CC_ALWAYS_FAIL:-/nonexistent}" ] && { echo "$src:1:1: error: cannot compile this at all" >&2; exit 1; }
+if [ "$permissive" -eq 0 ] && [ -n "$src" ]; then
+    if grep -q 'mkdir(' "$src" && ! grep -q '<sys/stat.h>' "$src"; then
+        echo "$src:651:5: error: implicit declaration of function 'mkdir'" >&2; exit 1; fi
+    if grep -q 'getopt(' "$src" && ! grep -q '<unistd.h>' "$src"; then
+        echo "$src:1228:19: error: implicit declaration of function 'getopt'" >&2; exit 1; fi
+fi
+printf '#!/bin/sh\necho "unlzx test build"\n' > "$out"; chmod +x "$out"
+EOF
+chmod +x "$UB/cc"
+cat > "$UB/drive.sh" << EOF
+#!/usr/bin/env bash
+set -u
+note() { printf '%s\n' "\$*"; }
+bad()  { printf 'ERROR: %s\n' "\$*"; }
+eval "\$(awk '/^build_unlzx\\(\\)/,/^}\$/' "$ROOT/setup.sh")"
+tmp="\$(mktemp -d)"
+if build_unlzx "$UB/cc" "\$1" "\$tmp"; then echo "BUILD-OK"; "\$tmp/unlzx"; else echo "BUILD-FAILED"; fi
+rm -rf "\$tmp"
+EOF
+chmod +x "$UB/drive.sh"
+( cd "$UB" && ./cc -O2 -w -o "$UB/plain" "$UB/unlzx.c" ) > "$T/unlzx_plain.log" 2>&1; st=$?
+check "the stand-in compiler really does reject the old source (as the Pi 400 did)" \
+  '[ "$st" -ne 0 ] && grep -q "implicit declaration of function .mkdir" "$T/unlzx_plain.log"'
+( cd "$UB" && ./drive.sh "$UB/unlzx.c" ) > "$T/unlzx_build.log" 2>&1
+check "setup.sh still builds unlzx by adding the headers the source leaves out" \
+  'grep -q "BUILD-OK" "$T/unlzx_build.log" && grep -q "unlzx test build" "$T/unlzx_build.log"'
+check "...and says so, so the user knows what happened" \
+  'grep -q "headers the old unlzx source leaves out" "$T/unlzx_build.log"'
+( cd "$UB" && ./drive.sh "$UB/withheaders.c" ) > "$T/unlzx_ok.log" 2>&1
+check "a source that already has its headers builds unchanged, with no note" \
+  'grep -q "BUILD-OK" "$T/unlzx_ok.log" && ! grep -q "headers the old unlzx source" "$T/unlzx_ok.log"'
+: > "$UB/alwaysfail"
+( cd "$UB" && CC_ALWAYS_FAIL="$UB/alwaysfail" ./drive.sh "$UB/unlzx.c" ) > "$T/unlzx_bad.log" 2>&1
+check "a source that cannot build fails clearly and shows the compiler's message" \
+  'grep -q "BUILD-FAILED" "$T/unlzx_bad.log" && grep -q "compiling unlzx failed" "$T/unlzx_bad.log" && grep -q "cannot compile this at all" "$T/unlzx_bad.log"'
+check "...and says the rest of the suite still works without it" \
+  'grep -q "lzx archives will be skipped" "$T/unlzx_bad.log"'
+
+
+section "52. Settings that are used as numbers, and listing timeouts"
+# A setting used in arithmetic or in a -mmin test must be checked: unchecked,
+# ARTWORK_CHECK_INTERVAL_HOURS="soon" silently became 0 and turned the daily
+# artwork check into an every-run check.
+NUMDIR="$T/numcfg"; setup mkdir -p "$NUMDIR"
+numcfg() { printf '%s\n' "$1" > "$NUMDIR/retroplay.conf"; }
+numval() {   # numval <setting> ; prints "<warned?> <value>"
+    bash -c "SCRIPT_DIR=\"$ROOT\"; RP_INVOKED_FROM=\"$NUMDIR\"; . \"$ROOT/lib.sh\";
+             rp_load_config >/dev/null 2>&1
+             printf '%s %s\n' \"\$(printf '%s' \"\$RP_CONFIG_WARNINGS\" | grep -c \"$1\")\" \"\$(eval printf '%s' \\\"\\\$RP_$1\\\")\""
+}
+for setting in ARTWORK_CHECK_INTERVAL_HOURS:24 ARTWORK_KEEP_BACKUPS:2 ARTWORK_FETCH_LIMIT:25 STATE_BACKUP_MAX_MB:50; do
+    name="${setting%%:*}"; want="${setting##*:}"
+    numcfg "$name=\"soon\""
+    check "$name: a value that is not a number warns and falls back to $want" \
+      '[ "$(numval "$name")" = "1 '"$want"'" ]'
+done
+numcfg 'ARTWORK_CHECK_INTERVAL_HOURS="6"'
+check "a valid number is kept as given" '[ "$(numval ARTWORK_CHECK_INTERVAL_HOURS)" = "0 6" ]'
+numcfg 'ARTWORK_CHECK_INTERVAL_HOURS="soon"'
+check "...so the daily artwork check is not turned into an every-run check" \
+  'bash -c "SCRIPT_DIR=\"$ROOT\"; RP_INVOKED_FROM=\"$NUMDIR\"; . \"$ROOT/lib.sh\"; rp_load_config >/dev/null 2>&1; echo \$(( RP_ARTWORK_CHECK_INTERVAL_HOURS * 60 ))" | grep -qx 1440'
+
+# A listing is a few KB. update.sh checks five folders, so a 120s timeout each
+# meant ten minutes of silence before --dry-run said anything.
+LT="$T/listtimeout"; setup mkdir -p "$LT"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" > "%s/curl_args"\nexit 0\n' "$LT" > "$LT/curl"
+chmod +x "$LT/curl"
+( PATH="$LT:$PATH" bash -c "SCRIPT_DIR=\"$ROOT\"; . \"$ROOT/lib.sh\"; rp_fetch_listing http://mock/list" ) >/dev/null 2>&1
+check "the listing fetch gives up in a minute, not two, and caps the connect" \
+  'grep -q -- "--connect-timeout 15" "$LT/curl_args" && grep -q -- "-m 60" "$LT/curl_args"'
+( PATH="$LT:$PATH" bash -c "SCRIPT_DIR=\"$ROOT\"; . \"$ROOT/lib.sh\"; RP_LISTING_TIMEOUT=5 RP_CONNECT_TIMEOUT=2 rp_fetch_listing http://mock/list" ) >/dev/null 2>&1
+check "...and both timeouts can be overridden" \
+  'grep -q -- "--connect-timeout 2" "$LT/curl_args" && grep -q -- "-m 5" "$LT/curl_args"'
+
+section "53. Output levels, colour and the stderr rule"
+# --quiet: errors and the final result only. A no-op run should say almost
+# nothing, but must never swallow a warning or an error.
+run q1 ./all.sh --skip-update --variants aga --quiet
+check "--quiet keeps a normal run to a handful of lines" '[ "$(grep -c . "$T/q1.log")" -lt 6 ]'
+check "--quiet still prints the result" 'grep -qiE "up to date|finished|done|nothing" "$T/q1.log"'
+( cd "$ROOT" && ./all.sh --variants nosuchvariant --quiet ) > "$T/q2.out" 2> "$T/q2.err"; st=$?
+check "--quiet still prints errors, and on stderr" \
+  '[ "$st" -ne 0 ] && [ -s "$T/q2.err" ] && grep -q "ERROR" "$T/q2.err" && ! grep -q "ERROR" "$T/q2.out"'
+run v1 ./all.sh --skip-update --variants aga --verbose
+check "--verbose says more than --quiet" '[ "$(grep -c . "$T/v1.log")" -gt "$(grep -c . "$T/q1.log")" ]'
+check "--verbose is not --debug" '! grep -q "\[debug\]" "$T/v1.log"'
+
+# Colour: one rule for the whole suite. NO_COLOR follows the published
+# convention (any non-empty value), and --color=always wins over the terminal
+# test so "| less -R" works.
+esc() {   # esc <env assignments...> ; true when colour escapes are emitted
+    ( cd "$ROOT" && env SCRIPT_DIR="$ROOT" "$@" bash -c '. "$SCRIPT_DIR/lib.sh"; rp_set_colours; printf "%sx%s" "$RED" "$NC"' ) \
+        | od -c | grep -q '033'
+}
+check "--color=always gives colour even when piped" 'esc RP_COLOR=always'
+check "--color=never gives none, terminal or not" '! esc RP_COLOR=never RP_FORCE_TTY=1'
+check "on a terminal, colour is on by default" 'esc RP_FORCE_TTY=1'
+check "NO_COLOR=1 turns colour off on a terminal" '! esc RP_FORCE_TTY=1 NO_COLOR=1'
+check "NO_COLOR=true does too - any value, not just 1" '! esc RP_FORCE_TTY=1 NO_COLOR=true'
+check "piped output has no colour without being asked" '! esc RP_COLOR=auto'
+check "the leaf scripts use the same decision, not their own" \
+  '! grep -q "NO_COLOR\" = \"1\"" "$ROOT/extract.sh" "$ROOT/merge.sh" &&
+   grep -q "^rp_set_colours" "$ROOT/extract.sh" && grep -q "^rp_set_colours" "$ROOT/merge.sh"'
+
+section "54. One run at a time: the stage scripts honour the same lock"
+# all.sh has always taken a lock. Now the stage scripts take the SAME one when
+# a person runs them by hand, so an interactive ./merge.sh cannot work on a
+# collection a nightly build is halfway through.
+LK="$ROOT/.all.lock"
+rm -rf "$LK.d" "$LK.info"
+if [ -n "$FLOCK" ]; then
+    ( exec 9>"$LK"; "$FLOCK" 9; sleep 300 ) & holder=$!
+    sleep 1
+    run lockmerge ./merge.sh --aga --dest "$ROOT/build/retro_aga"; st=$?
+    check "merge.sh run by hand is refused while a build holds the lock" \
+      '[ "$st" -eq 4 ] && grep -q "already running" "$T/lockmerge.log"'
+    check "...and it says how to clear a lock that is really stale" \
+      'grep -q -- "--unlock-stale" "$T/lockmerge.log"'
+    run lockupd ./update.sh; st=$?
+    check "update.sh is refused too" '[ "$st" -eq 4 ]'
+    # A stage started BY all.sh must NOT refuse - the parent holds the lock.
+    ( cd "$ROOT" && RP_CHILD=1 ./sort.sh --pfs --dest "$ROOT/build/retro_aga" --called-from-all ) \
+        > "$T/lockchild.log" 2>&1; st=$?
+    check "a stage started by all.sh is not refused (the parent holds it)" '[ "$st" -ne 4 ]'
+    kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+    sleep 1
+    run lockfree ./merge.sh --aga --dest "$ROOT/build/retro_aga"; st=$?
+    check "once the build finishes, running it by hand works again" '[ "$st" -ne 4 ]'
+else
+    echo "  (skipped: flock not installed)"
+fi
+
+# A worker orphaned by a killed run must not keep the lock held: it inherits
+# the lock's file descriptor unless the fork closes it, and every later run
+# would then be refused for ever.
+rm -rf "$LK.d" "$LK.info"
+if [ -n "$FLOCK" ]; then
+    ( cd "$ROOT" && ./extract.sh -u -d "$T/lockorph" >/dev/null 2>&1 ) &
+    ekill=$!
+    sleep 1; kill -9 "$ekill" 2>/dev/null; wait "$ekill" 2>/dev/null
+    st=1; n=0
+    while [ "$n" -lt 20 ]; do
+        if ( exec 9>"$LK"; "$FLOCK" -n 9 ); then st=0; break; fi
+        sleep 1; n=$((n + 1))
+    done
+    check "a killed run leaves no worker holding the lock" '[ "$st" -eq 0 ]'
+fi
+
+section "55. --unlock-stale reports before it removes anything"
+# The orphan test above deliberately kills a run mid-flight; anything it left
+# running would write the lock record again under us.
+pkill -f "$ROOT/extract.sh" 2>/dev/null || true
+pkill -f 'extract\.sh -u -d' 2>/dev/null || true
+sleep 2
+rm -rf "$LK.d" "$LK.info"
+run unlocknone ./start.sh --unlock-stale
+check "with no lock in place it says so and changes nothing" \
+  'grep -qi "no lock" "$T/unlocknone.log" && [ ! -e "$LK.d" ]'
+# A lock folder whose owner is alive: never removed.
+( sleep 6 ) & live=$!
+mkdir -p "$LK.d"
+printf 'pid=%s\nhost=%s\nstarted=now\nrun_id=t\ncommand=all.sh --sync\n' "$live" "$(hostname 2>/dev/null || uname -n)" > "$LK.info"
+run unlocklive ./start.sh --unlock-stale; st=$?
+check "a lock whose run is still alive is reported, not removed" \
+  '[ "$st" -eq 4 ] && [ -e "$LK.d" ] && grep -q "still running" "$T/unlocklive.log"'
+check "...and it shows the holder and the exact lock path" \
+  'grep -q "all.sh --sync" "$T/unlocklive.log" && grep -q ".all.lock" "$T/unlocklive.log"'
+kill "$live" 2>/dev/null; wait "$live" 2>/dev/null
+# A lock from another machine: never removed, however old.
+printf 'pid=1\nhost=someothermachine\nstarted=now\nrun_id=t\ncommand=all.sh\n' > "$LK.info"
+run unlockhost ./start.sh --unlock-stale; st=$?
+check "a lock taken on another machine is left alone" \
+  '[ "$st" -eq 4 ] && [ -e "$LK.d" ] && grep -q "someothermachine" "$T/unlockhost.log"'
+# A lock left by a run that no longer exists here: removed, unattended.
+deadpid="$( ( exec sh -c 'echo $$' ) )"; sleep 0.2
+printf 'pid=%s\nhost=%s\nstarted=now\nrun_id=t\ncommand=all.sh --sync\n' "$deadpid" "$(hostname 2>/dev/null || uname -n)" > "$LK.info"
+run unlockstale ./start.sh --unlock-stale; st=$?
+check "a lock left by a run that is gone is removed" \
+  '[ "$st" -eq 0 ] && [ ! -e "$LK.d" ] && [ ! -e "$LK.info" ]'
+rm -rf "$LK.d" "$LK.info"
+
+
+section "56. Each collection records what it is, and can explain itself"
+MAN="$ROOT/.retroplay/manifest"
+run manbuild ./all.sh --skip-update --variants aga
+check "a finished collection writes a manifest" '[ -s "$MAN/retro_aga" ]'
+check "...with the counts, the settings and the version that built it" \
+  'grep -q "^game_count=" "$MAN/retro_aga" && grep -q "^size_kb=" "$MAN/retro_aga" &&
+   grep -q "^art_order=" "$MAN/retro_aga" && grep -q "^config_fingerprint=" "$MAN/retro_aga" &&
+   grep -q "^suite_version=" "$MAN/retro_aga"'
+check "--status shows the game count from it, without walking the tree" \
+  'run_out ./start.sh --status | grep -qE "retro_aga:.*[0-9]+ games"'
+run whyb ./start.sh --why-build aga
+check "--why-build says the state, the artwork and whether anything is queued" \
+  'grep -q "retro_aga" "$T/whyb.log" && grep -qi "queue" "$T/whyb.log" && grep -qi "artwork" "$T/whyb.log"'
+check "...and that the settings have not changed since it was built" \
+  'grep -q "unchanged since it was built" "$T/whyb.log"'
+fp_before="$(sed -n 's/^config_fingerprint=//p' "$MAN/retro_aga")"
+acfg ART_ORDER '"Titles,Covers,Screens"'
+run whyb2 ./start.sh --why-build aga
+check "changing the artwork order is noticed" 'grep -q "has changed since this was built" "$T/whyb2.log"'
+acfg NTFY_TOPIC '"somethingelse"'
+run whyb3 ./start.sh --why-build aga
+acfg ART_ORDER '"Screens,Covers,Titles"'
+run whyb4 ./start.sh --why-build aga
+check "...but changing a notification topic is not a reason to rebuild" \
+  'grep -q "unchanged since it was built" "$T/whyb4.log" &&
+   [ "$(sed -n "s/^config_fingerprint=//p" "$MAN/retro_aga")" = "$fp_before" ]'
+# A collection from an older release has no manifest: that is "no details",
+# never "needs rebuilding".
+mv "$MAN/retro_aga" "$T/manifest.saved"
+run whyold ./start.sh --why-build aga
+check "a collection built by an older version reads as built, details unknown" \
+  'grep -q "no record kept" "$T/whyold.log" && grep -q "not a reason to rebuild" "$T/whyold.log" &&
+   ! grep -q "has changed since this was built" "$T/whyold.log"'
+mv "$T/manifest.saved" "$MAN/retro_aga"
+run whyb5 ./start.sh --why-build zzz
+check "--why-build for a variant that was never built says so" 'grep -qi "not built yet" "$T/whyb5.log"'
+run whyspace ./start.sh --why-space
+check "--why-space shows the drive, what is free and what is using it" \
+  'grep -q "Free now" "$T/whyspace.log" && grep -q "retro_aga" "$T/whyspace.log" && grep -q "MIN_FREE_MB" "$T/whyspace.log"'
+
+section "57. Failed archives can be listed and retried"
+printf '3\tWHDLoad/Games/Z/Zeta_v1.0.lha\n' > "$ROOT/.retroplay/extract_attempts.list"
+run showfail ./start.sh --show-failed
+check "--show-failed lists the archives that were set aside" \
+  'grep -q "Zeta_v1.0.lha" "$T/showfail.log" && grep -q "3x" "$T/showfail.log"'
+check "...and the games left without artwork" 'grep -qi "without artwork" "$T/showfail.log"'
+run retryfail ./start.sh --retry-failed
+check "--retry-failed clears the count so they are tried again" \
+  '[ ! -s "$ROOT/.retroplay/extract_attempts.list" ] && grep -q "tries them again" "$T/retryfail.log"'
+run retryempty ./start.sh --retry-failed
+check "...and says so plainly when there is nothing set aside" \
+  'grep -qi "nothing has been set aside" "$T/retryempty.log"'
+
+section "58. The preview builds a batch and leaves the collection alone"
+server_add WHDLoad/Games/P/Preview_v1.0.lha
+
+run prev ./start.sh --preview-new --aga; st=$?
+latestp="$(ls -1d "$ROOT"/build/new_aga/*/ 2>/dev/null | sort | tail -1)"
+check "the preview run finishes" '[ "$st" -eq 0 ] || [ "$st" -eq 2 ]'
+check "the new game is in the dated batch" '[ -d "${latestp}WHDLoad/Games/P/Preview" ]'
+check "the batch says in plain words that it is not a collection" \
+  '[ -f "${latestp}PREVIEW_ONLY.txt" ] && grep -q "NOT a collection" "${latestp}PREVIEW_ONLY.txt"'
+check "the collection itself was not changed" '[ ! -d "$ROOT/build/retro_aga/WHDLoad/Games/P/Preview" ]'
+check "the archive stays queued, so an ordinary run still installs it" \
+  'grep -q "Preview_v1.0.lha" "$ROOT/.retroplay/queue/retro_aga.list"'
+run prevthen ./start.sh --sync --aga; st=$?
+check "...and the next ordinary run does install it" \
+  '{ [ "$st" -eq 0 ] || [ "$st" -eq 2 ]; } && [ -d "$ROOT/build/retro_aga/WHDLoad/Games/P/Preview" ]'
+run quickdep ./quick.sh --help
+check "quick.sh still works and points at the new name" \
+  'grep -q -- "--preview-new" "$T/quickdep.log"'
+check "...and says it is deprecated rather than failing" \
+  'grep -qi "replaced by" "$T/quickdep.log"'
+
+section "59. Help is grouped, and every old option still works"
+run helpshort ./start.sh --help
+check "the everyday commands come first and fit on a screen" \
+  '[ "$(grep -c . "$T/helpshort.log")" -lt 50 ] && grep -q "^Everyday" "$T/helpshort.log"'
+check "the advanced options are grouped, not listed one by one" \
+  'grep -q "^Advanced" "$T/helpshort.log" && grep -q -- "--help advanced" "$T/helpshort.log"'
+run helplong ./start.sh --help advanced
+check "--help advanced explains each of them" \
+  '[ "$(grep -c . "$T/helplong.log")" -gt "$(grep -c . "$T/helpshort.log")" ] &&
+   grep -q -- "--preview-new" "$T/helplong.log" && grep -q -- "--skip-variant-sort" "$T/helplong.log"'
+check "the diagnosis commands are in the help" \
+  'grep -q -- "--why-build" "$T/helpshort.log" && grep -q -- "--show-failed" "$T/helpshort.log" &&
+   grep -q -- "--unlock-stale" "$T/helpshort.log"'
+
+
+section "60. Stage timings, and how many things to do at once"
+# Give it something to do: the "nothing to do" path exits before the summary.
+server_add WHDLoad/Games/T/Timed_v1.0.lha
+run timedupd ./all.sh --variants aga
+run timed ./all.sh --variants aga --force
+check "the report says where the time went, stage by stage" \
+  'grep -q "Time per stage" "$T/timed.log" && grep -qE "^  preflight +[0-9]+" "$T/timed.log" &&
+   grep -qE "^  update +[0-9]+" "$T/timed.log" && grep -qE "^  build +[0-9]+" "$T/timed.log"'
+check "...and the saved report keeps them too" \
+  'grep -q "Time per stage" "$(ls -1 "$ROOT"/reports/*.txt | grep -v _no_artwork | sort | tail -1)"'
+# JOBS: auto must keep exactly what each stage worked out for itself.
+run jobsauto ./extract.sh -u -d "$T/jobs_out" --debug
+auto_jobs="$(sed -n 's/.*using \([0-9]*\) parallel extraction job.*/\1/p' "$T/jobsauto.log" | head -1)"
+check "with no setting, the job count is whatever it always was" '[ -n "$auto_jobs" ]'
+run jobs1 ./extract.sh -u -d "$T/jobs_out1" --jobs 1
+check "--jobs 1 really runs one at a time" 'grep -q "using 1 parallel extraction job" "$T/jobs1.log"'
+acfg EXTRACT_JOBS '"2"'
+run jobscfg ./extract.sh -u -d "$T/jobs_out2"
+check "EXTRACT_JOBS in retroplay.conf is honoured" 'grep -q "using 2 parallel extraction job" "$T/jobscfg.log"'
+run jobsover ./extract.sh -u -d "$T/jobs_out3" --jobs 3
+check "...and --jobs beats the config" 'grep -q "using 3 parallel extraction job" "$T/jobsover.log"'
+acfg EXTRACT_JOBS '"nonsense"'
+run jobsbad ./extract.sh -u -d "$T/jobs_out4"
+check "a job count that is not a number warns and carries on" \
+  'grep -qi "not a whole number" "$T/jobsbad.log" && grep -q "using $auto_jobs parallel extraction job" "$T/jobsbad.log"'
+acfg EXTRACT_JOBS '"auto"'
+run jobsnoval ./extract.sh -u -d "$T/jobs_out5" --jobs; st=$?
+check "--jobs with no value fails cleanly" '[ "$st" -eq 4 ]'
 
 # ================================================================ summary ===
 echo

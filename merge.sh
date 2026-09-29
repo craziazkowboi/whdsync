@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.09.29   (every script in the set must carry the same stamp)
+# Remember where the user ran this from, before any cd: retroplay.conf is
+# looked for there first (see lib.sh).
+RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
+RP_ORIG_ARGS="$*"      # remembered for the lock record and the logs
 #
 # Purpose: Adds iGame/TinyLauncher artwork to a collection.
 #   Options: --aga --ecs --rtg --aga-laced --ecs-laced --set NAME --custom
@@ -57,18 +61,23 @@ unset _cand
 
 # Amiga Retroplay iGame Artwork Merger
 # macOS 10.15.7+ | Debian 12 | Debian 13 | Raspberry Pi Compatible
-# Version: 1.8.0-fallback-chain (Priority-ordered merge, dynamic artwork sets, tier fallback)
+# Part of the whdsync suite - the one version is RP_SUITE_VERSION in lib.sh. (Priority-ordered merge, dynamic artwork sets, tier fallback)
 
 BAR_WIDTH=40
-NO_COLOR="${NO_COLOR:-0}"
-
-if [ "$NO_COLOR" = "1" ] || [ ! -t 1 ]; then
+# Colour follows the same rule as lib.sh: any non-empty NO_COLOR turns it
+# off (that is the published convention - NO_COLOR=true must work, not just
+# NO_COLOR=1), and never on anything that isn't a terminal. Re-applied from
+# lib.sh once that is loaded, so --color=always|never wins.
+if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ]; then
   RED=""; GREEN=""; YELLOW=""; BLUE=""; BOLD=""; NC="";
 else
   RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m';
   BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m';
 fi
 DEBUG=0
+# Run as one stage of an all.sh pipeline: no banner, no header block, and the
+# counts go back in a key=value file instead of being read off the screen.
+CALLED_FROM_ALL="${RP_CHILD:-0}"
 WHY_GAME=""      # --why NAME: explain how artwork is looked up for one game
 processed=0
 CUSTOM=0
@@ -82,7 +91,8 @@ ONLY_MISSING=0   # --only-missing: skip any target that already has an
                  # rather than a full re-merge of everything.
 # Defaults come from retroplay.conf (ART_ORDER / DEMO_ART_ORDER) so running
 # merge.sh by hand matches what the engine does; --art overrides them.
-GAME_ART_PRIORITY="${RP_ART_ORDER:-Covers,Screens,Titles}"
+ART_GIVEN=0      # set when --art is used; otherwise the variant decides
+GAME_ART_PRIORITY="${RP_ART_ORDER:-Screens,Covers,Titles}"
 DEMO_ART_PRIORITY="${RP_DEMO_ART_ORDER:-Titles,Screens,Covers}"  # default order for demos
 DEMO_ART_OVERRIDE=0                        # set to 1 if --demo-art is used
 
@@ -122,7 +132,10 @@ if [ ! -f "$SCRIPT_DIR/lib.sh" ]; then
     exit 4
 fi
 . "$SCRIPT_DIR/lib.sh"
+# One colour decision for the whole suite (NO_COLOR, --color, terminal or not).
+rp_set_colours
 rp_load_config
+rp_banner "merge.sh"
 # Artwork sets matched ONLY by the standard Covers|Screens|Titles/<Games|
 # Demos|Magazines>/<letter>/<game> layout. Every other set (iGame_art,
 # custom packs, ...) ALSO matches a game folder anywhere inside it.
@@ -248,7 +261,7 @@ while [ $# -gt 0 ]; do
         -d|--dest) rp_require_option_value "$1" "$#" "${2-}"; DEST="$2"; shift 2 ;;
         --art)
           rp_require_option_value "$1" "$#" "${2-}"
-        GAME_ART_PRIORITY="$2"
+        GAME_ART_PRIORITY="$2"; ART_GIVEN=1
         shift 2
         ;;
     --demo-art)
@@ -264,10 +277,12 @@ while [ $# -gt 0 ]; do
             shift ;;                 # option keeps working in scripts and cron
         --report-missing) rp_require_option_value "$1" "$#" "${2-}"; REPORT_MISSING="$2"; shift 2 ;;
         --debug) DEBUG=1; shift ;;
+        --called-from-all) CALLED_FROM_ALL=1; shift ;;
+        --jobs) rp_require_option_value "$1" "$#" "${2-}"; RP_JOBS_OVERRIDE="$2"; shift 2 ;;
         -h|--help)
             echo
             echo "Amiga Retroplay iGame Artwork Merger"
-            echo "Version: 1.8.0-fallback-chain (Priority-ordered merge, dynamic artwork sets, tier fallback)"
+            echo "Version: ${RP_SUITE_VERSION} (release ${RP_RELEASE})"
             echo "Usage: $(basename "$0") [--custom] [--ecs|--aga|--rtg|--ecs-laced|--aga-laced|--set NAME] [-d DEST] [--art ORDER] [--debug]"
   echo "  -h, --help            Show this help and exit."
   echo "  --why NAME            Explain where artwork for NAME was looked for, and"
@@ -346,6 +361,15 @@ else
         echo "Get the artwork with: ./start.sh --artwork-sync   (or --artwork-plan to see what it would fetch)"
         exit 1
     fi
+fi
+
+# Artwork order: unless --art was given, the variant decides. RTG shows
+# covers best, so ART_ORDER_RTG differs from the default - running
+# "merge.sh --rtg" by hand must honour that just as all.sh does.
+if [ "$ART_GIVEN" -eq 0 ] && [ -n "${SELECTED_SET_KEY:-}" ]; then
+    _v="$(printf '%s' "$SELECTED_SET_KEY" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+    GAME_ART_PRIORITY="$(rp_art_order_for "$_v")"
+    unset _v
 fi
 
 # DEST comes from -d/--dest, or from start.sh. With neither, use the
@@ -623,7 +647,7 @@ fi
 
 CORES=${CORES:-2}
 [ "$CORES" -gt 8 ] && CORES=8
-max_parallel="$CORES"
+max_parallel="$(rp_jobs merge "$CORES")"
 
 # Basic platform tuning for progress and parallelism
 UNAME_OUT="$(uname 2>/dev/null || echo Unknown)"
@@ -671,9 +695,10 @@ elif [ -e /proc/a314 ] || ls /dev/a314* >/dev/null 2>&1; then
     PROGRESS_STEP=500
 fi
 
+if [ "$CALLED_FROM_ALL" -eq 0 ]; then
 echo -e "${BOLD}==========================================${NC}"
 echo -e "${BOLD} Amiga Retroplay iGame Artwork Merger ${NC}"
-echo -e "${BOLD} Version: 1.8.0-fallback-chain ${NC}"
+echo -e "${BOLD} Version: ${RP_SUITE_VERSION} (release ${RP_RELEASE}) ${NC}"
 echo -e "${BOLD}==========================================${NC}"
 echo -e "Platform: ${YELLOW}$(uname)${NC}"
 echo -e "Detected CPU core(s): ${YELLOW}$CORES${NC}"
@@ -686,6 +711,7 @@ echo -e "Demo art order: ${YELLOW}$DEMO_ART_PRIORITY${NC}"
 [ -d "$TINYLAUNCHER_SRC" ] && echo -e "TinyLauncher source: ${YELLOW}$TINYLAUNCHER_SRC${NC}"
 [ "$DEBUG" -eq 1 ] && echo -e "${YELLOW}Debug mode: ENABLED${NC}"
 echo -e "${BOLD}==========================================${NC}"
+fi
 echo
 
 whdload_path="$DEST/WHDLoad"
@@ -716,8 +742,25 @@ for _tf in /tmp/artwork_merger_*.*; do
     kill -0 "$_pid" 2>/dev/null || rm -f -- "$_tf"
 done
 unset _tf _pid
-trap 'rm -f "$ERROR_LOG" "$IGAMEECS_LOG" "$TINYLAUNCHER_LOG"' EXIT
-trap 'echo -e "\nAborted. Cleaning up..."; pkill -P $$ 2>/dev/null; exit 130' INT TERM
+# However this ends - finished, Ctrl-C, or killed outright (the OOM killer
+# on a small Pi) - stop and reap the background workers before removing the
+# temp files, and keep the original exit status. extract.sh and sort.sh use
+# the same shape; a bare "rm -f" trap left orphaned workers behind when the
+# parent was killed without a signal handler running.
+cleanup_merge() {
+    local st=$?
+    rp_lock_release
+    trap - EXIT INT TERM
+    pkill -P $$ 2>/dev/null || true
+    wait 2>/dev/null || true
+    rm -f -- "$ERROR_LOG" "$IGAMEECS_LOG" "$TINYLAUNCHER_LOG"
+    exit "$st"
+}
+# Run by hand? Then this is the run, and it takes the same lock all.sh
+# uses, so it cannot work on a collection a nightly build is midway through.
+rp_lock_for_stage "merge.sh ${RP_ORIG_ARGS:-}"
+trap cleanup_merge EXIT
+trap 'echo; echo "Aborted. Cleaning up..."; exit 130' INT TERM
 
 merge_targets=()
 
@@ -839,6 +882,13 @@ art_should_copy() { return 0; }
 
 try_copy_matched_artwork() {
     [ -n "$best_dir" ] && [ -d "$best_dir" ] || return 1
+
+    # When refreshing, clear the whole iGame.iff family first. Changing
+    # ART_ORDER changes which slot each section goes to, so an old iGame.iff
+    # from a previous order would otherwise stay and keep being shown.
+    if [ "$REFRESH_ART" -eq 1 ]; then
+        rm -f "$dest_sub"/iGame.iff "$dest_sub"/igame1.iff "$dest_sub"/igame2.iff 2>/dev/null
+    fi
 
     # 1) Copy all non-IFF artwork files from this section into the game dir
     #    Preserve original names; replace one already there only when the
@@ -1132,6 +1182,9 @@ if [ -s "$TINYLAUNCHER_LOG" ]; then tinylauncher_count=$(wc -l < "$TINYLAUNCHER_
 elapsed=$(( $(date +%s) - start_time ))
 fmt_time="$(format_elapsed_time "$elapsed")"
 
+rp_child_result "stage=merge" "status=$([ "$errors" -eq 0 ] && echo ok || echo warnings)" \
+    "seconds=$SECONDS" "merged=$igameecs_count" "tinylauncher=$tinylauncher_count" \
+    "added=$ART_NEW" "refreshed=$ART_REPLACED" "errors=$errors" "dest=$DEST"
 echo -e "${BOLD}=================== MERGE REPORT ===================${NC}"
 echo "Destination: $DEST"
 echo "Artwork Source: $ART_SRC"

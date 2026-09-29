@@ -1,5 +1,123 @@
 # Changelog
 
+## 0.4 - 2026-09-29 (engineering review: output, locking, state)
+### Changed
+- **`all.sh` no longer runs merge and sort through `start.sh`.** The engine
+  called the interactive dispatcher, which re-printed its banner and re-ran its
+  tool and locale checks for every variant - the reason one build looked like
+  several unrelated tools starting in turn. The stages are now called directly
+  and take `--called-from-all`, so `all.sh` owns the display and the children
+  hand back a `key=value` result file instead of printing a summary each.
+- Output levels: `--quiet` (errors, warnings and the result only), `--verbose`,
+  `--debug`, and `--color=auto|always|never`. Warnings and errors go to stderr.
+  `NO_COLOR` now follows the published convention everywhere - any non-empty
+  value turns colour off, not only `NO_COLOR=1`.
+- `./start.sh --help` leads with the seven everyday commands and groups the
+  rest; `--help advanced` explains each advanced option in full. Every option
+  that worked before still works.
+- `quick.sh` is deprecated. It now runs `./start.sh --preview-new`, which does
+  the same job through the engine and so gets the lock, the output-drive check,
+  the shared queue, the report and the summary table. The old name keeps
+  working for one release.
+
+### Fixed
+- **A finished collection is no longer deleted before its replacement exists.**
+  The new one is built beside it and swapped in with two renames, so a power cut
+  mid-build leaves the previous collection usable. A build now needs room for
+  one collection twice over while it runs, and says so if there isn't.
+- **One run at a time, properly.** `merge.sh`, `sort.sh`, `extract.sh`,
+  `update.sh` and `quick.sh` take the same lock `all.sh` does when you run them
+  by hand, so an interactive merge cannot work on a collection a nightly build
+  is halfway through. Background workers no longer inherit the lock, which
+  previously let a killed run hold it for ever.
+- `ARTWORK_CHECK_INTERVAL_HOURS`, `ARTWORK_KEEP_BACKUPS`, `ARTWORK_FETCH_LIMIT`
+  and `STATE_BACKUP_MAX_MB` were not checked for being numbers. A typo silently
+  evaluated to 0 - which turned the daily artwork check into an every-run check,
+  and could have emptied the artwork backup keep-count.
+- Artwork progress no longer writes progress bars into a cron log: it now
+  degrades to timestamped milestones like every other stage.
+- The Retroplay listing is given 60 seconds with a 15-second connect timeout
+  instead of 120 seconds across five directories, so `--dry-run` against an
+  unreachable server reports in seconds instead of looking like a hang.
+- The artwork-fetch count is read from a result file rather than scraped out of
+  the child's console text, so rewording a message cannot change a report figure.
+- `merge.sh` now reaps its workers and preserves the exit status on any exit,
+  not only on Ctrl-C.
+
+### Added
+- Every finished collection records what it is in `.retroplay/manifest/` -
+  counts, size, artwork order, filesystem and a fingerprint of the settings that
+  affect output. `--status` reads it instead of walking the tree. A collection
+  built by an older release simply has no manifest, which means "details
+  unknown", never "needs rebuilding".
+- Commands that explain themselves from what the run recorded:
+  `--why-build VARIANT`, `--why-artwork NAME`, `--why-space`, `--show-failed`,
+  `--retry-failed`.
+- `--unlock-stale`: shows the lock's owner, host, age, command and path, and
+  removes it only when that run is provably gone from this machine. It never
+  removes a live lock or one taken on another machine.
+- `--preview-new`: builds the dated folder of just the new games and leaves the
+  collection alone. The batch carries a `PREVIEW_ONLY.txt` note and the archives
+  stay queued, so an ordinary run still installs them properly.
+- `JOBS`, `EXTRACT_JOBS`, `MERGE_JOBS` and `SORT_JOBS` in `retroplay.conf`, plus
+  `--jobs N`. `auto` keeps exactly what each stage worked out before, so nothing
+  changes unless you set one.
+- The run report now shows the time each stage took, which is the thing to look
+  at before changing any job count.
+
+### Tests
+- 333 automated tests (was 265) and 205 option checks. The option matrix's
+  per-case limit is now 180 seconds (`MATRIX_TIMEOUT` to change it): at 25 it was
+  measuring machine speed rather than catching hangs.
+
+## 0.4 - 2026-09-28 (fixes from the Pi 400 install)
+### Fixed
+- **unlzx would not compile on a current Raspberry Pi OS or Xcode.** The Aminet
+  source calls `mkdir()` and `getopt()` without including the headers that
+  declare them; GCC 14 and clang 16 turn that into an error, so `setup.sh`
+  stopped with `implicit declaration of function 'mkdir'`. setup.sh now adds
+  the missing headers before compiling, with permissive compiler flags and the
+  unpatched source as fallbacks, and prints the compiler's own message if the
+  build still fails.
+- **A failed artwork download was recorded as if the check had succeeded.**
+  When the artwork host answered 503, the pack was correctly left alone, but
+  the "checked recently" stamp in `.retroplay` was written anyway, so the next
+  24 hours of runs skipped the artwork check and never retried. The stamp is
+  now written only when the check actually finished; after a failure it is
+  removed, so the very next run tries again. The pack's own record in
+  `.retroplay` is untouched, so nothing that failed is left looking current.
+- Artwork failures are now recorded in `.retroplay/artwork/last_failure` and
+  shown by `./start.sh --artwork-status`, naming the archives still to do.
+
+### Changed
+- 265 automated tests (was 250), including the two faults above with mutation
+  checks proving the new tests catch them.
+
+## 0.4 - 2026-09-26 (engineering review)
+### Changed (engineering review)
+- One canonical version: the old per-script labels (merge 1.8.0, sort 3.0.0, extract 1.4.0) are gone; `--version` on all.sh and start.sh reports the suite release.
+- bash 4 (needed by merge.sh) is checked at the start of a run, so a macOS system without it fails immediately instead of after a long download.
+- Installing packages is setup.sh's job. all.sh, update.sh and extract.sh no longer offer to run brew/apt mid-run - a build or cron job can't stop at a sudo prompt. `./start.sh --install-missing-tools` opts in.
+
+### Added
+- A release check that only ever reads a version number over HTTPS: it prints the address and the commands and never downloads or runs anything. A tag that isn't digits and dots is ignored, and a non-HTTPS address is refused. `./start.sh --check-update`, `UPDATE_CHECK` to disable.
+- Per-variant artwork order now applies however merge is run: `merge.sh --rtg` on its own used the default order instead of `ART_ORDER_RTG`; only all.sh was applying it.
+- Progress bar style is per platform again (blocks on macOS, ASCII on Linux/A314, `PROGRESS_STYLE` to override). It had fallen back to `#` everywhere because the style was chosen before the config was read, and `tr` cannot map to a multi-byte character.
+- Summary table at the end: per collection - games, size, time, the primary artwork applied, and the result - plus the total time.
+- `setup.sh`: waits for the dpkg lock (a fresh Pi holds it for minutes) instead of failing; unlzx is fetched as C source from Aminet or GitHub (no lha needed); an interrupted setup is cleared before starting again; offers to tidy the scripts into `scripts/`.
+
+### Fixed
+- `retroplay.conf` was only looked for in one place, so a conf beside the scripts was ignored and the built-in defaults were used silently. It is now looked for where you ran the script, then beside the scripts, then the folder above - and if none is found, every run says so.
+- Artwork order defaults corrected: `Screens,Covers,Titles` for every variant, `Covers,Screens,Titles` for RTG (`ART_ORDER_RTG`).
+- `--artwork-sync` reported "installed, but you have changed it" for packs the tool installed itself. iGame_AGA, iGame_ECS, iGame_RTG (with their laced/lores subfolders) and TinyLauncher are now always replaced with the current version, with no backup kept. Only packs you added yourself (iGame_art and the like) are protected.
+- Missing artwork was detected by checking for a pack FOLDER, so an empty `iGame_AGA/` counted as installed and only `iGame_RTG` was reported. One shared check now looks for actual section folders, reports every missing pack and flavour, and `all.sh` downloads them before building rather than leaving the collection without pictures.
+- Artwork console output no longer interleaves the transfer meter with the overall progress bar; the overall bar prints once per file, each file gets its own lines, and the noisy "previous version kept in ..." path is gone.
+- `--refresh-artwork` now clears the whole `iGame.iff` family first, so changing `ART_ORDER` can't leave an old primary file being shown.
+
+### Added
+- Every script prints its version and release when it starts, so mixed-up copies are obvious.
+- `--status` shows which `retroplay.conf` is in use, or "not in use (built-in defaults)".
+
 ## 2026.09.25 (packaging and docs)
 ### Added
 - `whdsync.zip`: every script, the tests and the docs in one archive. Save it where you want the tool to live, unpack, run `./setup.sh`.
@@ -104,7 +222,7 @@
 ### Fixed
 - The folder migration ran before the unmounted-drive check, and during `--dry-run`; both now happen in the right order.
 
-## 2026.09.22 (third update - artwork sync)
+## 2026.09.29 (third update - artwork sync)
 ### Added
 - `artwork_sync.sh`: downloads, checks and installs the `iGame_*` / `TinyLauncher` artwork packs, with `--status`, `--plan`, `--sync`, `--verify` and `--rollback`. Reached through `./start.sh --artwork-*`.
 - Only `iGame_*.lha` and `TinyLauncher.lha` are used from the source; everything else is ignored.
@@ -118,7 +236,7 @@
 - Downloaded archives named `<name>.lha.part` were not integrity-checked, so a corrupt download could replace a good cached archive.
 - `update.sh` now uses `#!/usr/bin/env bash`; per-script version numbers replaced by the single suite version; the `aga/ecs/rtg` wrappers use an absolute path.
 
-## 2026.09.22 (second update)
+## 2026.09.29 (second update)
 ### Added
 - `setup.sh`: one-step, repeatable install - tools, `unlzx` built from Aminet source, Linux locales, `retroplay.conf`, nightly run, final check.
 - Status view (`--status`, menu option 9, summary at the top of the menu) and `--test-notify` (menu option 10).
@@ -134,7 +252,7 @@
 - `update.sh` first download: 61 s -> under 1 s for 1,500 archives (one pass per folder). Results verified identical.
 - Artwork gap-fill only runs when artwork changed or every `GAPFILL_DAYS` days.
 
-## 2026.09.22
+## 2026.09.29
 ### Fixed
 - `all.sh` hung forever when `--dest`, `--variant`, `--art` or `--demo-art` was given without a value.
 - `start.sh` crashed ("unbound variable") when `--dest`, `--set`, `--art`, `--demo-art` or `--report-missing` had no value. Every value option in every script now stops with a clear message.

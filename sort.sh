@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.09.29   (every script in the set must carry the same stamp)
+# Remember where the user ran this from, before any cd: retroplay.conf is
+# looked for there first (see lib.sh).
+RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
+RP_ORIG_ARGS="$*"      # remembered for the lock record and the logs
 #
 # Purpose: Sorts games by variant and language, and makes filenames Amiga-safe.
 #   Options: -d/--dest DIR --ffs --pfs --skipchk --skip-variant-sort
@@ -9,7 +13,7 @@
 
 # Amiga Retroplay Archive Organizer & Sorter - Ultimate Edition
 # Compatible: macOS, Linux, Debian 12/13, Amiga A314
-# Version: 3.0.0-ultimate
+# Part of the whdsync suite - the one version is RP_SUITE_VERSION in lib.sh.
 #
 # WHAT THIS SCRIPT DOES:
 #   The last step of the pipeline. Once files are extracted (extract.sh)
@@ -45,7 +49,10 @@ if [ ! -f "$SCRIPT_DIR/lib.sh" ]; then
     exit 1
 fi
 . "$SCRIPT_DIR/lib.sh"
+# One colour decision for the whole suite (NO_COLOR, --color, terminal or not).
+rp_set_colours
 rp_load_config
+rp_banner "sort.sh"
 
 DEFAULT_DEST="${DEST:-$RP_BUILD_ROOT/retro}"
 DEST_OVERRIDE=""
@@ -70,12 +77,16 @@ trap 'exit 130' INT TERM
 compliance_tmpdir=""
 cleanup_sort() {
     local st=$?
+    rp_lock_release
     trap - EXIT
     pkill -P $$ 2>/dev/null || true
     wait 2>/dev/null || true
     [ -n "${compliance_tmpdir:-}" ] && rm -rf -- "$compliance_tmpdir"
     exit "$st"
 }
+# Run by hand? Then this is the run, and it takes the same lock all.sh
+# uses, so it cannot work on a collection a nightly build is midway through.
+rp_lock_for_stage "sort.sh ${RP_ORIG_ARGS:-}"
 trap cleanup_sort EXIT
 
 BAR_WIDTH=50
@@ -86,6 +97,8 @@ FFS_LIMIT=30
 PFS_LIMIT=107
 MAX_FILENAME_LEN=$PFS_LIMIT
 RUN_COMPLIANCE_CHECK=true
+# One stage of an all.sh pipeline: the parent owns the heading and summary.
+CALLED_FROM_ALL="${RP_CHILD:-0}"
 SKIP_DETOX=false
 RUN_VARIANT_LANG_SORT=true
 
@@ -154,6 +167,11 @@ while [ $# -gt 0 ]; do
             ;;
         --skipchk)
             RUN_COMPLIANCE_CHECK=false
+            shift
+            ;;
+        --jobs) rp_require_option_value "$1" "$#" "${2-}"; RP_JOBS_OVERRIDE="$2"; shift 2 ;;
+        --called-from-all)
+            CALLED_FROM_ALL=1
             shift
             ;;
         --no-detox)
@@ -445,6 +463,8 @@ if [ -n "$_mem_kb" ] && [ "$_mem_kb" -gt 0 ] && [ "$_mem_kb" -lt 786432 ] && [ "
     NUM_JOBS=4
 fi
 unset _mem_kb _mem_bytes
+# SORT_JOBS (or JOBS, or --jobs N) overrides all of the above; "auto" keeps it.
+NUM_JOBS="$(rp_jobs sort "$NUM_JOBS")"
 
 # ============================================================================
 # PARALLEL JOB MANAGEMENT
@@ -455,7 +475,7 @@ killed_job_descs=()
 
 _start_job() {
     local desc="$*"
-    "$@" &
+    "$@" 9>&- &               # 9>&-: a worker must not hold the run lock
     local pid=$!
     running_pids+=("$pid")
     running_descs+=("$desc")
@@ -549,10 +569,12 @@ else
     PROGRESS_STYLE="ASCII (Linux/Debian/A314)"
 fi
 
+if [ "$CALLED_FROM_ALL" -eq 0 ]; then
 echo "Sorting script running in $DEST..."
 echo "Platform: $OS_TYPE | CPU cores: $(get_cpu_cores) | Parallel jobs: $NUM_JOBS"
 echo "Progress bar: $PROGRESS_STYLE"
 echo "Filesystem type: $FS_TYPE (max filename length: $MAX_FILENAME_LEN)"
+fi
 
 if [ "$RUN_COMPLIANCE_CHECK" = true ]; then
     echo "Compliance check: ENABLED (will auto-fix filenames)"
@@ -963,7 +985,7 @@ if [ "$RUN_COMPLIANCE_CHECK" = true ]; then
                 done < "$chunk_file"
                 echo "$local_scanned" > "$progress_file"
                 echo "$local_scanned $local_fixed $local_issues" > "$result_file"
-            ) &
+            ) 9>&- &          # 9>&-: a worker must not hold the run lock
             compliance_pids+=("$!")
         done
 
@@ -1034,4 +1056,6 @@ fi
 echo "Deleting empty directories in $DEST ..."
 find "$DEST" -type d -empty -delete 2>/dev/null || true
 
+rp_child_result "stage=sort" "status=ok" "seconds=$SECONDS" "dest=$DEST" \
+    "filesystem=$FS_TYPE" "issues=${issues_found:-0}"
 echo "✓ Sort operation complete. (Check contents of $DEST)"

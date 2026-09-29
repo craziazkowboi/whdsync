@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.09.29   (every script in the set must carry the same stamp)
+# Remember where the user ran this from, before any cd: retroplay.conf is
+# looked for there first (see lib.sh).
+RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
+RP_ORIG_ARGS="$*"      # remembered for the lock record and the logs
 #
 # Purpose: Mirrors the Retroplay archives into downloads/, queues what is new,
 #   retires superseded versions and tests new downloads.  Options: --dry-run --help
@@ -42,11 +46,14 @@ if [ ! -f "$SCRIPT_DIR/lib.sh" ]; then
 fi
 . "$SCRIPT_DIR/lib.sh"
 rp_load_config
+rp_banner "update.sh"
 
 DRY_RUN=0
+CALLED_FROM_ALL="${RP_CHILD:-0}"   # run as one stage of an all.sh pipeline
 for _arg in "$@"; do
     case "$_arg" in
         --dry-run) DRY_RUN=1 ;;
+        --called-from-all) CALLED_FROM_ALL=1 ;;
         -h|--help)
             echo "Usage: $(basename "$0") [--dry-run]"
 echo "  -h, --help   Show this help and exit."
@@ -65,7 +72,10 @@ FTP_BASE="ftp://ftp:amiga@grandis.nu/Retroplay%20WHDLoad%20Packs"
 # ----- wget dependency check, with an offer to auto-install if missing -----
 if ! command -v wget >/dev/null 2>&1; then
     echo "wget is not installed (required to download update archives)."
-    if [ -t 0 ]; then
+    # Only offer to install when explicitly asked: a run must not stop at a
+    # sudo prompt (see rp_may_install_tools).
+    rp_may_install_tools || rp_tool_missing_hint wget
+    if [ -t 0 ] && rp_may_install_tools; then
         if [[ "$OS_TYPE" == "darwin" ]]; then
             printf 'Install it now via Homebrew (brew install wget)? [y/N] '
         else
@@ -104,49 +114,17 @@ required_art_dirs=(
   "TinyLauncher"
 )
 
-# Artwork check, naming exactly which packs (and flavours) are missing.
-# In the artwork folder a pack looks like:
-#   iGame_AGA/lores/<Section>/...   iGame_AGA/laced/<Section>/...
-#   iGame_RTG/<Section>/...         TinyLauncher/...
-# When artwork_sync.sh can fetch them, say so instead of sending the reader
-# off to a forum thread - all.sh downloads and installs them by itself.
-art_have() {          # art_have <folder under artwork/>  - any Section inside?
-    local base="$RP_ARTWORK_ROOT/$1" p
-    for p in "$base"/Covers "$base"/Screens "$base"/Titles "$base"/Game "$base"/Demo; do
-        [ -d "$p" ] && return 0
-    done
-    return 1
-}
-missing_art=""
-for d in AGA ECS; do
-    art_have "iGame_$d/lores" || missing_art="$missing_art iGame_$d/lores"
-    art_have "iGame_$d/laced" || missing_art="$missing_art iGame_$d/laced"
-done
-art_have "iGame_RTG"     || missing_art="$missing_art iGame_RTG"
-art_have "TinyLauncher"  || missing_art="$missing_art TinyLauncher"
-# Artwork already installed the older flat way still counts.
-for d in AGA ECS; do
-    if art_have "iGame_$d"; then
-        missing_art="$(printf '%s' "$missing_art" | sed "s| iGame_$d/lores||; s| iGame_$d/laced||")"
-    fi
-done
-
+# Artwork check - the same one all.sh uses, so both agree on what is missing.
+missing_art="$(rp_artwork_missing | tr '\n' ' ')"
 if [ -n "$missing_art" ]; then
-    echo "Artwork not installed yet for:$missing_art"
+    echo "Artwork not installed yet for: $missing_art"
     if [ -x "$SCRIPT_DIR/artwork_sync.sh" ]; then
-        case "${RP_ARTWORK_SYNC:-ask}" in
-            auto|yes)
-                echo "  Don't worry - these are downloaded and installed automatically when the run reaches the artwork stage." ;;
-            *)
-                echo "  Don't worry - all.sh downloads and installs these for you. To do it now:"
-                echo "      ./start.sh --artwork-sync              (everything)"
-                echo "      ./start.sh --artwork-sync --for aga    (just one build)"
-                echo "  Set ARTWORK_SYNC=\"auto\" in retroplay.conf to include artwork in the nightly run." ;;
-        esac
+        echo "  Don't worry - all.sh downloads and installs these before it builds."
+        echo "  To do it now:  ./start.sh --artwork-sync        (everything)"
+        echo "             or:  ./start.sh --artwork-sync --for aga"
         echo "  Source: $RP_ARTWORK_SOURCE_URL"
     else
         echo "  artwork_sync.sh is missing, so these can't be fetched automatically."
-        echo "  Source: $RP_ARTWORK_SOURCE_URL"
     fi
     echo
 fi
@@ -226,6 +204,10 @@ fi
 rp_migrate_layout
 # Everything below works inside the downloads folder, so paths recorded in
 # update.log and in the queues stay WHDLoad/... exactly as before.
+# Run by hand? Then this is the run, and it takes the same lock all.sh uses,
+# so a download pass cannot overlap a nightly build that is already going.
+rp_lock_for_stage "update.sh ${RP_ORIG_ARGS:-}"
+trap 'rp_lock_release' EXIT
 mkdir -p "$RP_DOWNLOAD_ROOT" || exit 4
 cd "$RP_DOWNLOAD_ROOT" || exit 4
 rp_restore_state_if_lost
@@ -470,6 +452,8 @@ if [ "$total_new_files" -eq 0 ]; then
     exit 2
 fi
 
+rp_child_result "stage=update" "status=ok" "seconds=$SECONDS" \
+    "new_archives=$total_new_files" "retired=$pruned_count"
 echo
 echo "Total new files across all directories: $total_new_files"
 if [ "$pruned_count" -gt 0 ]; then

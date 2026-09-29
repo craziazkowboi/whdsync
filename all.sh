@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.09.29   (every script in the set must carry the same stamp)
+# Remember where the user ran this from, before any cd: retroplay.conf is
+# looked for there first (see lib.sh).
+RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
 #
 # Purpose: The engine: update, extract, artwork, sort, install - for every variant.
 #   Options: --aga --ecs --rtg --aga-laced --ecs-laced --set NAME --variants LIST
@@ -43,6 +46,15 @@ fi
 . "$SCRIPT_DIR/lib.sh"
 rp_load_config
 
+# --version answers before anything else is printed (no banner, no checks).
+for _a in "$@"; do
+    case "$_a" in
+        --version|-V) printf 'whdsync %s (suite %s)\n' "$RP_RELEASE" "$RP_SUITE_VERSION"; exit 0 ;;
+    esac
+done
+unset _a
+rp_banner "all.sh"
+
 usage() {
     cat << 'USAGE'
 Usage: all.sh [options]
@@ -72,7 +84,11 @@ What to do:
                         and writes to all_cron.log
 
 Overrides for retroplay.conf settings:
-  --art ORDER  --demo-art ORDER  --ffs | --pfs  --no-detox | --detox  --debug
+  --art ORDER  --demo-art ORDER  --ffs | --pfs  --no-detox | --detox
+  --quiet               Errors and the final result only (good for cron)
+  --verbose             More detail about each stage
+  --debug               Diagnostic detail (implies --verbose)
+  --color auto|always|never   Colour: a terminal by default; NO_COLOR is honoured
 
 Exit codes: 0 = work done, 2 = nothing to do, 1 = failure.
 USAGE
@@ -82,6 +98,7 @@ ORIG_ARGS="$*"
 VARIANT_ARGS=""; DEST_OVERRIDE=""
 CLEAN=0; SKIP_UPDATE=0; FORCE=0
 REFRESH_ART=0        # --refresh-artwork: replace artwork already in the collection
+PREVIEW_ONLY=0       # --preview-new: save the dated batch, do not install it
 DRY_RUN=0; CRON=0; DEBUG=0
 ART_OVERRIDE=""; DEMO_ART_OVERRIDE=""; FS_OVERRIDE=""; DETOX_OVERRIDE=""
 
@@ -97,7 +114,13 @@ while [ $# -gt 0 ]; do
         --rebuild)   CLEAN=1; SKIP_UPDATE=1; shift ;;
         --skip-update) SKIP_UPDATE=1; shift ;;
         --force)     FORCE=1; shift ;;
+        --preview-new)
+            # Build the dated batch of new games and stop there: the
+            # collection itself is left exactly as it is. Same queue, same
+            # lock, same drive check, same report as a normal run.
+            PREVIEW_ONLY=1; shift ;;
         --refresh-artwork) REFRESH_ART=1; shift ;;
+        --jobs)      rp_require_option_value "$1" "$#" "${2-}"; RP_JOBS_OVERRIDE="$2"; export RP_JOBS_OVERRIDE; shift 2 ;;
         --dry-run)   DRY_RUN=1; shift ;;
         --cron)      CRON=1; shift ;;
         --art)       rp_require_option_value "$1" "$#" "${2-}"; ART_OVERRIDE="$2"; shift 2 ;;
@@ -106,8 +129,15 @@ while [ $# -gt 0 ]; do
         --pfs)       FS_OVERRIDE=pfs; shift ;;
         --no-detox)  DETOX_OVERRIDE=no; shift ;;
         --detox)     DETOX_OVERRIDE=yes; shift ;;
-        --debug)     DEBUG=1; shift ;;
-        --status)    rp_print_status; exit 0 ;;
+        --debug)     DEBUG=1; RP_VERBOSITY=3; RP_DEBUG=1; export RP_VERBOSITY RP_DEBUG; rp_set_colours; shift ;;
+        --quiet)     RP_VERBOSITY=0; export RP_VERBOSITY; shift ;;
+        --verbose)   [ "$RP_VERBOSITY" -lt 2 ] && RP_VERBOSITY=2; export RP_VERBOSITY; shift ;;
+        --color|--colour)
+                     rp_require_option_value "$1" "$#" "${2-}"
+                     RP_COLOR="$2"; export RP_COLOR; rp_set_colours; shift 2 ;;
+        --color=*|--colour=*)
+                     RP_COLOR="${1#*=}"; export RP_COLOR; rp_set_colours; shift ;;
+                --status)    rp_print_status; exit 0 ;;
         --test-notify) rp_test_notify; exit $? ;;
         -h|--help)   usage; exit 0 ;;
         *) echo "Unknown option: $1 (try --help)" >&2; exit 4 ;;
@@ -147,41 +177,20 @@ export RETROPLAY_ALL_SH=1
 if [ "$DRY_RUN" -eq 0 ]; then
 OS_TYPE="$(uname -s | tr '[:upper:]' '[:lower:]')"
 
-# Resolves a usable flock binary, including macOS's keg-only Homebrew
-# util-linux install (Homebrew doesn't symlink flock into PATH there,
-# since it would shadow other things) - checked before concluding flock
-# is genuinely missing and needs installing.
-resolve_flock() {
-    if command -v flock >/dev/null 2>&1; then
-        printf 'flock'
-        return 0
-    fi
-    if [[ "$OS_TYPE" == "darwin" ]] && command -v brew >/dev/null 2>&1; then
-        local prefix
-        prefix="$(brew --prefix util-linux 2>/dev/null)"
-        if [ -n "$prefix" ] && [ -x "$prefix/bin/flock" ]; then
-            printf '%s/bin/flock' "$prefix"
-            return 0
-        fi
-    fi
-    return 1
-}
-
 # ----- Prevent overlapping runs -----
-# If a previous cron-triggered run is somehow still going (e.g. an
-# unusually slow week, or someone manually starts one while cron's is
-# still running) when the next one fires, running two full pipelines
-# against the same directories at once is exactly the kind of thing that
-# corrupts output and pointlessly doubles resource usage on a small
-# device. flock makes a second concurrent instance exit immediately
-# instead of piling up.
-LOCK_FILE="$SCRIPT_DIR/.all.lock"
-FLOCK_BIN="$(resolve_flock || true)"
+# Two full pipelines against the same folders at once is exactly what
+# corrupts output and doubles the load on a small device, so a second
+# instance exits immediately instead of piling up. The lock itself lives in
+# lib.sh, so the stage scripts run by hand honour the same one.
+RUN_ID="$(date '+%Y%m%d-%H%M%S')-$$"
+RP_RUN_ID="$RUN_ID"
 
-if [ -z "$FLOCK_BIN" ] && [ -t 0 ]; then
-    echo "'flock' was not found - it's needed to guarantee only one all.sh"
-    echo "instance runs at a time (e.g. so cron can't overlap a still-running pass)."
-    if [[ "$OS_TYPE" == "darwin" ]]; then
+# Installing packages mid-run would stop a build (or a cron job) at a sudo
+# prompt, so it only happens when explicitly asked for.
+if ! rp_flock_bin >/dev/null 2>&1 && [ -t 0 ] && rp_may_install_tools; then
+    echo "'flock' was not found - it's needed to guarantee only one run"
+    echo "happens at a time (e.g. so cron can't overlap a still-running pass)."
+    if [ "$OS_TYPE" = "darwin" ]; then
         printf 'Install it now via Homebrew (brew install util-linux)? [y/N] '
     else
         printf 'Install it now via apt (sudo apt install util-linux)? [y/N] '
@@ -189,7 +198,7 @@ if [ -z "$FLOCK_BIN" ] && [ -t 0 ]; then
     read -r _flock_reply
     case "$_flock_reply" in
         [Yy]*)
-            if [[ "$OS_TYPE" == "darwin" ]]; then
+            if [ "$OS_TYPE" = "darwin" ]; then
                 _had=0; pkg_already_installed brew util-linux && _had=1
                 if brew install util-linux && [ "$_had" -eq 0 ]; then
                     record_installed_dep "brew" "util-linux"
@@ -200,56 +209,18 @@ if [ -z "$FLOCK_BIN" ] && [ -t 0 ]; then
                     record_installed_dep "apt" "util-linux"
                 fi
             fi
-            FLOCK_BIN="$(resolve_flock || true)"
             ;;
     esac
     unset _flock_reply
 fi
 
-# Lock record: who holds the lock, so a refused run can say what it's
-# waiting for.
-LOCK_INFO="$LOCK_FILE.info"
-LOCK_HOST="$(hostname 2>/dev/null || uname -n)"
-RUN_ID="$(date '+%Y%m%d-%H%M%S')-$$"
-lock_holder() { [ -f "$LOCK_INFO" ] && tr '\n' ' ' < "$LOCK_INFO" | sed 's/ $//'; }
-write_lock_info() {
-    printf 'pid=%s\nhost=%s\nstarted=%s\nrun_id=%s\ncommand=%s\n' \
-        "$$" "$LOCK_HOST" "$(rp_ts)" "$RUN_ID" "all.sh $ORIG_ARGS" | rp_atomic_write "$LOCK_INFO"
-}
-refuse_locked() {
-    echo "Another all.sh is already running - not starting a second one at the same time." >&2
-    [ -n "$(lock_holder)" ] && echo "  Held by: $(lock_holder)" >&2
-    exit "$RP_EXIT_CONFIG"
-}
-
-if [ -n "$FLOCK_BIN" ]; then
-    # flock releases automatically when the holder exits or dies, so a lock
-    # that can't be taken is always an ACTIVE run, never a stale one.
-    exec 9>"$LOCK_FILE"
-    "$FLOCK_BIN" -n 9 || refuse_locked
-    write_lock_info
-else
-    # No flock: an atomic mkdir lock instead. A lock left by a process that
-    # no longer exists ON THIS MACHINE is stale and taken over; a lock from
-    # another machine (shared drive) is never assumed stale.
-    LOCK_DIR="$LOCK_FILE.d"
-    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-        lpid="$(sed -n 's/^pid=//p' "$LOCK_INFO" 2>/dev/null)"
-        lhost="$(sed -n 's/^host=//p' "$LOCK_INFO" 2>/dev/null)"
-        if [ "$lhost" = "$LOCK_HOST" ] && [ -n "$lpid" ] && ! kill -0 "$lpid" 2>/dev/null; then
-            echo "Removing a stale lock left by a run that no longer exists ($(lock_holder))."
-            rm -rf "$LOCK_DIR"
-            mkdir "$LOCK_DIR" 2>/dev/null || refuse_locked
-        else
-            refuse_locked
-        fi
-    fi
-    write_lock_info
-    echo "Note: 'flock' not found - using a simpler lock folder instead." >&2
-    if [[ "$OS_TYPE" == "darwin" ]]; then
-        echo "  For the most reliable locking: brew install util-linux" >&2
+rp_lock_take "all.sh $ORIG_ARGS" || rp_lock_refuse "all.sh"
+if [ "$RP_LOCK_HELD" = "2" ]; then
+    rp_warn "'flock' not found - using a simpler lock folder instead"
+    if [ "$OS_TYPE" = "darwin" ]; then
+        rp_info "  For the most reliable locking: brew install util-linux"
     else
-        echo "  For the most reliable locking: sudo apt install util-linux" >&2
+        rp_info "  For the most reliable locking: sudo apt install util-linux"
     fi
 fi
 
@@ -281,6 +252,35 @@ REPORT_TMP="$(mktemp "${TMPDIR:-/tmp}/retroplay_report.XXXXXX")"
 FAIL_REASON=""
 
 report() { printf '%s\n' "$*" >> "$REPORT_TMP"; }
+# Per-variant results for the table at the end.
+VARIANT_ROWS=""
+# Per-stage seconds, so a slow run can be explained rather than guessed at.
+# (Per-variant time is already in the summary table; this is the breakdown.)
+STAGE_TIMES=""
+_stage_t0=0
+stage_start() { _stage_t0="$SECONDS"; }
+stage_end()   { STAGE_TIMES="$STAGE_TIMES$1=$(( SECONDS - _stage_t0 ))
+"; }
+variant_row() {   # variant_row <key> <started at $SECONDS> [note]
+    local key="$1" t0="$2" note="${3:-}" dest="" art="" games kb i kind i_last=0
+    for i in "${!V_KEY[@]}"; do
+        [ "${V_KEY[$i]}" = "$key" ] && { dest="${V_DEST[$i]}"; art="${V_ART[$i]%%,*}"; i_last="$i"; }
+    done
+    [ -n "$dest" ] && [ -d "$dest" ] || return 0
+    games="$(rp_count_games "$dest")"; kb="$(rp_du_kb "$dest")"
+    VARIANT_ROWS="$VARIANT_ROWS$key|${games:-0}|$(( ${kb:-0} / 1024 ))|$(rp_format_duration $(( SECONDS - t0 )))|${art:-none}|$note
+"
+    # Record what this collection now is, while the numbers are in hand.
+    case "$note" in
+        built)   kind=full ;;
+        updated) kind=update ;;
+        *)       kind="${note:-update}" ;;
+    esac
+    rp_write_manifest "$key" "$dest" "$kind" "${games:-0}" "${kb:-0}" \
+        "${V_ART[$i_last]:-}" "${V_MFLAGS[$i_last]:-}"
+    return 0
+}
+
 mark_success() { mkdir -p "$RP_STATE_DIR/last_success" 2>/dev/null; rp_ts | rp_atomic_write "$RP_STATE_DIR/last_success/$1"; }
 # fail_with <exit code> <message>; fail <message> = unexpected error (1).
 FAIL_CODE=1
@@ -342,10 +342,9 @@ if [ "$DRY_RUN" -eq 0 ]; then
 fi
 
 finish() {
-    local st=$? errs=0 result body
-    if [ "$DRY_RUN" -eq 0 ] && [ "$(sed -n 's/^pid=//p' "$LOCK_INFO" 2>/dev/null)" = "$$" ]; then
-        rm -f "$LOCK_INFO"; rm -rf "${LOCK_DIR:-/nonexistent-lock}"
-    fi
+    local st=$? errs=0 result body sname ssecs
+    stage_end build_seconds
+    if [ "$DRY_RUN" -eq 0 ]; then rp_lock_release; fi
     rm -f "$REPORT_TMP.missing" 2>/dev/null
     if [ "$DRY_RUN" -eq 1 ]; then rm -f "$REPORT_TMP"; return; fi
     rm -rf -- "$WORK_ROOT" "$STAGE_ROOT"
@@ -365,7 +364,26 @@ finish() {
         {
             echo "Amiga Retroplay run report - $(date '+%Y-%m-%d %H:%M:%S')"
             echo "Result:   $result"
-            printf 'Duration: %d:%02d:%02d\n' $((SECONDS / 3600)) $(((SECONDS % 3600) / 60)) $((SECONDS % 60))
+            if [ -n "$VARIANT_ROWS" ]; then
+                echo
+                printf '  %-14s %6s %9s %9s  %-8s %s\n' "Collection" "Games" "Size(MB)" "Time" "Artwork" "Result"
+                printf '  %-14s %6s %9s %9s  %-8s %s\n' "--------------" "------" "--------" "--------" "--------" "-------"
+                printf '%s' "$VARIANT_ROWS" | while IFS='|' read -r k g m t a n; do
+                    [ -n "$k" ] || continue
+                    printf '  %-14s %6s %9s %9s  %-8s %s\n' "$k" "$g" "$m" "$t" "$a" "$n"
+                done
+                echo
+            fi
+            printf 'Total time: %d:%02d:%02d\n' $((SECONDS / 3600)) $(((SECONDS % 3600) / 60)) $((SECONDS % 60))
+            # Where the time actually went. Useful on a Pi, and the thing to
+            # look at before changing any JOBS setting.
+            if [ -n "$STAGE_TIMES" ]; then
+                echo "Time per stage (seconds):"
+                printf '%s' "$STAGE_TIMES" | while IFS='=' read -r sname ssecs; do
+                    [ -n "$sname" ] || continue
+                    printf '  %-22s %s\n' "${sname%_seconds}" "$ssecs"
+                done
+            fi
             echo
             [ -s "$REPORT_TMP" ] && cat "$REPORT_TMP" && echo
             if [ "$errs" -gt 0 ]; then
@@ -405,21 +423,31 @@ trap 'fail_with "$RP_EXIT_INTERRUPTED" "interrupted"' INT TERM
 # steps can take a while on a Pi (tidying folders, checking artwork), and
 # silence looks like a hung script.
 TOTAL_STEPS=5
+if ! rp_quiet; then
 echo
 echo "${RP_C_HEAD}Amiga Retroplay${RP_C_OFF} - $([ "$DRY_RUN" -eq 1 ] && echo "plan only, nothing will be changed" || echo "building: $(printf '%s ' "${V_KEY[@]}")")"
 echo "${RP_C_DIM}Collection: $RP_BUILD_ROOT   Archives: $RP_DOWNLOAD_ROOT   Artwork: $RP_ARTWORK_ROOT${RP_C_OFF}"
+fi
 if [ "$DRY_RUN" -eq 0 ]; then
+    stage_start
     rp_step 1 "$TOTAL_STEPS" "Checking the setup and the output drive"
     rp_restore_state_if_lost
-    printf '      checking the output folder is there...\n'
+    # After the restore: this writes a timestamp into the state folder, and
+    # doing it earlier made a lost state folder look present.
+    rp_check_for_update
+    rp_info '      checking the tools this run needs...'
+    rp_require_tools lha 7z unar || fail "some tools this run needs are not on PATH - nothing was downloaded or changed"
+    command -v unlzx >/dev/null 2>&1 || rp_warn "unlzx is not installed - .lzx archives will be skipped (./setup.sh installs it)"
+    rp_require_bash4 || fail_with "$RP_EXIT_CONFIG" "cannot add artwork without bash 4 - nothing was downloaded or changed"
+    rp_info '      checking the output folder is there...'
     rp_check_output_root || fail_with "$RP_EXIT_CONFIG" "the output folder isn't available (drive not mounted?) - nothing was changed"
-    printf '      tidying the folder layout if needed...\n'
+    rp_info '      tidying the folder layout if needed...'
     rp_migrate_layout      # only once the output drive is known to be there
-    printf '      tidying leftovers in .retroplay...\n'
+    rp_info '      tidying leftovers in .retroplay...'
     rp_tidy_state
-    printf '      clearing old logs...\n'
+    rp_info '      clearing old logs...'
     rp_prune_logs
-    printf '      backing up the queue and build markers...\n'
+    rp_info '      backing up the queue and build markers...'
     rp_backup_state
     rp_done "ready"
 else
@@ -434,6 +462,7 @@ fi
 # missing; auto/yes = check at most once every ARTWORK_CHECK_INTERVAL_HOURS.
 # artwork_sync.sh runs in library mode so it does NOT take a second lock.
 ARTWORK_NOTE=""
+stage_end preflight_seconds
 artwork_preflight() {
     local due_stamp="$RP_STATE_DIR/artwork_last_check" rc=0 mode="$RP_ARTWORK_SYNC"
     [ "$DRY_RUN" -eq 1 ] && return 0
@@ -441,13 +470,10 @@ artwork_preflight() {
     case "$mode" in
         no) return 0 ;;
         ask)
-            # Only useful by hand, and only when a wanted pack is missing.
-            rp_is_interactive || return 0
-            local missing="" p
-            for p in $RP_ARTWORK_PACKS; do [ -d "$RP_ARTWORK_ROOT/iGame_$p" ] || missing="$missing $p"; done
-            [ -n "$missing" ] || return 0
-            printf 'Artwork packs missing:%s. Download them now? [y/N] ' "$missing"
-            read -r reply; case "$reply" in [Yy]*) ;; *) return 0 ;; esac ;;
+            # Missing artwork is fetched without asking - a build without it
+            # produces a collection with no pictures, which is never wanted.
+            # (The question only remains for the interval check below.)
+            : ;;
         auto|yes)
             if [ -f "$due_stamp" ] && [ -z "$(find "$due_stamp" -mmin "+$(( RP_ARTWORK_CHECK_INTERVAL_HOURS * 60 ))" 2>/dev/null)" ]; then
                 rp_debug "artwork checked recently - skipping"
@@ -461,16 +487,38 @@ artwork_preflight() {
     if [ "$nvar" -ge "$(printf '%s' "$RP_VARIANTS" | tr ',' ' ' | wc -w)" ]; then
         art_args="--all-artwork"
     fi
-    rp_step 2 "$TOTAL_STEPS" "[Artwork] checking what this run needs ($art_args)"
+    # Anything missing? Then fetch it now, before the collection is built.
+    local missing
+    missing="$(rp_artwork_missing "$(printf '%s ' "${V_TOK[@]}")" | tr '\n' ' ')"
+    if [ -n "$missing" ]; then
+        rp_step 2 "$TOTAL_STEPS" "[Artwork] missing: $missing- downloading it now"
+    else
+        # Nothing missing: only check again when the interval says so.
+        if [ "$mode" != "auto" ] && [ "$mode" != "yes" ]; then
+            rp_debug "artwork present and ARTWORK_SYNC=$mode - not checking for updates"
+            return 0
+        fi
+        rp_step 2 "$TOTAL_STEPS" "[Artwork] checking for updates ($art_args)"
+    fi
     # shellcheck disable=SC2086
     ./artwork_sync.sh --sync $art_args --called-from-all; rc=$?
-    rp_state_init; : > "$due_stamp"
+    rp_state_init
+    # The "checked recently" stamp is only written when the check actually
+    # finished. A pack that failed to download (a 503 from the source, a
+    # dropped connection) is NOT recorded as current: its manifest in
+    # .retroplay is left exactly as it was, and removing the stamp means the
+    # very next run tries again instead of waiting out the 24 hour interval.
+    case "$rc" in
+        0|2) : > "$due_stamp" ;;
+        *)   rm -f "$due_stamp" ;;
+    esac
     case "$rc" in
         0) ARTWORK_NOTE="artwork updated"; report "[Artwork] packs updated (see the messages above)" ;;
         2) report "[Artwork] no changes" ;;
         *)
             ARTWORK_NOTE="artwork update had problems; the previous artwork was kept"
             report "[Artwork] WARNING: update did not complete - your previous artwork was kept"
+            rp_warn "the pack(s) that failed were not recorded as up to date - the next run will try them again"
             if [ "$RP_ARTWORK_FAILURE_POLICY" = "fail" ]; then
                 fail_with "$RP_EXIT_INTEGRITY" "artwork update failed and ARTWORK_FAILURE_POLICY=fail - stopping before any collection changes (queues are untouched)"
             fi
@@ -478,7 +526,9 @@ artwork_preflight() {
     esac
     return 0
 }
+stage_start
 artwork_preflight
+stage_end artwork_seconds
 
 # ============================================================================
 # 1. Check for updates
@@ -486,15 +536,22 @@ artwork_preflight
 # Folders from older versions of these scripts get markers first, so that
 # anything downloaded now is queued for them.
 if [ "$DRY_RUN" -eq 0 ]; then
-    for i in "${!V_TOK[@]}"; do rp_adopt_legacy "${V_KEY[$i]}" "${V_DEST[$i]}"; done
+    for i in "${!V_TOK[@]}"; do
+        # A build cut short while swapping the new collection in leaves the
+        # previous one under a .previous_ name: put it back before anything
+        # else looks at the folder.
+        rp_recover_swap "${V_DEST[$i]}"
+        rp_adopt_legacy "${V_KEY[$i]}" "${V_DEST[$i]}"
+    done
 fi
 
+stage_start
 if [ "$SKIP_UPDATE" -eq 0 ]; then
     rp_step 3 "$TOTAL_STEPS" "Checking the Retroplay server for new archives"
     if [ "$DRY_RUN" -eq 1 ]; then
-        ./update.sh --dry-run
+        RP_CHILD=1 ./update.sh --dry-run
     else
-        ./update.sh; ust=$?
+        RP_CHILD=1 ./update.sh; ust=$?
         case "$ust" in
             0|2) ;;
             3) fail_with "$RP_EXIT_REMOTE" "could not update from the Retroplay server (network or server problem) - will retry next run" ;;
@@ -535,6 +592,8 @@ for i in "${!V_TOK[@]}"; do
     fi
 done
 
+stage_end update_seconds
+stage_start
 rp_step 4 "$TOTAL_STEPS" "Plan - working out what needs doing"
 echo
 for i in "${!V_TOK[@]}"; do
@@ -591,6 +650,8 @@ if [ "$any_work" -eq 0 ]; then
     echo "Nothing new to process - every variant is up to date."
     exit 2
 fi
+stage_end plan_seconds
+stage_start
 mkdir -p "$WORK_ROOT" "$STAGE_ROOT"
 
 # extract.sh writes extract_errors.log into the folder it runs from; when
@@ -625,7 +686,8 @@ run_extract() {
     tmp="$WORK_ROOT/.failed.$$.${RANDOM:-0}"
     # Run from the downloads folder so the paths inside the collection stay
     # WHDLoad/... rather than downloads/WHDLoad/...
-    ( cd "$RP_DOWNLOAD_ROOT" && RP_EXTRACT_FAILED_LIST="$tmp" bash "$SCRIPT_DIR/extract.sh" "$@" ); st=$?
+    ( cd "$RP_DOWNLOAD_ROOT" && RP_EXTRACT_FAILED_LIST="$tmp" RP_CHILD=1 \
+        bash "$SCRIPT_DIR/extract.sh" --called-from-all "$@" ); st=$?
     [ -s "$tmp" ] && cat "$tmp" >> "$acc"
     rm -f "$tmp"
     case "$st" in
@@ -682,16 +744,34 @@ handle_failed() {
 }
 
 # merge_variant <index> <folder> [extra merge.sh options...]
+# The stage scripts are run directly. They used to be reached through
+# "./start.sh --merge" and "./start.sh --sort", which meant the pipeline
+# engine called the interactive dispatcher, and every variant re-printed its
+# banner and re-ran the startup checks - one build looked like several
+# unrelated tools starting up in turn. RP_CHILD tells them they are one stage
+# of this run: no banner, no header block, and their counts come back in
+# RP_RESULT_FILE as key=value rather than being read off the screen.
+STAGE_RESULT="$WORK_ROOT/.stage_result.$$"
 merge_variant() {   # (adds --refresh-artwork when asked for)
     local i="$1" dir="$2"; shift 2
     local refresh=""
     [ "$REFRESH_ART" -eq 1 ] && refresh="--refresh-artwork"
+    mkdir -p "$WORK_ROOT" 2>/dev/null
     # shellcheck disable=SC2086
-    ./start.sh --merge ${V_MFLAGS[$i]} --art "${V_ART[$i]}" --demo-art "$DEMO_ART" \
-        --dest "$dir" $DETOX_FLAG $DEBUG_FLAG $refresh "$@"
+    RP_CHILD=1 RP_RESULT_FILE="$STAGE_RESULT" bash "$SCRIPT_DIR/merge.sh" \
+        ${V_MFLAGS[$i]} --art "${V_ART[$i]}" --demo-art "$DEMO_ART" \
+        -d "$dir" $DEBUG_FLAG $refresh --called-from-all "$@"
 }
 
-sort_folder() { ./start.sh --sort $FS_FLAG $DETOX_FLAG --dest "$1"; }
+sort_folder() {
+    mkdir -p "$WORK_ROOT" 2>/dev/null
+    # shellcheck disable=SC2086
+    RP_CHILD=1 RP_RESULT_FILE="$STAGE_RESULT" bash "$SCRIPT_DIR/sort.sh" \
+        "$FS_FLAG" $DETOX_FLAG --dest "$1" --called-from-all
+}
+
+# stage_result <key> : the last stage's figure, or empty. Never parses text.
+stage_result() { sed -n "s/^$1=//p" "$STAGE_RESULT" 2>/dev/null | tail -1; }
 
 # After the packs have had their turn: ask the command you configured for
 # anything still missing (off unless ARTWORK_FETCH=yes). Counts go into the
@@ -703,9 +783,9 @@ fetch_missing_artwork() {   # <index> <missing-list-file>
     [ -s "$2" ] || return 0
     [ -f "$SCRIPT_DIR/artwork_fetch.sh" ] || return 0
     out="$REPORT_TMP.fetch"
-    ./artwork_fetch.sh --list "$2" --variant "${V_KEY[$1]}" --dest "${V_DEST[$1]}" | tee "$out"
-    found="$(sed -n 's/.*Artwork found and installed: *//p' "$out" | tail -1)"
-    found="${found:-0}"
+    RP_RESULT_FILE="$out" ./artwork_fetch.sh --list "$2" --variant "${V_KEY[$1]}" --dest "${V_DEST[$1]}"
+    found="$(sed -n 's/^found=//p' "$out" 2>/dev/null | tail -1)"
+    case "$found" in ''|*[!0-9]*) found=0 ;; esac
     if [ "$found" -gt 0 ]; then
         FETCH_FOUND=$(( FETCH_FOUND + found ))
         report "${V_KEY[$1]}: found artwork elsewhere for $found game(s) and converted it to IFF"
@@ -729,6 +809,16 @@ save_missing_list() {   # <index> <missing-list-file> ; prints the count
 # ============================================================================
 FULL=()
 for i in "${!V_TOK[@]}"; do [ "${V_ACT[$i]}" = full ] && FULL+=("$i"); done
+# A preview shows what the NEW archives would add. A collection that does not
+# exist yet has nothing to add to, so those variants are left for an ordinary
+# run rather than silently building the whole thing under a preview name.
+if [ "$PREVIEW_ONLY" -eq 1 ] && [ "${#FULL[@]}" -gt 0 ]; then
+    for i in "${FULL[@]}"; do
+        rp_warn "${V_KEY[$i]} has not been built yet - there is nothing to preview against"
+        report "${V_KEY[$i]}: skipped - a preview needs an existing collection (run ./start.sh --sync first)"
+    done
+    FULL=()
+fi
 
 if [ "${#FULL[@]}" -gt 0 ]; then
     names=""; for i in "${FULL[@]}"; do names="$names ${V_KEY[$i]}"; done
@@ -798,20 +888,30 @@ if [ "${#FULL[@]}" -gt 0 ]; then
         echo "===== $key: installing and adding artwork ====="
         need_kb="$(rp_du_kb "$COMMON" ${extra:+"$extra"})"
         [ "$remaining" -eq 0 ] && need_kb="$(rp_du_kb ${extra:+"$extra"})"   # last one moves instead of copying
-        free_kb="$(rp_free_kb "$RP_OUTPUT_ROOT")"; old_kb="$(rp_du_kb "$dest")"
-        if [ -n "$free_kb" ] && [ $((need_kb + RP_MIN_FREE_MB * 1024)) -gt $((free_kb + old_kb)) ]; then
-            fail_with "$RP_EXIT_CONFIG" "not enough disk space to install $key (needs about $((need_kb / 1024)) MB)"
+        free_kb="$(rp_free_kb "$RP_OUTPUT_ROOT")"
+        # The new collection is now built BESIDE the finished one and only
+        # swapped in when it is complete, so the space for both is needed at
+        # once. That is the price of never leaving the drive without a usable
+        # collection if the power goes out mid-build.
+        if [ -n "$free_kb" ] && [ $((need_kb + RP_MIN_FREE_MB * 1024)) -gt "$free_kb" ]; then
+            fail_with "$RP_EXIT_CONFIG" "not enough disk space to build $key beside the collection you already have (needs about $((need_kb / 1024)) MB free; the previous collection is kept until the new one is finished)"
         fi
-        rm -rf -- "$dest"
+        staged="$(rp_staged_path "$dest")"
+        rm -rf -- "$staged"
         mkdir -p "$(dirname "$dest")"
         if [ "$remaining" -eq 0 ]; then
-            mv "$COMMON" "$dest" || fail "could not move the build into $dest"
+            mv "$COMMON" "$staged" || fail "could not move the build into $staged"
         else
-            cp -a "$COMMON" "$dest" || fail "could not copy the build into $dest"
+            cp -a "$COMMON" "$staged" || fail "could not copy the build into $staged"
         fi
-        [ -n "$extra" ] && { cp -a "$extra/." "$dest/" || fail "could not copy the $ALL_EXCL releases into $dest"; }
+        [ -n "$extra" ] && { cp -a "$extra/." "$staged/" || fail "could not copy the $ALL_EXCL releases into $staged"; }
         miss="$REPORT_TMP.missing"; : > "$miss"
-        merge_variant "$i" "$dest" --report-missing "$miss" || fail "adding artwork to $key failed"
+        merge_variant "$i" "$staged" --report-missing "$miss" || fail "adding artwork to $key failed"
+        # Everything is in place and merged: now, and only now, the previous
+        # collection is replaced - two renames in one folder, so the moment
+        # where neither is complete is as short as the filesystem can make it.
+        rp_swap_collection "$dest" || fail "could not put the new $key in place - your previous collection was kept"
+        variant_row "$key" "${vstart:-$SECONDS}" "built"
         rp_mark_complete "$key" "$dest"
         rp_queue_clear "$key"
         rp_gapfill_done "$key"          # a full build merged everything
@@ -895,7 +995,8 @@ for g in ${G_SIG[@]+"${!G_SIG[@]}"}; do
 
     echo "--- Extracting $narch new archive(s) ---"
     : > "$STAGE_ROOT/failed_$g.list"
-    (cd "$src" && RP_EXTRACT_FAILED_LIST="$STAGE_ROOT/failed_$g.list" bash "$SCRIPT_DIR/extract.sh" -u -d "$batch" $DEBUG_FLAG)
+    (cd "$src" && RP_EXTRACT_FAILED_LIST="$STAGE_ROOT/failed_$g.list" RP_CHILD=1 \
+        bash "$SCRIPT_DIR/extract.sh" --called-from-all -u -d "$batch" $DEBUG_FLAG)
     xst=$?
     rescue_extract_log "$src"
     case "$xst" in
@@ -945,18 +1046,32 @@ for g in ${G_SIG[@]+"${!G_SIG[@]}"}; do
         fi
         miss="$REPORT_TMP.missing"; : > "$miss"
         merge_variant "$i" "$vcopy" --report-missing "$miss" || fail "adding artwork to the new batch for $key failed"
-        rp_replace_and_copy "$vcopy" "$dest" || fail "copying the new batch into $dest failed"
+        if [ "$PREVIEW_ONLY" -eq 1 ]; then
+            rp_info "  preview only - $key itself was not changed"
+        else
+            rp_replace_and_copy "$vcopy" "$dest" || fail "copying the new batch into $dest failed"
+        fi
 
         # Keep a dated copy of just this batch (e.g. for copying to the Amiga).
         rp_migrate_new_dir "${V_NEW[$i]}"
         mkdir -p "${V_NEW[$i]}"
         mv "$vcopy" "${V_NEW[$i]}/$RUN_TS" || fail "could not save the batch to ${V_NEW[$i]}"
+        if [ "$PREVIEW_ONLY" -eq 1 ]; then
+            printf '%s\n' \
+                "PREVIEW ONLY - this is NOT a collection." \
+                "" \
+                "These are the games from the archives downloaded on $RUN_TS," \
+                "with artwork added, so you can look at them before they go in." \
+                "$key itself was not changed, and these archives are still" \
+                "queued: the next ordinary run installs them properly." \
+                > "${V_NEW[$i]}/$RUN_TS/PREVIEW_ONLY.txt"
+        fi
         rp_prune_batches "${V_NEW[$i]}" "$RP_KEEP_NEW_BATCHES"
 
         # Fill in artwork for anything in the collection still missing it.
         # (only when an artwork pack changed, or every GAPFILL_DAYS days)
         gapnote=""
-        if [ "$REFRESH_ART" -eq 1 ] || rp_gapfill_due "$key"; then
+        if [ "$PREVIEW_ONLY" -eq 0 ] && { [ "$REFRESH_ART" -eq 1 ] || rp_gapfill_due "$key"; }; then
             gapmode="--only-missing"
             [ "$REFRESH_ART" -eq 1 ] && gapmode=""      # every game, not just the gaps
             echo "  refreshing artwork for $key..."
@@ -964,14 +1079,24 @@ for g in ${G_SIG[@]+"${!G_SIG[@]}"}; do
             if merge_variant "$i" "$dest" $gapmode; then rp_gapfill_done "$key"
             else gapnote=" (artwork gap-fill reported errors - see retroerror.log)"; fi
         fi
-        mark_success "$key"
-
-        rp_queue_remove_processed "$key" "$STAGE_ROOT/processed_$key.list"
+        if [ "$PREVIEW_ONLY" -eq 0 ]; then
+            mark_success "$key"
+            rp_queue_remove_processed "$key" "$STAGE_ROOT/processed_$key.list"
+        fi
         fetch_missing_artwork "$i" "$miss"
         nomiss="$(save_missing_list "$i" "$miss")"
+        if [ "$PREVIEW_ONLY" -eq 1 ]; then
+            line="$key: PREVIEW - $bgames game(s) from $narch archive(s) put in ${V_NEW[$i]##*/}/$RUN_TS; $key itself was not changed and the archives stay queued"
+        else
         line="$key: $bgames game(s) added/updated from $narch archive(s) - batch saved in ${V_NEW[$i]##*/}/$RUN_TS, $nomiss without artwork"
         [ "$nomiss" -gt 0 ] && line="$line (list: reports/${RUN_TS}_${key}_no_artwork.txt)"
         [ "$nfailed" -gt 0 ] && line="$line; $nfailed archive(s) failed and stay queued"
+        fi
+        if [ "$PREVIEW_ONLY" -eq 1 ]; then
+            variant_row "${V_KEY[$i]}" "${vstart:-$SECONDS}" "preview"
+        else
+            variant_row "${V_KEY[$i]}" "${vstart:-$SECONDS}" "updated"
+        fi
         report "$line$gapnote"
     done
     rm -rf -- "$src"
@@ -997,6 +1122,7 @@ for i in "${!V_TOK[@]}"; do
     rp_gapfill_done "${V_KEY[$i]}"
     mark_success "${V_KEY[$i]}"
     fetch_missing_artwork "$i" "$miss"
+    variant_row "${V_KEY[$i]}" "${vstart:-$SECONDS}" "artwork refreshed"
     report "${V_KEY[$i]}: up to date - artwork gap-fill done; $(save_missing_list "$i" "$miss") game(s) still without artwork"
 done
 

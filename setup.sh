@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.09.29   (every script in the set must carry the same stamp)
+# Remember where the user ran this from, before any cd: retroplay.conf is
+# looked for there first (see lib.sh).
+RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
 # Amiga Retroplay - one-step setup
 #
 # Installs everything the scripts need and sets them up, then runs doctor.sh.
@@ -21,6 +24,8 @@ if [ ! -f "$SCRIPT_DIR/lib.sh" ]; then
 fi
 . "$SCRIPT_DIR/lib.sh"
 rp_load_config
+RP_ALLOW_TOOL_INSTALL=1; export RP_ALLOW_TOOL_INSTALL   # setup is where installing belongs
+rp_banner "setup.sh"
 
 ASSUME_YES=0; DRY=0; CRON_CHOICE=ask
 for a in "$@"; do
@@ -50,6 +55,23 @@ ask() {
     printf '%s' "${reply:-$2}"
 }
 yes_to() { case "$(ask "$1 (y/n)" "$2")" in [Yy]*) return 0 ;; *) return 1 ;; esac; }
+
+# An interrupted setup leaves half-written settings behind. Starting again
+# should start clean: anything THIS script wrote (the config it created, the
+# nightly job it added, its own state) is undone first. Tools already
+# installed are left alone - removing those is uninstall_deps.sh's job.
+SETUP_STATE="$RP_BASE_DIR/.retroplay_setup_state"
+if [ -f "$SETUP_STATE" ] && [ "$DRY" -eq 0 ]; then
+    # the file lists what was done, one per line, ending with "complete"
+    if ! grep -qx 'complete' "$SETUP_STATE" 2>/dev/null; then
+        echo "A previous setup didn't finish. Clearing what it wrote and starting again."
+        grep -q '^wrote_conf$' "$SETUP_STATE" 2>/dev/null && rm -f "$RP_CONF_FILE" && echo "  removed the part-written retroplay.conf"
+        grep -q '^wrote_cron$' "$SETUP_STATE" 2>/dev/null && { ./install_cron.sh --disable --yes >/dev/null 2>&1; echo "  removed the nightly job it had added"; }
+        rm -f "$SETUP_STATE"
+    fi
+fi
+[ "$DRY" -eq 1 ] || { mkdir -p "$(dirname "$SETUP_STATE")" 2>/dev/null; : > "$SETUP_STATE"; }
+setup_note() { [ "$DRY" -eq 1 ] || printf '%s\n' "$1" >> "$SETUP_STATE"; }
 
 echo "Amiga Retroplay setup - $SCRIPT_DIR"
 [ "$DRY" -eq 1 ] && echo "(dry run: nothing will be changed)"
@@ -103,7 +125,20 @@ install_pkgs() {   # installs the missing packages; records only ones that weren
     [ -n "$want_pkgs" ] || return 0
     for p in $want_pkgs; do pkg_already_installed "$PM" "$p" && pre="$pre $p"; done
     if [ "$PM" = "apt" ]; then
-        run sudo apt-get update -qq && run sudo apt-get install -y $want_pkgs || return 1
+        # A fresh Pi runs packagekitd / unattended-upgrades in the background,
+        # which holds the dpkg lock for the first few minutes. Waiting for it
+        # is right; failing with "Could not get lock" is not. apt can wait by
+        # itself (DPkg::Lock::Timeout), and older apt gets a manual wait.
+        local waited=0
+        while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+            [ "$waited" -eq 0 ] && note "another package manager is busy (usually the Pi's own updater) - waiting up to 5 minutes"
+            [ "$waited" -ge 300 ] && { bad "the package lock is still held after 5 minutes. Try again shortly, or: sudo systemctl stop packagekit"; return 1; }
+            sleep 10; waited=$((waited + 10))
+            printf '  ...waiting (%ds)\r' "$waited"
+        done
+        [ "$waited" -gt 0 ] && echo "  the lock is free now, carrying on            "
+        run sudo apt-get -o DPkg::Lock::Timeout=300 update -qq \
+            && run sudo apt-get -o DPkg::Lock::Timeout=300 install -y $want_pkgs || return 1
     elif [ "$PM" = "brew" ]; then
         run brew install $want_pkgs || return 1
     else
@@ -122,9 +157,61 @@ fi
 
 # ------------------------------------------------------------------ 3. unlzx
 step "3. unlzx (for .lzx archives - built from source)"
-UNLZX_URLS="${RP_UNLZX_URL:-https://aminet.net/util/arc/unlzx.lha http://aminet.net/util/arc/unlzx.lha}"
+# The C source directly - no archive to unpack, so lha is not needed here.
+UNLZX_URLS="${RP_UNLZX_URL:-http://aminet.net/misc/unix/unlzx.c.gz https://raw.githubusercontent.com/nhoudelot/unlzx/master/unlzx.c}"
+# unlzx.c is 1990s C. It calls mkdir(), getopt(), exit() and friends without
+# including the headers that declare them, which older compilers allowed with
+# a warning. GCC 14 and clang 16 turn an implicit declaration into an ERROR,
+# so a plain build fails on a current Raspberry Pi OS or Xcode:
+#     error: implicit declaration of function 'mkdir'
+#     error: implicit declaration of function 'getopt'
+# Adding the missing headers ahead of the source fixes it properly; the
+# permissive compiler flags below are only a fallback for anything else the
+# old source trips over. The unpatched source is tried last, so a copy that
+# already has its includes can never be made worse by the prelude.
+build_unlzx() {   # <compiler> <source file> <temp dir>; leaves <temp dir>/unlzx
+    local cc="$1" src="$2" tmp="$3" patched="$3/unlzx_patched.c" log="$3/build.log" f added=0
+    if ! grep -q '<sys/stat.h>' "$src" 2>/dev/null || ! grep -q '<unistd.h>' "$src" 2>/dev/null; then added=1; fi
+    {
+        # Declarations the original source relies on but never includes.
+        printf '%s\n' \
+            '#include <sys/types.h>' \
+            '#include <sys/stat.h>' \
+            '#include <unistd.h>' \
+            '#include <stdio.h>' \
+            '#include <stdlib.h>' \
+            '#include <string.h>' \
+            '#include <time.h>'
+        cat "$src"
+    } > "$patched" 2>/dev/null || patched="$src"
+
+    : > "$log"
+    for f in "$patched::-O2 -w" \
+             "$patched::-O2 -w -std=gnu89" \
+             "$patched::-O2 -w -fpermissive" \
+             "$patched::-O2 -w -Wno-implicit-function-declaration -Wno-implicit-int -Wno-int-conversion -Wno-incompatible-pointer-types" \
+             "$src::-O2 -w" \
+             "$src::-O2 -w -std=gnu89"; do
+        local file="${f%%::*}" flags="${f#*::}"
+        [ -f "$file" ] || continue
+        rm -f "$tmp/unlzx"
+        # shellcheck disable=SC2086
+        if "$cc" $flags -o "$tmp/unlzx" "$file" >>"$log" 2>&1 && [ -x "$tmp/unlzx" ]; then
+            if [ "$file" != "$src" ] && [ "$added" -eq 1 ]; then
+                note "  added the C headers the old unlzx source leaves out (mkdir, getopt)"
+            fi
+            return 0
+        fi
+    done
+    bad "compiling unlzx failed"
+    note "  the compiler said:"
+    sed -n '1,12p' "$log" 2>/dev/null | sed 's/^/      /'
+    note "  .lzx archives will be skipped until unlzx is installed; everything else works."
+    return 1
+}
+
 install_unlzx() {
-    local cc="" url tmp src dest_dir
+    local cc="" url out tmp src dest_dir
     for c in cc gcc clang; do command -v "$c" >/dev/null 2>&1 && { cc="$c"; break; }; done
     if [ -z "$cc" ]; then
         if [ "$PM" = "apt" ]; then
@@ -135,18 +222,33 @@ install_unlzx() {
             return 1
         fi
     fi
-    command -v lha >/dev/null 2>&1 || { bad "lha is needed to unpack the unlzx source"; return 1; }
-    [ "$DRY" -eq 1 ] && { echo "  + download unlzx.lha from Aminet, compile with $cc, install it"; return 0; }
+    [ "$DRY" -eq 1 ] && { echo "  + download the unlzx source, compile it with $cc, install it"; return 0; }
     tmp="$(mktemp -d "${TMPDIR:-/tmp}/unlzx_build.XXXXXX")" || return 1
+    src=""
     for url in $UNLZX_URLS; do
-        if command -v curl >/dev/null 2>&1; then curl -fsSL -m 120 -o "$tmp/unlzx.lha" "$url" && break
-        else wget -q -T 120 -O "$tmp/unlzx.lha" "$url" && break; fi
+        case "$url" in
+            *.gz)  out="$tmp/unlzx.c.gz" ;;
+            *.lha) out="$tmp/unlzx.lha" ;;
+            *)     out="$tmp/unlzx.c" ;;
+        esac
+        rp_fetch "$url" "$out" 2>/dev/null || continue
+        [ -s "$out" ] || continue
+        case "$out" in
+            *.gz)  gunzip -f "$out" 2>/dev/null && src="$tmp/unlzx.c" ;;
+            *.lha) ( cd "$tmp" && lha x unlzx.lha >/dev/null 2>&1 ); src="$(find "$tmp" -name 'unlzx.c' | head -1)" ;;
+            *)     src="$out" ;;
+        esac
+        # make sure it really is the source and not an error page
+        if [ -n "$src" ] && [ -s "$src" ] && grep -qi 'unlzx\|lzx' "$src" 2>/dev/null; then break; fi
+        src=""
     done
-    [ -s "$tmp/unlzx.lha" ] || { rm -rf "$tmp"; bad "couldn't download unlzx from Aminet (network?)"; return 1; }
-    ( cd "$tmp" && lha x unlzx.lha >/dev/null 2>&1 )
-    src="$(find "$tmp" -name 'unlzx.c' | head -1)"
-    [ -n "$src" ] || { rm -rf "$tmp"; bad "the downloaded unlzx archive has no unlzx.c"; return 1; }
-    "$cc" -O2 -w -o "$tmp/unlzx" "$src" || { rm -rf "$tmp"; bad "compiling unlzx failed"; return 1; }
+    if [ -z "$src" ]; then
+        rm -rf "$tmp"
+        bad "couldn't download the unlzx source. Tried:$(printf '\n      %s' $UNLZX_URLS)"
+        note "  .lzx archives will be skipped until unlzx is installed; everything else works."
+        return 1
+    fi
+    build_unlzx "$cc" "$src" "$tmp" || { rm -rf "$tmp"; return 1; }
     if [ -n "${RP_INSTALL_BIN:-}" ]; then dest_dir="$RP_INSTALL_BIN"
     elif [ "$PM" = "brew" ] && [ -w "$(brew --prefix)/bin" ]; then dest_dir="$(brew --prefix)/bin"
     else dest_dir="/usr/local/bin"; fi
@@ -198,7 +300,7 @@ else
             /^OUTPUT_ROOT=/ { print "OUTPUT_ROOT=\"" o "\""; next }
             /^NTFY_TOPIC=/  { print "NTFY_TOPIC=\"" t "\""; next }
             { print }' "$SCRIPT_DIR/retroplay.conf.example" > "$RP_CONF_FILE" \
-            && ok "created retroplay.conf (variants: $variants; output: $out)"
+            && { setup_note wrote_conf; ok "created retroplay.conf (variants: $variants; output: $out)"; }
     fi
 fi
 
@@ -231,7 +333,7 @@ else
     esac
     if [ "$do_cron" -eq 1 ]; then
         if [ "$DRY" -eq 1 ]; then echo "  + ./install_cron.sh"
-        elif ./install_cron.sh > /dev/null 2>&1; then ok "nightly run installed (2am)"
+        elif ./install_cron.sh > /dev/null 2>&1; then setup_note wrote_cron; ok "nightly run installed (2am)"
         else bad "installing the nightly run failed - try ./install_cron.sh"; fi
     else
         ok "skipped (run ./install_cron.sh any time)"
@@ -239,13 +341,54 @@ else
 fi
 
 # ----------------------------------------------------------------- 7. check
-step "8. Checking everything"
+# ------------------------------------------------------- 8. tidy the folder
+# Only offered on a first run in a folder that holds nothing but the scripts.
+TIDY_INTO_SCRIPTS=0
+# Only when someone is there to answer: moving the scripts changes the
+# layout, so it is never done unattended (--yes, cron, a script calling this).
+if [ "$DRY" -eq 0 ] && [ "$ASSUME_YES" -eq 0 ] && rp_is_interactive && [ "${SCRIPT_DIR##*/}" != "scripts" ]; then
+    others=0
+    for d in "$SCRIPT_DIR"/*/; do [ -d "$d" ] && others=$((others + 1)); done
+    if [ "$others" -eq 0 ]; then
+        step "8. Tidying up"
+        if yes_to "Move the scripts into a scripts/ folder to keep this folder tidy?" "y"; then
+            TIDY_INTO_SCRIPTS=1
+            ok "will do that at the end (artwork/, build/, downloads/ stay here)"
+        else
+            ok "leaving the scripts where they are"
+        fi
+    fi
+fi
+
+step "9. Checking everything"
 if [ "$DRY" -eq 1 ]; then echo "  + ./doctor.sh"; exit 0; fi
 ./doctor.sh; dst=$?
 echo
+finish_setup() {
+    setup_note complete
+    if [ "$TIDY_INTO_SCRIPTS" -eq 1 ]; then
+        mkdir -p "$SCRIPT_DIR/scripts" || return 0
+        for f in "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR"/to_ilbm.py; do
+            [ -f "$f" ] || continue
+            mv "$f" "$SCRIPT_DIR/scripts/" 2>/dev/null
+        done
+        [ -d "$SCRIPT_DIR/tests" ] && mv "$SCRIPT_DIR/tests" "$SCRIPT_DIR/scripts/" 2>/dev/null
+        echo
+        echo "The scripts are now in: $SCRIPT_DIR/scripts"
+        echo "Everything else (artwork/, build/, downloads/, logs/, retroplay.conf) stays in $SCRIPT_DIR."
+        echo
+        echo "Next:  cd \"$SCRIPT_DIR/scripts\" && ./all.sh"
+    else
+        echo "Next:  ./all.sh        (the first run downloads and builds everything)"
+    fi
+    echo "       ./start.sh --status   shows where things stand at any time"
+}
+
 if [ "$PROBLEMS" -eq 0 ] && [ "$dst" -eq 0 ]; then
-    echo "Setup complete. Next: ./all.sh  (the first run downloads and builds everything)"
+    echo "Setup complete."
+    finish_setup
     exit 0
 fi
 echo "Setup finished with problems - see above. Fix them and run ./setup.sh again (it's safe to repeat)."
+finish_setup
 exit 4

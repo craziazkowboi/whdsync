@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.09.29   (every script in the set must carry the same stamp)
+# Remember where the user ran this from, before any cd: retroplay.conf is
+# looked for there first (see lib.sh).
+RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
 set -e
 
 # Installs (or updates) a cron job that runs all.sh every morning at 2am.
@@ -16,6 +19,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$SCRIPT_DIR/lib.sh" ] || { echo "ERROR: lib.sh is missing from $SCRIPT_DIR" >&2; exit 1; }
 . "$SCRIPT_DIR/lib.sh"
+rp_banner "install_cron.sh"
 # cron runs jobs with a bare PATH, so remember the PATH of THIS shell - the
 # one where your tools (unlzx etc.) work - for the nightly run to use.
 rp_remember_path force

@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.09.22   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.09.29   (every script in the set must carry the same stamp)
+# Remember where the user ran this from, before any cd: retroplay.conf is
+# looked for there first (see lib.sh).
+RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
 #
 # Purpose: Checks the whole setup and explains how to fix anything wrong.
 #   Changes nothing.  Options: --help.  Exit: 0 = fine, 1 = problems found.
@@ -26,6 +29,7 @@ if [ ! -f "$SCRIPT_DIR/lib.sh" ]; then
 fi
 . "$SCRIPT_DIR/lib.sh"
 rp_load_config
+rp_banner "doctor.sh"
 
 OS_TYPE="$(uname -s | tr '[:upper:]' '[:lower:]')"
 PROBLEMS=0; WARNINGS=0

@@ -15,7 +15,7 @@ OUTPUT_ROOT="."
 # Artwork priority. ART_ORDER_<VARIANT> overrides it for one variant.
 ART_ORDER="Screens,Covers,Titles"
 DEMO_ART_ORDER="Titles,Screens,Covers"
-# ART_ORDER_RTG="Covers,Screens,Titles"
+# ART_ORDER_RTG="Screens,Covers,Titles"
 
 # Artwork packs matched ONLY by the standard layout
 #   <Covers|Screens|Titles>/<Games|Demos|Magazines>/<letter>/<game>/iGame.iff
@@ -104,6 +104,15 @@ STATE_BACKUP="no"
 # markers only; previous artwork versions are never included.
 STATE_BACKUP_MAX_MB=50
 
+# Say when a newer release exists. This only ever READS a version number
+# from GitHub over HTTPS: it never downloads an archive and never runs
+# anything - it prints the address and the commands, and you decide.
+UPDATE_CHECK="yes"
+UPDATE_CHECK_INTERVAL_HOURS=24
+
+# Progress bar: auto (blocks on macOS, ASCII on Linux/A314), smooth, or ascii.
+PROGRESS_STYLE="auto"
+
 # Delete logs older than this many days; 0 keeps them for ever.
 LOG_RETENTION_DAYS=1
 
@@ -125,3 +134,17 @@ NTFY_SERVER="https://ntfy.sh"
 # Email needs a working 'mail' command on this machine.
 NOTIFY_EMAIL=""
 NOTIFY_ON_SUCCESS="no"
+
+# ---- How many things to do at once ---------------------------------------
+# "auto" is what each stage works out for itself from the CPU count, capped
+# again by how much memory the machine has - which is what these scripts have
+# always done. Set a number only if you have measured that it helps: the run
+# report now prints the time each stage took, which is the place to look.
+#
+# On a Pi Zero 2 W with the collection on an SD card, 1 is often faster than
+# the automatic choice; on a desktop with an NVMe drive, more can help.
+JOBS="auto"
+# Per stage, if one of them is the problem rather than all of them.
+EXTRACT_JOBS="auto"
+MERGE_JOBS="auto"
+SORT_JOBS="auto"
