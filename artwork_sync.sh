@@ -130,9 +130,23 @@ SOURCE_URL="${RP_ARTWORK_SOURCE_URL%/}"
 CHANGED_LIST="$RP_STATE_DIR/artwork_changed"
 WARNINGS=0; INSTALLED=0; SKIPPED=0; FAILED=0
 
-cleanup() { [ -n "${MY_WORK:-}" ] && rm -rf "$MY_WORK"; }
+# Purpose:       leave nothing of this run behind, however it ended.
+# Assumptions:   MY_WORK, when set, is this run's own staging folder.
+# Inputs:        $? as it stood when the shell started exiting.
+# Outputs:       none.
+# Side effects:  removes the staging folder; the live artwork is never touched
+#                here - install_pack only swaps a pack in once it is complete.
+cleanup() {
+    local st=$?
+    trap - EXIT INT TERM
+    pkill -P $$ 2>/dev/null || true
+    wait 2>/dev/null || true
+    [ -n "${MY_WORK:-}" ] && rm -rf "$MY_WORK"
+    rp_lock_release 2>/dev/null || true
+    exit "$st"
+}
 trap cleanup EXIT
-trap 'echo; echo "Interrupted - the current artwork is unchanged."; exit 130' INT TERM
+trap 'printf "\n"; rp_warn "interrupted - the current artwork is unchanged"; exit 130' INT TERM
 
 # =============================================================================
 # Remote listing: only iGame_*.lha and TinyLauncher.lha are ever considered
@@ -148,9 +162,17 @@ approved() {
         [Tt]iny[Ll]auncher.lha|[Tt]iny[Ll]auncher.LHA) return 0 ;;
         *) return 1 ;;
     esac
-    # section and variant must both be ones we know
-    case "$(printf '%s' "$1" | cut -d_ -f2)" in Covers|Screens|Titles) ;; *) return 1 ;; esac
-    case "$(printf '%s' "${1%.[Ll][Hh][Aa]}" | cut -d_ -f3-)" in
+    # Section and flavour must both be ones we know. Split with parameter
+    # expansion rather than cut: this runs once per name in the remote
+    # listing, and two processes a name adds up on a Pi.
+    #   IGame_Covers_AGA_Laced.lha -> section "Covers", flavour "AGA_Laced"
+    local rest section flavour
+    rest="${1#*_}"                     # drop "IGame_"
+    section="${rest%%_*}"              # up to the next underscore
+    flavour="${rest#*_}"               # the remainder...
+    flavour="${flavour%.[Ll][Hh][Aa]}" # ...without the extension
+    case "$section" in Covers|Screens|Titles) ;; *) return 1 ;; esac
+    case "$flavour" in
         AGA_Laced|AGA_LoRes|ECS_Laced|ECS_LoRes|RTG) return 0 ;;
         *) return 1 ;;
     esac
@@ -164,8 +186,12 @@ target_for() {
     local stem section rest
     case "$1" in [Tt]iny*) printf 'TinyLauncher'; return 0 ;; esac
     stem="${1%.[Ll][Hh][Aa]}"
-    section="$(printf '%s' "$stem" | cut -d_ -f2)"
-    rest="$(printf '%s' "$stem" | cut -d_ -f3-)"
+    # Split with parameter expansion, not cut: target_for runs once per
+    # archive in the listing, and two processes each adds up on a Pi.
+    #   IGame_Screens_AGA_Laced -> section "Screens", rest "AGA_Laced"
+    rest="${stem#*_}"                  # drop "IGame_"
+    section="${rest%%_*}"              # up to the next underscore
+    rest="${rest#*_}"                  # what is left is the flavour
     case "$rest" in
         RTG)        printf 'iGame_RTG/%s' "$section" ;;
         AGA_Laced)  printf 'iGame_AGA/laced/%s' "$section" ;;
@@ -175,7 +201,10 @@ target_for() {
     esac
 }
 # Manifests and backups are keyed by a flat, safe version of that path.
-target_key() { printf '%s' "$1" | tr '/' '_'; }
+# iGame_AGA/laced/Screens -> iGame_AGA_laced_Screens. Called several times
+# per pack, so it uses expansion rather than a tr process each time.
+# (Bash 3.2 has no ${var//.../...} on arrays, but this plain form is fine.)
+target_key() { local k="${1//\//_}"; printf '%s' "$k"; }
 
 # The archives one variant needs (three sections).
 archives_for_variant() {

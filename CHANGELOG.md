@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.4 - 2026-09-29 (reported from the Mac and the Pi)
+### Fixed
+- **`--aga-laced` and `--ecs-laced` were never using the laced artwork.** The
+  flavour folders (`iGame_AGA/laced`, `iGame_AGA/lores`) were mapped onto the
+  set names about 300 lines AFTER the command line had been resolved, so
+  `merge.sh --aga-laced` asked for a name that did not exist yet: it reported
+  "no iGame_AGA_LACED directory found", then quietly built from the fallback
+  chain - the lores artwork - instead. Running a laced build through `all.sh`
+  was unaffected; running `merge.sh` directly was not.
+- That message also named the folder the scripts are in rather than the
+  artwork folder, which is what made the fault visible. It now names
+  `artwork/` and says which `--artwork-sync --for` would fetch the set.
+- **No more `setlocale: cannot change locale (en_AU.UTF-8)` on a Pi.**
+  `extract.sh` exported `LANG`/`LC_ALL=en_AU.UTF-8` outright, but `setup.sh`
+  generates `C.UTF-8` and `en_US.ISO-8859-1`. On a machine set up exactly as
+  documented, every subprocess printed the warning - two lines per archive,
+  straight through the progress bar. The locale is now chosen from what
+  `locale -a` actually lists, honouring an existing `LANG` first.
+- The same mismatch meant the **Latin-1 extraction passes never ran in
+  Latin-1**: they asked for `en_AU.ISO-8859-1` while setup generates
+  `en_US.ISO-8859-1`. They now use whichever Latin-1 locale exists, and are
+  skipped rather than run under the wrong one when there is none.
+
+## 0.4 - 2026-09-29 (shell review: safety, noise, per-item subprocesses)
+### Fixed
+- `artwork_fetch.sh` read the finished IFF's header with no stderr redirect and
+  no status check, so a short or malformed file printed a Python traceback into
+  the middle of the "found - converted and installed (...)" line. It now reports
+  "size unknown" instead. The Pillow and image checks say which piece is
+  missing rather than letting an ImportError speak for them.
+- `all.sh` created its report scratch file about 170 lines before `trap finish
+  EXIT` was installed. Anything that exited in that window - a bad option, a
+  drive that was not mounted - left the file in `/tmp`. A stop-gap trap now
+  covers it, and `finish` clears the side files by pattern.
+- The lock record flattened its command line through `"$*"`, so
+  `--dest "My Drive"` was written as two loose words. It is rendered from `"$@"`
+  with the quoting intact.
+- `artwork_fetch.sh` and `artwork_sync.sh` now clean up the way the other stage
+  scripts do: capture the exit status, stop and reap any children, remove only
+  this run's scratch folder, then exit with the status that was saved.
+
+### Changed
+- `approved()`, `target_for()` and `target_key()` in `artwork_sync.sh` used
+  `cut` and `tr` - two or three processes per archive, on every name in the
+  remote listing. They use parameter expansion now; classification was compared
+  against the old code over 654 archive names with no differences.
+- Two `df` calls in consecutive lines, and a `du` of the whole staged collection
+  taken twice for the last variant, are now taken once.
+- `artwork_fetch.sh` uses the shared `rp_heading`/`rp_info`/`rp_warn`/`rp_error`
+  helpers, so its headings, indentation and stderr behaviour match every other
+  script.
+- Comments on the non-obvious functions now state purpose, assumptions, inputs,
+  outputs and side effects.
+
+**Not changed, deliberately:** the `${ARRAY[@]+"${ARRAY[@]}"}` guards stay. On
+macOS's stock bash 3.2 - which this suite supports and CI tests - expanding an
+empty array as `"${ARRAY[@]}"` under `set -u` is an "unbound variable" error;
+bash only stopped doing that in 4.4. Every guarded array in `all.sh`
+(`V_TOK`, `EXTRA_SET`, `INC`, `G_SIG`) is empty in the ordinary case, so
+removing the guards would break the common path on a Mac.
+
 ## 0.4 - 2026-09-29 (engineering review: output, locking, state)
 ### Changed
 - **`all.sh` no longer runs merge and sort through `start.sh`.** The engine
@@ -66,7 +127,7 @@
   at before changing any job count.
 
 ### Tests
-- 333 automated tests (was 265) and 205 option checks. The option matrix's
+- 344 automated tests (was 265) and 205 option checks. The option matrix's
   per-case limit is now 180 seconds (`MATRIX_TIMEOUT` to change it): at 25 it was
   measuring machine speed rather than catching hangs.
 

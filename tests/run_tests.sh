@@ -1683,6 +1683,54 @@ acfg EXTRACT_JOBS '"auto"'
 run jobsnoval ./extract.sh -u -d "$T/jobs_out5" --jobs; st=$?
 check "--jobs with no value fails cleanly" '[ "$st" -eq 4 ]'
 
+
+section "61. --aga-laced and --ecs-laced really use the laced artwork"
+# The flavour folders (iGame_AGA/laced, iGame_AGA/lores) were mapped onto the
+# set names AFTER the command line had already been resolved, so --aga-laced
+# asked for a key that did not exist yet: it always reported "not found" and
+# quietly built from the fallback chain instead. It also named the scripts
+# folder rather than the artwork folder in that message.
+mkdir -p "$ROOT/artwork/iGame_AGA/laced/Covers/Games/L/Laced" \
+         "$ROOT/artwork/iGame_ECS/laced/Covers/Games/L/Laced" \
+         "$ROOT/build/lacedtest/WHDLoad/Games/L/Laced"
+echo "AGA-LACED-ART" > "$ROOT/artwork/iGame_AGA/laced/Covers/Games/L/Laced/iGame.iff"
+echo "ECS-LACED-ART" > "$ROOT/artwork/iGame_ECS/laced/Covers/Games/L/Laced/iGame.iff"
+touch "$ROOT/build/lacedtest/WHDLoad/Games/L/Laced.info"
+run mlaced ./merge.sh --aga-laced -d "$ROOT/build/lacedtest" --art Covers,Screens,Titles
+check "--aga-laced picks iGame_AGA/laced, not the fallback chain" \
+  'grep -q "Selected artwork source: .*iGame_AGA/laced" "$T/mlaced.log"'
+check "...and the game gets the laced artwork" \
+  'grep -q "AGA-LACED-ART" "$ROOT/build/lacedtest/WHDLoad/Games/L/Laced/iGame.iff"'
+run mlacede ./merge.sh --ecs-laced -d "$ROOT/build/lacedtest" --art Covers,Screens,Titles
+check "--ecs-laced picks iGame_ECS/laced too" \
+  'grep -q "Selected artwork source: .*iGame_ECS/laced" "$T/mlacede.log"'
+# The message when a set really is missing must name the artwork folder.
+run mnoset ./merge.sh --set Nonexistent -d "$ROOT/build/lacedtest"
+check "a set that is not there names the artwork folder, not the scripts folder" \
+  'grep -q "artwork" "$T/mnoset.log" && ! grep -q "found under: $ROOT\$" "$T/mnoset.log"'
+check "...and says how to fetch it" 'grep -q -- "--artwork-sync" "$T/mnoset.log"'
+
+section "62. No locale warnings on a machine without en_AU"
+# extract.sh used to export LANG/LC_ALL=en_AU.UTF-8 outright. setup.sh
+# generates C.UTF-8 and en_US.ISO-8859-1, so on a Pi set up exactly as
+# documented every subprocess printed "setlocale: cannot change locale",
+# two lines per archive, through the progress bar. The Latin-1 extraction
+# passes asked for en_AU.ISO-8859-1 for the same reason, so that fallback
+# was running under the wrong locale.
+check "extract.sh no longer forces a locale before it knows what exists" \
+  '! grep -qE "^export (LANG|LC_ALL)=\"\\$\{(LANG|LC_ALL):-en_AU" "$ROOT/extract.sh"'
+check "the Latin-1 passes use whichever Latin-1 locale is generated" \
+  '! grep -q "LC_ALL=en_AU.ISO-8859-1" "$ROOT/extract.sh" && grep -q "RP_LC_LATIN1" "$ROOT/extract.sh"'
+( cd "$ROOT" && env -u LANG -u LC_ALL ./extract.sh -u -d "$T/locale_out" ) > "$T/locale.log" 2>&1 || true
+check "a run with no locale set prints no setlocale warnings" \
+  '! grep -qi "cannot change locale" "$T/locale.log"'
+check "...and still extracts" '[ -n "$(find "$T/locale_out" -name "*.info" 2>/dev/null | head -1)" ]'
+# rp_pick_locale itself
+check "rp_pick_locale returns one the machine has" \
+  '[ -n "$(cd "$ROOT" && bash -c "SCRIPT_DIR=. . ./lib.sh; rp_pick_locale zz_ZZ.UTF-8 C.UTF-8 C.utf8 C")" ]'
+check "...and nothing at all when none of them exist" \
+  '[ -z "$(cd "$ROOT" && bash -c "SCRIPT_DIR=. . ./lib.sh; rp_pick_locale zz_ZZ.UTF-8 qq_QQ.ISO-8859-9" 2>/dev/null)" ] && [ -n "$(cd "$ROOT" && bash -c "SCRIPT_DIR=. . ./lib.sh; rp_pick_locale qq_QQ.X C.UTF-8" 2>/dev/null)" ]'
+
 # ================================================================ summary ===
 echo
 if [ "$FAIL" -eq 0 ]; then

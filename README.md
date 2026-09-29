@@ -12,7 +12,7 @@ downloads/            →  extract  →  artwork  →  sort  →  build/retro_ag
 
 - **Runs on** a Raspberry Pi (including a Pi Zero 2 W) or a Mac. Linux and macOS, nothing else needed.
 - **Safe by design.** It never deletes a collection until its replacement is ready, never overwrites artwork you changed yourself, and stops rather than guessing.
-- **Tested.** 333 automated tests plus 205 option checks, run offline on every change. GitHub Actions runs them on Ubuntu and on macOS (bash 3.2), with ShellCheck.
+- **Tested.** 344 automated tests plus 205 option checks, run offline on every change. GitHub Actions runs them on Ubuntu and on macOS (bash 3.2), with ShellCheck.
 
 ---
 

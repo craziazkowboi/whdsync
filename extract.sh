@@ -32,8 +32,9 @@ RP_ORIG_ARGS="$*"      # remembered for the lock record and the logs
 # handling further down for how both failure modes are detected and
 # reported, since neither shows up in a plain `wait`.
 
-export LANG="${LANG:-en_AU.UTF-8}"
-export LC_ALL="${LC_ALL:-en_AU.UTF-8}"
+# Locale is chosen further down, once lib.sh is loaded: it has to be one this
+# machine actually has. Forcing en_AU.UTF-8 here made every subprocess on a
+# Pi print "setlocale: cannot change locale" straight through the progress bar.
 
 # Colour follows the same rule as lib.sh: any non-empty NO_COLOR turns it
 # off (that is the published convention - NO_COLOR=true must work, not just
@@ -149,6 +150,18 @@ if [ ! -f "$SCRIPT_DIR/lib.sh" ]; then
     exit 1
 fi
 . "$SCRIPT_DIR/lib.sh"
+
+# Archive filenames come in three flavours: plain ASCII, Latin-1 (most Amiga
+# archives), and whatever the system uses. The extraction passes below try
+# them in that order, so both a UTF-8 and a Latin-1 locale are wanted - but
+# only ones this machine actually has. An existing LANG is honoured first;
+# setup.sh generates C.UTF-8 and en_US.ISO-8859-1, which are in the lists.
+RP_LC_UTF8="$(rp_pick_locale "${LANG:-}" en_AU.UTF-8 en_GB.UTF-8 en_US.UTF-8 C.UTF-8 C.utf8 2>/dev/null || printf 'C')"
+export LANG="$RP_LC_UTF8" LC_ALL="$RP_LC_UTF8"
+# May be empty: if no Latin-1 locale is generated, that pass is simply skipped
+# rather than run under the wrong locale (which is what used to happen - the
+# passes asked for en_AU.ISO-8859-1 while setup.sh generates en_US.ISO-8859-1).
+RP_LC_LATIN1="$(rp_pick_locale en_AU.ISO-8859-1 en_GB.ISO-8859-1 en_US.ISO-8859-1 2>/dev/null || true)"
 # One colour decision for the whole suite (NO_COLOR, --color, terminal or not).
 rp_set_colours
 rp_load_config
@@ -573,9 +586,9 @@ extract_archive() {
         (cd "$abs_destdir" && LANG=C LC_ALL=C lha x "$abs_archive") >/dev/null 2>&1 && success=1
         [ $success -eq 0 ] && unar -encoding ASCII -quiet -f -o "$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
         [ $success -eq 0 ] && LANG=C LC_ALL=C 7z x -aoa -o"$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
-        [ $success -eq 0 ] && (cd "$abs_destdir" && LANG=en_AU.ISO-8859-1 LC_ALL=en_AU.ISO-8859-1 lha x "$abs_archive") >/dev/null 2>&1 && success=1
+        [ $success -eq 0 ] && [ -n "$RP_LC_LATIN1" ] && (cd "$abs_destdir" && LANG="$RP_LC_LATIN1" LC_ALL="$RP_LC_LATIN1" lha x "$abs_archive") >/dev/null 2>&1 && success=1
         [ $success -eq 0 ] && unar -encoding ISO-8859-1 -quiet -f -o "$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
-        [ $success -eq 0 ] && LANG=en_AU.ISO-8859-1 LC_ALL=en_AU.ISO-8859-1 7z x -aoa -o"$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
+        [ $success -eq 0 ] && [ -n "$RP_LC_LATIN1" ] && LANG="$RP_LC_LATIN1" LC_ALL="$RP_LC_LATIN1" 7z x -aoa -o"$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
         [ $success -eq 0 ] && (cd "$abs_destdir" && lha x "$abs_archive") >/dev/null 2>&1 && success=1
         [ $success -eq 0 ] && unar -quiet -f -o "$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
         [ $success -eq 0 ] && 7z x -aoa -o"$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
@@ -584,9 +597,9 @@ extract_archive() {
         (cd "$abs_destdir" && LANG=C LC_ALL=C unlzx -x "$abs_archive") >/dev/null 2>&1 && success=1
         [ $success -eq 0 ] && unar -encoding ASCII -quiet -f -o "$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
         [ $success -eq 0 ] && LANG=C LC_ALL=C 7z x -aoa -o"$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
-        [ $success -eq 0 ] && (cd "$abs_destdir" && LANG=en_AU.ISO-8859-1 LC_ALL=en_AU.ISO-8859-1 unlzx -x "$abs_archive") >/dev/null 2>&1 && success=1
+        [ $success -eq 0 ] && [ -n "$RP_LC_LATIN1" ] && (cd "$abs_destdir" && LANG="$RP_LC_LATIN1" LC_ALL="$RP_LC_LATIN1" unlzx -x "$abs_archive") >/dev/null 2>&1 && success=1
         [ $success -eq 0 ] && unar -encoding ISO-8859-1 -quiet -f -o "$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
-        [ $success -eq 0 ] && LANG=en_AU.ISO-8859-1 LC_ALL=en_AU.ISO-8859-1 7z x -aoa -o"$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
+        [ $success -eq 0 ] && [ -n "$RP_LC_LATIN1" ] && LANG="$RP_LC_LATIN1" LC_ALL="$RP_LC_LATIN1" 7z x -aoa -o"$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
         [ $success -eq 0 ] && (cd "$abs_destdir" && unlzx -x "$abs_archive") >/dev/null 2>&1 && success=1
         [ $success -eq 0 ] && unar -quiet -f -o "$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
         [ $success -eq 0 ] && 7z x -aoa -o"$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
@@ -595,7 +608,7 @@ extract_archive() {
         unar -encoding ASCII -quiet -f -o "$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
         [ $success -eq 0 ] && LANG=C LC_ALL=C 7z x -aoa -o"$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
         [ $success -eq 0 ] && unar -encoding ISO-8859-1 -quiet -f -o "$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
-        [ $success -eq 0 ] && LANG=en_AU.ISO-8859-1 LC_ALL=en_AU.ISO-8859-1 7z x -aoa -o"$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
+        [ $success -eq 0 ] && [ -n "$RP_LC_LATIN1" ] && LANG="$RP_LC_LATIN1" LC_ALL="$RP_LC_LATIN1" 7z x -aoa -o"$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
         [ $success -eq 0 ] && unar -quiet -f -o "$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
         [ $success -eq 0 ] && 7z x -aoa -o"$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
         ;;
@@ -603,7 +616,7 @@ extract_archive() {
         unar -encoding ASCII -quiet -f -o "$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
         [ $success -eq 0 ] && LANG=C LC_ALL=C 7z x -aoa -o"$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
         [ $success -eq 0 ] && unar -encoding ISO-8859-1 -quiet -f -o "$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
-        [ $success -eq 0 ] && LANG=en_AU.ISO-8859-1 LC_ALL=en_AU.ISO-8859-1 7z x -aoa -o"$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
+        [ $success -eq 0 ] && [ -n "$RP_LC_LATIN1" ] && LANG="$RP_LC_LATIN1" LC_ALL="$RP_LC_LATIN1" 7z x -aoa -o"$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
         [ $success -eq 0 ] && unar -quiet -f -o "$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
         [ $success -eq 0 ] && 7z x -aoa -o"$abs_destdir" "$abs_archive" >/dev/null 2>&1 && success=1
         ;;

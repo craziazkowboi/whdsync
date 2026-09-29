@@ -94,7 +94,24 @@ Exit codes: 0 = work done, 2 = nothing to do, 1 = failure.
 USAGE
 }
 
-ORIG_ARGS="$*"
+# What this run was asked to do, for the lock record and the logs. Built from
+# "$@" (not "$*") so an argument containing spaces is still readable as one
+# argument: --dest "My Drive" stays --dest "My Drive", not two loose words.
+# Purpose:       a human-readable record of the command line.
+# Inputs:        the script's own arguments.
+# Outputs:       ORIG_ARGS, a single display string.
+# Side effects:  none. It is never re-executed, only printed.
+rp_render_args() {
+    local a out=""
+    for a in ${1+"$@"}; do
+        case "$a" in
+            *[!A-Za-z0-9_=/.,:+-]*) out="$out \"$a\"" ;;   # quote anything with a space or shell character
+            *)                      out="$out $a" ;;
+        esac
+    done
+    printf '%s' "${out# }"
+}
+ORIG_ARGS="$(rp_render_args ${1+"$@"})"
 VARIANT_ARGS=""; DEST_OVERRIDE=""
 CLEAN=0; SKIP_UPDATE=0; FORCE=0
 REFRESH_ART=0        # --refresh-artwork: replace artwork already in the collection
@@ -249,6 +266,11 @@ WORK_ROOT="$RP_OUTPUT_ROOT/.retroplay_work"     # same drive as the output, so m
 STAGE_ROOT="$RP_STATE_DIR/stage"                # same drive as the archives, so staging can hardlink
 REPORT_DIR="$RP_REPORT_ROOT"
 REPORT_TMP="$(mktemp "${TMPDIR:-/tmp}/retroplay_report.XXXXXX")"
+# finish() (installed further down) is what normally clears these, but it is
+# not in place yet: until it is, anything that exits early - a bad option, a
+# drive that is not mounted - would leave the file in /tmp. This stop-gap trap
+# is replaced by `trap finish EXIT` once the real one is ready.
+trap 'rm -f "$REPORT_TMP" "$REPORT_TMP".* 2>/dev/null' EXIT INT TERM
 FAIL_REASON=""
 
 report() { printf '%s\n' "$*" >> "$REPORT_TMP"; }
@@ -342,10 +364,10 @@ if [ "$DRY_RUN" -eq 0 ]; then
 fi
 
 finish() {
-    local st=$? errs=0 result body sname ssecs
+    local st=$? errs=0 result body sname ssecs free_left
     stage_end build_seconds
     if [ "$DRY_RUN" -eq 0 ]; then rp_lock_release; fi
-    rm -f "$REPORT_TMP.missing" 2>/dev/null
+    rm -f "$REPORT_TMP".* 2>/dev/null        # .missing, .fetch and anything else
     if [ "$DRY_RUN" -eq 1 ]; then rm -f "$REPORT_TMP"; return; fi
     rm -rf -- "$WORK_ROOT" "$STAGE_ROOT"
     [ -s "$RP_LOG_ROOT/retroerror.log" ] && errs="$(grep -c . "$RP_LOG_ROOT/retroerror.log")"
@@ -391,8 +413,8 @@ finish() {
             else
                 echo "No errors logged."
             fi
-            [ -n "$(rp_free_kb "$RP_OUTPUT_ROOT")" ] && \
-                echo "Free space left: $(( $(rp_free_kb "$RP_OUTPUT_ROOT") / 1024 )) MB"
+            free_left="$(rp_free_kb "$RP_OUTPUT_ROOT")"      # asked once, not twice
+            [ -n "$free_left" ] && echo "Free space left: $(( free_left / 1024 )) MB"
         } > "$REPORT_DIR/$RUN_TS.txt"
         echo
         echo "======================== Summary ========================"
@@ -637,7 +659,8 @@ if [ "$DRY_RUN" -eq 1 ]; then
     for i in "${!V_TOK[@]}"; do
         if [ "${V_ACT[$i]}" = full ]; then
             akb="$(rp_du_kb "$RP_DOWNLOAD_ROOT")"
-            echo "A full build needs roughly $(( akb * RP_SPACE_FACTOR * 2 / 1024 )) MB free; $(( $(rp_free_kb "$RP_OUTPUT_ROOT") / 1024 )) MB available."
+            free_kb_now="$(rp_free_kb "$RP_OUTPUT_ROOT")"
+            echo "A full build needs roughly $(( akb * RP_SPACE_FACTOR * 2 / 1024 )) MB free; $(( ${free_kb_now:-0} / 1024 )) MB available."
             break
         fi
     done
@@ -886,8 +909,14 @@ if [ "${#FULL[@]}" -gt 0 ]; then
         for n in ${EXTRA_SET[@]+"${!EXTRA_SET[@]}"}; do [ "${EXTRA_SET[$n]}" = "${V_EXCL[$i]}" ] && extra="${EXTRA_DIR[$n]}"; done
         echo
         echo "===== $key: installing and adding artwork ====="
-        need_kb="$(rp_du_kb "$COMMON" ${extra:+"$extra"})"
-        [ "$remaining" -eq 0 ] && need_kb="$(rp_du_kb ${extra:+"$extra"})"   # last one moves instead of copying
+        # The last variant MOVES the shared tree rather than copying it, so only
+        # the extras need room. Work out which measurement is wanted first and
+        # take it once: this is a full walk of the staged collection.
+        if [ "$remaining" -eq 0 ]; then
+            need_kb="$(rp_du_kb ${extra:+"$extra"})"
+        else
+            need_kb="$(rp_du_kb "$COMMON" ${extra:+"$extra"})"
+        fi
         free_kb="$(rp_free_kb "$RP_OUTPUT_ROOT")"
         # The new collection is now built BESIDE the finished one and only
         # swapped in when it is complete, so the space for both is needed at

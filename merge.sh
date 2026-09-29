@@ -173,6 +173,36 @@ done
 shopt -u nullglob
 unset _igdir _igbase _igname _igkey
 
+# The artwork packs from the source are per section (Covers/Screens/Titles)
+# and per flavour, so iGame_AGA and iGame_ECS hold "laced/" and "lores/"
+# subfolders. Map the sets onto them:
+#     --aga        -> iGame_AGA/lores      --aga-laced -> iGame_AGA/laced
+#     --ecs        -> iGame_ECS/lores      --ecs-laced -> iGame_ECS/laced
+#     --rtg        -> iGame_RTG            (no flavours)
+# A pack still laid out the old flat way keeps working: if there is no
+# laced/ or lores/ subfolder, the folder itself is used as before.
+for _base in AGA ECS; do
+    _dir="${IGAME_SET_DIR[$_base]:-}"
+    [ -n "$_dir" ] || continue
+    if [ -d "$_dir/laced" ]; then
+        IGAME_SET_DIR["${_base}_LACED"]="$_dir/laced"
+        case " ${IGAME_SET_NAMES[*]} " in *" ${_base}_Laced "*) ;; *) IGAME_SET_NAMES+=("${_base}_Laced") ;; esac
+    fi
+    if [ -d "$_dir/lores" ]; then
+        IGAME_SET_DIR["$_base"]="$_dir/lores"
+        # Artwork installed the older, flat way (iGame_AGA/Covers/...) still
+        # counts: it is kept as an extra fallback right after the flavour
+        # folder, so games only present there keep their artwork.
+        for _sec in Covers Screens Titles; do
+            if [ -d "$_dir/$_sec" ]; then
+                IGAME_SET_DIR["${_base}_FLAT"]="$_dir"
+                break
+            fi
+        done
+    fi
+done
+unset _base _dir
+
 # Resolve a requested set name (any case) to ART_SRC. Returns 1 if not found.
 # On success also records the uppercased key in SELECTED_SET_KEY, used to
 # build the artwork fallback chain later.
@@ -350,8 +380,9 @@ if [ "$CUSTOM" -eq 1 ]; then
     show_artwork_menu
 elif [ -n "$SET_OPT" ]; then
     if ! resolve_art_set "$SET_OPT"; then
-        echo "NOTE: No iGame_$SET_OPT directory found under: $SCRIPT_DIR"
-        echo "Will still try the artwork fallback chain (see --help) for a match."
+        rp_warn "no iGame_$SET_OPT artwork found under: $RP_ARTWORK_ROOT"
+        rp_info "  Will still try the artwork fallback chain (see --help) for a match."
+        rp_info "  To fetch it:  ./start.sh --artwork-sync --for $(printf '%s' "$SET_OPT" | tr '[:upper:]_' '[:lower:]-')"
         SELECTED_SET_KEY="${SET_OPT^^}"
         ART_SRC=""
     fi
@@ -455,35 +486,6 @@ if [ -z "${IGAME_SET_DIR[ART]+_}" ]; then
     unset _art_resolved
 fi
 
-# The artwork packs from the source are per section (Covers/Screens/Titles)
-# and per flavour, so iGame_AGA and iGame_ECS hold "laced/" and "lores/"
-# subfolders. Map the sets onto them:
-#     --aga        -> iGame_AGA/lores      --aga-laced -> iGame_AGA/laced
-#     --ecs        -> iGame_ECS/lores      --ecs-laced -> iGame_ECS/laced
-#     --rtg        -> iGame_RTG            (no flavours)
-# A pack still laid out the old flat way keeps working: if there is no
-# laced/ or lores/ subfolder, the folder itself is used as before.
-for _base in AGA ECS; do
-    _dir="${IGAME_SET_DIR[$_base]:-}"
-    [ -n "$_dir" ] || continue
-    if [ -d "$_dir/laced" ]; then
-        IGAME_SET_DIR["${_base}_LACED"]="$_dir/laced"
-        case " ${IGAME_SET_NAMES[*]} " in *" ${_base}_Laced "*) ;; *) IGAME_SET_NAMES+=("${_base}_Laced") ;; esac
-    fi
-    if [ -d "$_dir/lores" ]; then
-        IGAME_SET_DIR["$_base"]="$_dir/lores"
-        # Artwork installed the older, flat way (iGame_AGA/Covers/...) still
-        # counts: it is kept as an extra fallback right after the flavour
-        # folder, so games only present there keep their artwork.
-        for _sec in Covers Screens Titles; do
-            if [ -d "$_dir/$_sec" ]; then
-                IGAME_SET_DIR["${_base}_FLAT"]="$_dir"
-                break
-            fi
-        done
-    fi
-done
-unset _base _dir
 
 # Put each "_FLAT" fallback directly after the set it belongs to.
 _chain_with_flat=()

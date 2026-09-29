@@ -66,15 +66,24 @@ LIMIT="${LIMIT:-$RP_ARTWORK_FETCH_LIMIT}"
 [ -s "$LIST" ] || exit 2
 
 if [ -z "$RP_ARTWORK_FETCH_COMMAND" ]; then
-    echo "Artwork search is on (ARTWORK_FETCH=yes) but no ARTWORK_FETCH_COMMAND is set,"
-    echo "so there is nothing to ask. See retroplay.conf.example for what to put there."
-    exit 4
+    rp_error "artwork search is on (ARTWORK_FETCH=yes) but no ARTWORK_FETCH_COMMAND is set"
+    rp_info  "  There is nothing to ask. retroplay.conf.example shows what to put there."
+    exit "$RP_EXIT_CONFIG"
 fi
-if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import PIL' 2>/dev/null; then
-    echo "Artwork search needs python3 with Pillow to make the IFF files."
-    echo "  Linux:  sudo apt install python3-pil"
-    echo "  macOS:  pip3 install pillow"
-    exit 4
+# python3 + Pillow are what turn a downloaded picture into an Amiga IFF.
+# Both checks keep their output to themselves: a missing module otherwise
+# prints an ImportError traceback in front of the explanation.
+if ! command -v python3 >/dev/null 2>&1; then
+    rp_error "artwork search needs python3, which is not installed"
+    rp_info  "  Linux:  sudo apt install python3 python3-pil"
+    rp_info  "  macOS:  brew install python3 && pip3 install pillow"
+    exit "$RP_EXIT_CONFIG"
+fi
+if ! python3 -c 'import PIL' >/dev/null 2>&1; then
+    rp_error "artwork search needs the Pillow library for python3, which is not installed"
+    rp_info  "  Linux:  sudo apt install python3-pil"
+    rp_info  "  macOS:  pip3 install pillow"
+    exit "$RP_EXIT_CONFIG"
 fi
 
 # A picture to copy the size and colour depth from: any artwork already
@@ -91,17 +100,28 @@ REF="$(reference_iff || true)"
 GEOM=(--width 320 --height 128 --planes 8)
 [ -n "$REF" ] && GEOM=(--like "$REF")
 
-echo
-echo "===== Looking for artwork the packs don't have ====="
-echo "  Games without artwork: $(grep -c . "$LIST")   (will try up to $LIMIT this run)"
-[ -n "$REF" ] && echo "  Matching the size and colours of: ${REF#$RP_ARTWORK_ROOT/}"
-echo "  Asking: $RP_ARTWORK_FETCH_COMMAND"
-[ "$DRY" -eq 1 ] && echo "  (dry run - nothing will be fetched or written)"
+rp_heading "Looking for artwork the packs don't have"
+rp_info "  Games without artwork: $(grep -c . "$LIST")   (will try up to $LIMIT this run)"
+[ -n "$REF" ] && rp_info "  Matching the size and colours of: ${REF#$RP_ARTWORK_ROOT/}"
+rp_info "  Asking: $RP_ARTWORK_FETCH_COMMAND"
+[ "$DRY" -eq 1 ] && rp_info "  (dry run - nothing will be fetched or written)"
 
 FOUND=0; FAILED=0; TRIED=0
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/artfetch.XXXXXX")" || exit 1
-trap 'rm -rf "$TMP"' EXIT
-trap 'echo; echo "Interrupted - nothing further was changed."; exit 130' INT TERM
+# Purpose:       leave nothing of this run behind, however it ended.
+# Assumptions:   TMP is this run's own scratch folder, made by mktemp -d.
+# Side effects:  removes TMP. Artwork already installed is left in place: each
+#                file is only copied once it has been converted whole.
+cleanup_fetch() {
+    local st=$?
+    trap - EXIT INT TERM
+    pkill -P $$ 2>/dev/null || true     # the fetch command may still be running
+    wait 2>/dev/null || true
+    rm -rf -- "$TMP"
+    exit "$st"
+}
+trap cleanup_fetch EXIT
+trap 'printf "\n"; rp_warn "interrupted - nothing further was changed"; exit 130' INT TERM
 
 total="$(grep -c . "$LIST")"
 [ "$total" -gt "$LIMIT" ] && total="$LIMIT"
@@ -126,7 +146,9 @@ while IFS= read -r rel; do
         FAILED=$((FAILED + 1)); continue
     fi
     # Make sure it really is a picture before doing anything with it.
-    if ! python3 -c 'import sys;from PIL import Image;Image.open(sys.argv[1]).verify()' "$img" 2>/dev/null; then
+    # Pillow's verify() raises for anything that is not a readable image; the
+    # traceback is of no use to the person watching, so only the verdict is kept.
+    if ! python3 -c 'import sys;from PIL import Image;Image.open(sys.argv[1]).verify()' "$img" >/dev/null 2>&1; then
         printf ' what came back was not an image - ignored\n'
         FAILED=$((FAILED + 1)); continue
     fi
@@ -145,19 +167,30 @@ while IFS= read -r rel; do
     if [ -d "$game_dir" ] && [ ! -e "$game_dir/iGame.iff" ]; then
         cp -f "$iff" "$game_dir/iGame.iff" 2>/dev/null
     fi
-    printf ' found - converted and installed (%s)\n' "$(python3 - "$iff" << 'PY'
+    # Describe what was written, from the IFF's own BMHD header. This is
+    # cosmetic: if the header cannot be read, say so rather than letting a
+    # Python traceback land in the middle of the line.
+    # Inputs:  $iff, a file to_ilbm.py has just written.
+    # Outputs: "320x128, 256 colours", or "size unknown".
+    # Side effects: none.
+    geom="$(python3 - "$iff" 2>/dev/null << 'PY'
 import sys, struct
-d = open(sys.argv[1], 'rb').read(32)
-w, h = struct.unpack('>HH', d[20:24]); print("%dx%d, %d colours" % (w, h, 1 << d[28]))
+with open(sys.argv[1], 'rb') as fh:
+    d = fh.read(32)
+if len(d) < 32:
+    raise SystemExit(1)
+w, h = struct.unpack('>HH', d[20:24])
+print("%dx%d, %d colours" % (w, h, 1 << d[28]))
 PY
-)"
+)" || geom=""
+    printf ' found - converted and installed (%s)\n' "${geom:-size unknown}"
     FOUND=$((FOUND + 1))
 done < "$LIST"
 
 echo
-echo "  Artwork found and installed: $FOUND"
-echo "  Still without artwork:       $FAILED"
-[ "$FOUND" -gt 0 ] && echo "  Saved in artwork/iGame_art/ so later artwork updates keep them."
+rp_info "  Artwork found and installed: $FOUND"
+rp_info "  Still without artwork:       $FAILED"
+[ "$FOUND" -gt 0 ] && rp_info "  Saved in artwork/iGame_art/ so later artwork updates keep them."
 # Results go in a key=value file, never scraped back out of the text above:
 # rewording a console message must not be able to change a reported figure.
 # RP_RESULT_FILE is set by the caller (all.sh); the copy in the state folder

@@ -1220,6 +1220,42 @@ rp_dir_fingerprint() {
 # beside the collection (so the swap is a rename in one folder, which is
 # instant and atomic) and both start with a dot, so they can never be mistaken
 # for a collection by the retro_* globs in rp_default_collection and friends.
+# --------------------------------------------------------------- locales ---
+# Pick a locale that this machine actually has.
+#
+# Purpose:       return the first name from the candidates that `locale -a`
+#                lists, so nothing ever forces a locale that is not generated.
+# Assumptions:   `locale` may be missing entirely (some minimal images); then
+#                only the POSIX default is safe.
+# Inputs:        candidate locale names, best first.
+# Outputs:       the chosen name on stdout, or nothing if none of them exist.
+# Side effects:  none. The lookup is done once and cached in RP_LOCALE_LIST.
+#
+# Why this exists: extract.sh used to export LANG/LC_ALL=en_AU.UTF-8 outright.
+# On a Raspberry Pi that had only C.UTF-8 and en_US.ISO-8859-1 - which is
+# exactly what setup.sh generates - every subprocess printed
+# "setlocale: LC_ALL: cannot change locale (en_AU.UTF-8)", two lines per
+# archive, straight through the progress bar.
+RP_LOCALE_LIST=""
+rp_locale_list() {
+    [ -n "$RP_LOCALE_LIST" ] && { printf '%s' "$RP_LOCALE_LIST"; return 0; }
+    if command -v locale >/dev/null 2>&1; then
+        RP_LOCALE_LIST="$(locale -a 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '-' | tr '\n' ' ')"
+    fi
+    RP_LOCALE_LIST="${RP_LOCALE_LIST:- }"
+    printf '%s' "$RP_LOCALE_LIST"
+}
+rp_pick_locale() {
+    local want have norm
+    have=" $(rp_locale_list) "
+    for want in "$@"; do
+        # locale -a prints en_US.iso88591 for what is written en_US.ISO-8859-1
+        norm="$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]' | tr -d '-')"
+        case "$have" in *" $norm "*) printf '%s' "$want"; return 0 ;; esac
+    done
+    return 1
+}
+
 # ----------------------------------------------------------------- jobs ---
 # How many things to do at once. "auto" keeps exactly what each stage worked
 # out for itself before this setting existed (CPU count, capped, then capped
