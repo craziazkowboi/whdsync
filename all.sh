@@ -60,10 +60,14 @@ usage() {
 Usage: all.sh [options]
 
 Builds or updates every variant listed in VARIANTS (retroplay.conf; default
-"aga ecs rtg") - or just the ones you name - extracting archives only once.
+"aga ecs rtg aga-laced ecs-laced") - or just the ones you name - extracting
+archives only once. Each collection needs its own room on the drive; set
+VARIANTS in retroplay.conf to build fewer of them.
 
 Choosing variants (default: VARIANTS from retroplay.conf):
   --aga --ecs --rtg --aga-laced --ecs-laced   Pick variants (repeatable)
+  --laced               Build the laced form of each AGA/ECS variant picked
+  --all                 Every variant: aga, ecs, rtg, aga-laced, ecs-laced
   --set NAME            Use the iGame_NAME artwork set as a variant
   --variants "a b c"    Give the whole list at once
   --dest PATH           Custom output folder (only with a single variant)
@@ -112,7 +116,8 @@ rp_render_args() {
     printf '%s' "${out# }"
 }
 ORIG_ARGS="$(rp_render_args ${1+"$@"})"
-VARIANT_ARGS=""; DEST_OVERRIDE=""
+VARIANT_ARGS=""; DEST_OVERRIDE=""; WANT_LACED=0
+vstart=0            # when the collection being worked on started (see variant_row)
 CLEAN=0; SKIP_UPDATE=0; FORCE=0
 REFRESH_ART=0        # --refresh-artwork: replace artwork already in the collection
 PREVIEW_ONLY=0       # --preview-new: save the dated batch, do not install it
@@ -123,6 +128,11 @@ while [ $# -gt 0 ]; do
     opt="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
     case "$opt" in
         --aga|--ecs|--rtg|--aga-laced|--ecs-laced) VARIANT_ARGS="$VARIANT_ARGS ${opt#--}"; shift ;;
+        # --laced is a modifier, not a variant: it turns each plain AGA/ECS
+        # choice into its laced counterpart. It is applied after parsing, so
+        # it works whether it comes before or after --aga.
+        --laced)     WANT_LACED=1; shift ;;
+        --all)       VARIANT_ARGS="$VARIANT_ARGS aga ecs rtg aga-laced ecs-laced"; shift ;;
         --set)       rp_require_option_value "$1" "$#" "${2-}"; VARIANT_ARGS="$VARIANT_ARGS $2"; shift 2 ;;
         --variants)  rp_require_option_value "$1" "$#" "${2-}"; VARIANT_ARGS="$VARIANT_ARGS $2"; shift 2 ;;
         --variant)   rp_require_option_value "$1" "$#" "${2-}"; VARIANT_ARGS="$VARIANT_ARGS $2"; shift 2 ;;
@@ -311,6 +321,21 @@ fail()      { fail_with 1 "$@"; }
 
 # ----- Resolve the variants -----
 V_TOK=(); V_DEST=(); V_KEY=(); V_EXCL=(); V_ART=(); V_NEW=(); V_MFLAGS=(); V_ACT=(); V_WHY=()
+# --laced rewrites the plain AGA/ECS choices into their laced counterparts
+# before anything else looks at the list. RTG has no laced pack, so it is
+# left as it is rather than silently dropped.
+if [ "$WANT_LACED" -eq 1 ]; then
+    _laced_in="${VARIANT_ARGS:-$RP_VARIANTS}"; _laced_out=""
+    for _lt in $(printf '%s' "$_laced_in" | tr ',' ' '); do
+        case "$(printf '%s' "$_lt" | tr '[:upper:]' '[:lower:]')" in
+            aga) _lt="aga-laced" ;;
+            ecs) _lt="ecs-laced" ;;
+        esac
+        _laced_out="$_laced_out $_lt"
+    done
+    VARIANT_ARGS="$_laced_out"
+    unset _laced_in _laced_out _lt
+fi
 for tok in $(printf '%s' "${VARIANT_ARGS:-$RP_VARIANTS}" | tr ',' ' '); do
     tok="$(printf '%s' "$tok" | tr '[:upper:]' '[:lower:]')"
     # A typo such as "agaa" would otherwise quietly build retro_agaa with
@@ -333,6 +358,10 @@ for tok in $(printf '%s' "${VARIANT_ARGS:-$RP_VARIANTS}" | tr ',' ' '); do
     V_TOK+=("$tok")
 done
 [ "${#V_TOK[@]}" -gt 0 ] || rp_die "$RP_EXIT_CONFIG" "no variants to build (check VARIANTS in retroplay.conf)."
+# Say out loud how many collections this run will produce. Each one is a full
+# copy on the drive, so "why is this taking all night" and "why is the disk
+# full" both start here.
+rp_info "Collections this run: ${V_TOK[*]}   (set VARIANTS in retroplay.conf to change)"
 if [ -n "$DEST_OVERRIDE" ] && [ "${#V_TOK[@]}" -gt 1 ]; then
     rp_die "$RP_EXIT_CONFIG" "--dest can only be used when building a single variant."
 fi
@@ -420,9 +449,19 @@ finish() {
         echo "======================== Summary ========================"
         cat "$REPORT_DIR/$RUN_TS.txt"
         echo "(saved as reports/$RUN_TS.txt)"
-        # keep the newest 60 reports
-        ls -1 "$REPORT_DIR"/*.txt 2>/dev/null | sort | awk -v n="$(ls -1 "$REPORT_DIR"/*.txt 2>/dev/null | grep -c .)" 'NR <= n - 60' | \
-            while IFS= read -r old; do rm -f "$old" "${old%.txt}"_*; done
+        # Keep the newest 60 reports. Report names are timestamps, so the
+        # shell's own glob order is the chronological one.
+        _rep_total="$(rp_count_matching "$REPORT_DIR/*.txt")"
+        if [ "$_rep_total" -gt 60 ]; then
+            _rep_n=0
+            for _rep in "$REPORT_DIR"/*.txt; do
+                [ -e "$_rep" ] || continue
+                _rep_n=$((_rep_n + 1))
+                [ "$_rep_n" -le $((_rep_total - 60)) ] || break
+                rm -f -- "$_rep" "${_rep%.txt}"_*
+            done
+        fi
+        unset _rep _rep_n _rep_total
     fi
     [ -n "${ARTWORK_NOTE:-}" ] && result="$result ($ARTWORK_NOTE)"
     body="$(cat "$REPORT_DIR/$RUN_TS.txt" 2>/dev/null)"
@@ -685,6 +724,53 @@ rescue_extract_log() {
     fi
 }
 
+# stage_failed <exit status> <what failed> <log heading>
+# Every stage failure says the same four things: which stage, the exit status
+# and what it means, that the previous collection is untouched, and where the
+# details are. "ERROR: sorting failed" said none of them, and nothing reached
+# the logs either.
+stage_failed() {
+    local rc="$1" what="$2" heading="$3"
+    collect_stage_logs "$heading" || true
+    mkdir -p "$RP_LOG_ROOT" 2>/dev/null
+    {
+        printf '===== %s failed =====\n' "$what"
+        printf '%s  exit status %s (%s)\n' "$(rp_ts)" "$rc" "$(rp_exit_meaning "$rc")"
+        printf 'The collection in %s was not changed; the archives stay queued.\n\n' "$RP_BUILD_ROOT"
+    } >> "$RP_LOG_ROOT/retroerror.log"
+    {
+        echo
+        echo "$what failed with exit status $rc ($(rp_exit_meaning "$rc"))."
+        echo "  Nothing in $RP_BUILD_ROOT was changed, and the archives stay queued for the next run."
+        echo "  Details: $RP_LOG_ROOT/retroerror.log"
+        echo "  The stage's own last message, just above this, usually names the cause."
+    } >&2
+    fail "$what failed (exit $rc) - see logs/retroerror.log"
+}
+
+# all.sh calls the stage scripts directly rather than through start.sh, so the
+# log gathering start.sh does at the end of a manual run never happens here.
+# Without this, retroerror.log stayed empty for a pipeline run and the summary
+# cheerfully reported "No errors logged" after a stage had written a full page
+# of them. Each stage log is appended under its own heading and then removed,
+# so the next stage's errors cannot be mistaken for this one's.
+collect_stage_logs() {   # collect_stage_logs <heading>
+    local f name found=0
+    for f in "$RP_LOG_ROOT"/extract_errors.log "$RP_LOG_ROOT"/merge_errors.log \
+             "$RP_LOG_ROOT"/sort.log "$RP_LOG_ROOT"/amiga_filename_issues.log; do
+        [ -s "$f" ] || { rm -f -- "$f"; continue; }
+        name="${f##*/}"
+        {
+            printf '===== %s%s =====\n' "$name" "${1:+  ($1)}"
+            cat "$f"
+            printf '\n'
+        } >> "$RP_LOG_ROOT/retroerror.log"
+        rm -f -- "$f"
+        found=1
+    done
+    return "$((1 - found))"
+}
+
 # Safety net: an extracted tree must only contain the archive folders at
 # its top level. Anything else (e.g. a whole absolute path such as
 # Users/<you>/Downloads/Amiga recreated inside it) means the extraction went
@@ -830,6 +916,9 @@ save_missing_list() {   # <index> <missing-list-file> ; prints the count
 # ============================================================================
 # 3. Full builds - every archive extracted and sorted ONCE for all of them
 # ============================================================================
+# The run announces five steps; this is the fifth, and it never said so. On a
+# long build that left the display stuck on "[4/5] Plan" for the entire job.
+rp_step 5 "$TOTAL_STEPS" "Building the collections"
 FULL=()
 for i in "${!V_TOK[@]}"; do [ "${V_ACT[$i]}" = full ] && FULL+=("$i"); done
 # A preview shows what the NEW archives would add. A collection that does not
@@ -876,7 +965,8 @@ if [ "${#FULL[@]}" -gt 0 ]; then
     fi
     mkdir -p "$COMMON"
     echo "--- Sorting and checking filenames ---"
-    sort_folder "$COMMON" || fail "sorting failed"
+    sort_folder "$COMMON" || stage_failed "$?" "sorting the extracted games" "sort"
+    collect_stage_logs "sort" || true
     check_layout "$COMMON"
 
     # One "extra" part per distinct set of left-out tags that isn't "all of
@@ -897,7 +987,8 @@ if [ "${#FULL[@]}" -gt 0 ]; then
             run_extract "$WORK_ROOT/failed_fresh.list" -u -d "$WORK_ROOT/extra_$n" --only-tags "$ALL_EXCL" $DEBUG_FLAG
         fi
         mkdir -p "$WORK_ROOT/extra_$n"
-        sort_folder "$WORK_ROOT/extra_$n" || fail "sorting failed"
+        sort_folder "$WORK_ROOT/extra_$n" || stage_failed "$?" "sorting the releases only some variants get (extra_$n)" "sort"
+        collect_stage_logs "sort" || true
         check_layout "$WORK_ROOT/extra_$n"
     done
 
@@ -908,6 +999,10 @@ if [ "${#FULL[@]}" -gt 0 ]; then
         extra=""
         for n in ${EXTRA_SET[@]+"${!EXTRA_SET[@]}"}; do [ "${EXTRA_SET[$n]}" = "${V_EXCL[$i]}" ] && extra="${EXTRA_DIR[$n]}"; done
         echo
+        # When this collection's own work starts. ${vstart:-$SECONDS} was the
+        # fallback for a variable nothing ever set, so every "Time" in the
+        # summary came out as zero.
+        vstart=$SECONDS
         echo "===== $key: installing and adding artwork ====="
         # The last variant MOVES the shared tree rather than copying it, so only
         # the extras need room. Work out which measurement is wanted first and
@@ -935,7 +1030,8 @@ if [ "${#FULL[@]}" -gt 0 ]; then
         fi
         [ -n "$extra" ] && { cp -a "$extra/." "$staged/" || fail "could not copy the $ALL_EXCL releases into $staged"; }
         miss="$REPORT_TMP.missing"; : > "$miss"
-        merge_variant "$i" "$staged" --report-missing "$miss" || fail "adding artwork to $key failed"
+        merge_variant "$i" "$staged" --report-missing "$miss" || stage_failed "$?" "adding artwork to $key" "$key"
+        collect_stage_logs "$key" || true
         # Everything is in place and merged: now, and only now, the previous
         # collection is replaced - two renames in one folder, so the moment
         # where neither is complete is as short as the filesystem can make it.
@@ -1049,7 +1145,8 @@ for g in ${G_SIG[@]+"${!G_SIG[@]}"}; do
     nfailed="$(grep -c . "$failed_rels" 2>/dev/null)"; nfailed="${nfailed:-0}"
     mkdir -p "$batch"
     echo "--- Sorting and checking filenames ---"
-    sort_folder "$batch" || fail "sorting the new archives failed"
+    sort_folder "$batch" || stage_failed "$?" "sorting the new archives" "sort (new batch)"
+    collect_stage_logs "sort (new batch)" || true
     mkdir -p "$batch"          # sort.sh removes empty folders
     check_layout "$batch"
     bgames="$(rp_count_games "$batch")"
@@ -1067,6 +1164,7 @@ for g in ${G_SIG[@]+"${!G_SIG[@]}"}; do
         remaining=$((remaining - 1))
         key="${V_KEY[$i]}"; dest="${V_DEST[$i]}"; vcopy="$WORK_ROOT/v_$key"
         echo
+        vstart=$SECONDS
         echo "===== $key: adding artwork and installing the new batch ====="
         if [ "$remaining" -eq 0 ]; then
             mv "$batch" "$vcopy" || fail "could not prepare the batch for $key"
@@ -1074,7 +1172,8 @@ for g in ${G_SIG[@]+"${!G_SIG[@]}"}; do
             cp -a "$batch" "$vcopy" || fail "could not prepare the batch for $key"
         fi
         miss="$REPORT_TMP.missing"; : > "$miss"
-        merge_variant "$i" "$vcopy" --report-missing "$miss" || fail "adding artwork to the new batch for $key failed"
+        merge_variant "$i" "$vcopy" --report-missing "$miss" || stage_failed "$?" "adding artwork to the new batch for $key" "$key (new batch)"
+        collect_stage_logs "$key (new batch)" || true
         if [ "$PREVIEW_ONLY" -eq 1 ]; then
             rp_info "  preview only - $key itself was not changed"
         else
@@ -1105,7 +1204,7 @@ for g in ${G_SIG[@]+"${!G_SIG[@]}"}; do
             [ "$REFRESH_ART" -eq 1 ] && gapmode=""      # every game, not just the gaps
             echo "  refreshing artwork for $key..."
             # shellcheck disable=SC2086
-            if merge_variant "$i" "$dest" $gapmode; then rp_gapfill_done "$key"
+            if merge_variant "$i" "$dest" $gapmode; then collect_stage_logs "$key (gap-fill)" || true; rp_gapfill_done "$key"
             else gapnote=" (artwork gap-fill reported errors - see retroerror.log)"; fi
         fi
         if [ "$PREVIEW_ONLY" -eq 0 ]; then
@@ -1137,6 +1236,7 @@ done
 for i in "${!V_TOK[@]}"; do
     [ "${V_ACT[$i]}" = gapfill ] || continue
     echo
+    vstart=$SECONDS
     echo "===== ${V_KEY[$i]}: artwork gap-fill ====="
     if [ "$REFRESH_ART" -eq 1 ]; then
         echo "  refreshing artwork for ${V_KEY[$i]} (every game)..."
@@ -1147,7 +1247,8 @@ for i in "${!V_TOK[@]}"; do
     fi
     miss="$REPORT_TMP.missing"; : > "$miss"
     # shellcheck disable=SC2086
-    merge_variant "$i" "${V_DEST[$i]}" $gapmode --report-missing "$miss" || fail "artwork gap-fill for ${V_KEY[$i]} failed"
+    merge_variant "$i" "${V_DEST[$i]}" $gapmode --report-missing "$miss" || stage_failed "$?" "the artwork gap-fill for ${V_KEY[$i]}" "${V_KEY[$i]} (gap-fill)"
+    collect_stage_logs "${V_KEY[$i]} (gap-fill)" || true
     rp_gapfill_done "${V_KEY[$i]}"
     mark_success "${V_KEY[$i]}"
     fetch_missing_artwork "$i" "$miss"
@@ -1169,7 +1270,7 @@ offer_backup_cleanup() {
     mb=$(( kb / 1024 ))
     echo
     echo "Saved backups are using ${mb} MB:"
-    [ -d "$RP_BACKUP_DIR" ] && echo "  $(ls -1 "$RP_BACKUP_DIR"/state-*.tgz 2>/dev/null | grep -c .) state backup(s)   ${RP_BACKUP_DIR##*/}/"
+    [ -d "$RP_BACKUP_DIR" ] && echo "  $(rp_count_matching "$RP_BACKUP_DIR/state-*.tgz") state backup(s)   ${RP_BACKUP_DIR##*/}/"
     [ -d "$RP_STATE_DIR/artwork/backups" ] && echo "  previous artwork versions   .retroplay/artwork/backups/"
     printf 'Delete them? (rollback of artwork won'"'"'t be possible afterwards) [y/N] '
     reply=""

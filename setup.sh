@@ -34,6 +34,8 @@ for a in "$@"; do
         --dry-run) DRY=1 ;;
         --cron)    CRON_CHOICE=yes ;;
         --no-cron) CRON_CHOICE=no ;;
+        --quiet|--verbose|--no-color|--no-colour|--color=*|--colour=*)
+            rp_common_opt "$a" >/dev/null ;;
         -h|--help) sed -n '4,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "Unknown option: $a (try --help)" >&2; exit 4 ;;
     esac
@@ -41,10 +43,14 @@ done
 
 OS="${RP_SETUP_OS:-$(uname -s | tr '[:upper:]' '[:lower:]')}"
 PROBLEMS=0
-step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
-ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
-note() { printf '  \033[33m!\033[0m %s\n' "$*"; }
-bad()  { PROBLEMS=$((PROBLEMS + 1)); printf '  \033[31m✗\033[0m %s\n' "$*"; }
+# Colours through lib.sh's one decision, so NO_COLOR, --color and "output is
+# being redirected to a file" are honoured here exactly as everywhere else.
+# These used to be raw escape sequences, which meant a piped setup log came
+# out full of control characters.
+step() { printf '\n%s== %s%s\n' "$RP_C_HEAD" "$*" "$RP_C_OFF"; }
+ok()   { printf '  %s✓%s %s\n' "$RP_C_OK" "$RP_C_OFF" "$*"; }
+note() { printf '  %s!%s %s\n' "$RP_C_WARN" "$RP_C_OFF" "$*"; }
+bad()  { PROBLEMS=$((PROBLEMS + 1)); printf '  %s✗%s %s\n' "$RP_C_ERR" "$RP_C_OFF" "$*"; }
 run()  { echo "  + $*"; [ "$DRY" -eq 1 ] || "$@"; }
 # ask <question> <default> -> answer (the default when --yes or unattended)
 ask() {
@@ -320,7 +326,7 @@ if [ -x "$SCRIPT_DIR/artwork_sync.sh" ]; then
 fi
 
 # ---------------------------------------------------------------- 7. nightly
-step "6. Nightly update"
+step "7. Nightly update"
 if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -q "retroplay-all-sh"; then
     ok "nightly run already installed"
     # refresh it so it remembers this terminal's PATH and uses --cron

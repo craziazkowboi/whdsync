@@ -12,8 +12,10 @@ RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
 #   Remote listing at ARTWORK_SOURCE_URL; settings from retroplay.conf.
 #
 # Outputs / side effects:
-#   Archive cache   <script dir>/artwork_archive/<name>.lha
-#   Live artwork    <script dir>/iGame_<suffix>/ , <script dir>/TinyLauncher/
+#   Archive cache   $RP_ARTWORK_CACHE/<name>.lha      (downloads/artwork_archives)
+#   Live artwork    $RP_ARTWORK_ROOT/iGame_<suffix>/ , $RP_ARTWORK_ROOT/TinyLauncher/
+#                   (artwork/ by default - NOT beside the scripts; that was
+#                    the pre-migration layout and rp_migrate_layout moves it)
 #   State           <state>/artwork/{manifests,remote_cache,work,backups}
 #
 # Safety contract:
@@ -443,9 +445,8 @@ install_pack() {   # <archive> <target path, may contain />
         [ -d "$backup" ] && [ ! -d "$live" ] && mv "$backup" "$live"
         FAILED=$((FAILED + 1)); return 5
     fi
-    # keep only the newest few backups
-    ls -1d "$BACKUP_DIR/$key"/*/ 2>/dev/null | sort -r | awk -v k="$RP_ARTWORK_KEEP_BACKUPS" 'NR > k' \
-        | while IFS= read -r old; do rm -rf "$old"; done
+    # keep only the newest few backups (their names are timestamps)
+    rp_prune_oldest "$RP_ARTWORK_KEEP_BACKUPS" "$BACKUP_DIR/$key/*/"
 
     mkdir -p "$MANIFEST_DIR" "$CHANGED_LIST" 2>/dev/null
     printf 'archive=%s\nfingerprint=%s\nsha256=%s\nremote_size=%s\nremote_date=%s\ninstalled_at=%s\nbackup=%s\n' \
@@ -600,7 +601,7 @@ cmd_rollback() {
     local t="$1" live backups newest ts
     case "$t" in [Tt]iny*) t=TinyLauncher ;; iGame_*) ;; *) t="iGame_$t" ;; esac
     live="$RP_ARTWORK_ROOT/$t"
-    newest="$(ls -1d "$BACKUP_DIR/$(target_key "$t")"/*/ 2>/dev/null | sort | tail -1)"
+    newest="$(rp_newest_matching "$BACKUP_DIR/$(target_key "$t")/*/" || true)"
     [ -n "$newest" ] || { rp_warn "no saved previous version of $t to go back to"; return 2; }
     echo "Roll back $t"
     echo "  Restore:  ${newest%/}"

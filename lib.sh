@@ -54,7 +54,7 @@ DEP_TRACK_FILE="$RP_BASE_DIR/.retroplay_installed_deps.log"
 # whatever the config file says.
 rp_load_config() {
     # Built-in defaults (used when there is no config file, or a key is absent)
-    RP_VARIANTS="aga ecs rtg"
+    RP_VARIANTS="aga ecs rtg aga-laced ecs-laced"
     RP_OUTPUT_ROOT="."
     RP_ART_ORDER="Screens,Covers,Titles"        # default for every variant...
     RP_ART_ORDER_RTG="Covers,Screens,Titles"    # ...except RTG
@@ -80,8 +80,11 @@ rp_load_config() {
     RP_ARTWORK_SOURCE_URL="https://ftp2.grandis.nu/turran/FTP/Collection/Various/WHDLoad_Images"
     RP_ARTWORK_ARCHIVE_DIR="artwork_archive"
     RP_ARTWORK_STATE_ROOT=""
-    RP_ARTWORK_PACKS="AGA ECS RTG"
-    RP_ARTWORK_OPTIONAL_PACKS="AGA_Laced ECS_Laced art TinyLauncher"
+    # Kept in step with RP_VARIANTS above: a variant whose artwork pack is not
+    # fetched is built from the fallback chain instead, which for aga-laced
+    # means it quietly comes out identical to plain AGA.
+    RP_ARTWORK_PACKS="AGA ECS RTG AGA_Laced ECS_Laced"
+    RP_ARTWORK_OPTIONAL_PACKS="art TinyLauncher"
     RP_ARTWORK_KEEP_BACKUPS="2"
     RP_ARTWORK_LOCAL_CHANGE_POLICY="ask"
     RP_ARTWORK_VERIFY_DOWNLOADS="yes"
@@ -102,16 +105,27 @@ rp_load_config() {
     RP_UPDATE_CHECK_URL="https://api.github.com/repos/craziazkowboi/whdsync/releases/latest"
     RP_UPDATE_CHECK_INTERVAL_HOURS="24"
     RP_STATE_BACKUP_MAX_MB="50"   # if yes: skip when it would exceed this
+    RP_NICE="auto"                # be gentle in unattended runs: auto | no
     RP_CONFIG_WARNINGS=""
 
     [ -f "$RP_CONF_FILE" ] || { rp_finish_config; return 0; }
 
-    local line key val lineno=0
+    # Comment rule, in full, because getting it wrong silently truncates
+    # settings:
+    #   * a line whose first non-blank character is # is a comment;
+    #   * inside a quoted value, # is an ordinary character - an ntfy topic
+    #     "retro#build" or a path with a # in it stays intact;
+    #   * in an unquoted value, a # that follows whitespace starts a comment,
+    #     so  JOBS=4   # four at a time  still works.
+    # This used to be a plain ${line%%#*}, which cut every value at its first
+    # # wherever it appeared, quotes and all.
+    local line key val lineno=0 rest q
     while IFS= read -r line || [ -n "$line" ]; do
         lineno=$((lineno + 1))
-        line="${line%%#*}"                       # strip comments
         line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-        [ -z "$line" ] && continue
+        case "$line" in
+            ''|'#'*) continue ;;                 # blank line or whole-line comment
+        esac
         case "$line" in
             *=*) ;;
             *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}line $lineno: not KEY=VALUE, ignored
@@ -120,8 +134,23 @@ rp_load_config() {
         key="$(printf '%s' "${line%%=*}" | sed 's/[[:space:]]*$//')"
         val="$(printf '%s' "${line#*=}" | sed 's/^[[:space:]]*//')"
         case "$val" in
-            \"*\") val="${val#\"}"; val="${val%\"}" ;;
-            \'*\') val="${val#\'}"; val="${val%\'}" ;;
+            \"*|\'*)
+                # Quoted: the value runs to the matching quote, and whatever
+                # follows it is a trailing comment we simply drop.
+                q="${val%"${val#?}"}"            # the opening quote character
+                rest="${val#?}"                  # everything after it
+                case "$rest" in
+                    *"$q"*) val="${rest%%"$q"*}" ;;
+                    *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}line $lineno: '$key' has an opening $q with no closing one - using the rest of the line
+"
+                       val="$rest" ;;
+                esac ;;
+            *)
+                # Unquoted: only a # that follows a space or tab is a comment.
+                case "$val" in
+                    *[[:space:]]#*) val="${val%%[[:space:]]#*}" ;;
+                esac
+                val="$(printf '%s' "$val" | sed 's/[[:space:]]*$//')" ;;
         esac
         case "$key" in
             VARIANTS|OUTPUT_ROOT|ART_ORDER|DEMO_ART_ORDER|FILESYSTEM|USE_DETOX|\
@@ -132,7 +161,7 @@ rp_load_config() {
             ARTWORK_OPTIONAL_PACKS|ARTWORK_KEEP_BACKUPS|ARTWORK_LOCAL_CHANGE_POLICY|\
             ARTWORK_VERIFY_DOWNLOADS|ARTWORK_FAILURE_POLICY|ARTWORK_CHECK_INTERVAL_HOURS|\
             ARTWORK_FETCH|ARTWORK_FETCH_COMMAND|ARTWORK_FETCH_LIMIT|\
-            ARTWORK_DIR|BUILD_DIR|DOWNLOAD_DIR|LOG_DIR|LOG_RETENTION_DAYS|STATE_BACKUP_MAX_MB|STATE_BACKUP|PROGRESS_STYLE|\
+            ARTWORK_DIR|BUILD_DIR|DOWNLOAD_DIR|LOG_DIR|LOG_RETENTION_DAYS|STATE_BACKUP_MAX_MB|STATE_BACKUP|PROGRESS_STYLE|NICE|\
             JOBS|EXTRACT_JOBS|MERGE_JOBS|SORT_JOBS|\
             UPDATE_CHECK|UPDATE_CHECK_URL|UPDATE_CHECK_INTERVAL_HOURS|REPO_URL)
                 printf -v "RP_$key" '%s' "$val" ;;
@@ -154,7 +183,8 @@ rp_finish_config() {
     # became 0 and turned the daily artwork check into an every-run check.
     for n in MIN_FREE_MB SPACE_FACTOR KEEP_NEW_BATCHES OLD_ARCHIVE_DAYS LOG_MAX_MB LOG_KEEP \
              MAX_EXTRACT_ATTEMPTS DOWNLOAD_RETRIES GAPFILL_DAYS LOG_RETENTION_DAYS \
-             ARTWORK_CHECK_INTERVAL_HOURS ARTWORK_KEEP_BACKUPS ARTWORK_FETCH_LIMIT STATE_BACKUP_MAX_MB; do
+             ARTWORK_CHECK_INTERVAL_HOURS ARTWORK_KEEP_BACKUPS ARTWORK_FETCH_LIMIT STATE_BACKUP_MAX_MB \
+             UPDATE_CHECK_INTERVAL_HOURS; do
         ref="RP_$n"
         case "${!ref}" in
             ''|*[!0-9]*)
@@ -167,6 +197,7 @@ rp_finish_config() {
     : "${RP_OLD_ARCHIVE_DAYS:=30}" "${RP_LOG_MAX_MB:=5}" "${RP_LOG_KEEP:=4}"
     : "${RP_MAX_EXTRACT_ATTEMPTS:=3}" "${RP_DOWNLOAD_RETRIES:=3}" "${RP_GAPFILL_DAYS:=7}"
     : "${RP_ARTWORK_FETCH_LIMIT:=25}" "${RP_ARTWORK_KEEP_BACKUPS:=2}" "${RP_ARTWORK_CHECK_INTERVAL_HOURS:=24}" "${RP_LOG_RETENTION_DAYS:=1}" "${RP_STATE_BACKUP_MAX_MB:=50}"
+    : "${RP_UPDATE_CHECK_INTERVAL_HOURS:=24}"
     # Artwork settings: check the words, and the pack names for anything unsafe.
     case "$RP_ARTWORK_SYNC" in ask|auto|yes|no) ;; *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}ARTWORK_SYNC must be ask, auto, yes or no - using ask
 "; RP_ARTWORK_SYNC=ask ;; esac
@@ -175,6 +206,8 @@ rp_finish_config() {
     case "$RP_ARTWORK_FAILURE_POLICY" in warn-and-continue|fail) ;; *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}ARTWORK_FAILURE_POLICY must be warn-and-continue or fail - using warn-and-continue
 "; RP_ARTWORK_FAILURE_POLICY=warn-and-continue ;; esac
     case "$RP_ARTWORK_VERIFY_DOWNLOADS" in yes|no) ;; *) RP_ARTWORK_VERIFY_DOWNLOADS=yes ;; esac
+    case "$RP_NICE" in auto|no) ;; *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}NICE must be auto or no - using auto
+"; RP_NICE=auto ;; esac
     case "$RP_ARTWORK_FETCH" in yes|no) ;; *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}ARTWORK_FETCH must be yes or no - using no
 "; RP_ARTWORK_FETCH=no ;; esac
     case "$RP_ARTWORK_SOURCE_URL" in http://*|https://*|ftp://*) ;; *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}ARTWORK_SOURCE_URL must start with http://, https:// or ftp://
@@ -247,7 +280,7 @@ rp_art_order_for() {
     up="$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')"
     var="RP_ART_ORDER_$up"
     val="${!var:-}"
-    [ -n "$val" ] && printf '%s' "$val" || printf '%s' "$RP_ART_ORDER"
+    if [ -n "$val" ]; then printf '%s' "$val"; else printf '%s' "$RP_ART_ORDER"; fi
 }
 
 # ============================================================================
@@ -851,9 +884,9 @@ rp_progress() {   # rp_progress <current> <total> [label]
         [ "$cur" -ge "$tot" ] && printf '\n'
     else
         local bucket=$((pct / 25))
+        # Off a terminal: one line per 25% bucket, plus the first item.
         if [ "$cur" -le 1 ] || [ "$bucket" != "$RP_PROGRESS_LAST" ]; then
-            [ "$bucket" = "$RP_PROGRESS_LAST" ] && [ "$cur" -gt 1 ] || \
-                printf '[%s] %s: %d%% (%d/%d)\n' "$(rp_ts)" "$label" "$pct" "$cur" "$tot"
+            printf '[%s] %s: %d%% (%d/%d)\n' "$(rp_ts)" "$label" "$pct" "$cur" "$tot"
             RP_PROGRESS_LAST="$bucket"
         fi
     fi
@@ -865,7 +898,17 @@ rp_progress() {   # rp_progress <current> <total> [label]
 rp_atomic_write() {   # rp_atomic_write <file>   (content on stdin)
     local f="$1" tmp
     tmp="$(dirname "$f")/.$(basename "$f").tmp.$$"
-    cat > "$tmp" && mv -f "$tmp" "$f" || { rm -f "$tmp"; return 1; }
+    # Spelled out rather than "cat && mv || rm": this decides whether a queue
+    # or a state file survives a crash, and it should be readable at a glance.
+    if ! cat > "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if ! mv -f "$tmp" "$f"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    return 0
 }
 
 # ============================================================================
@@ -887,6 +930,7 @@ rp_test_notify() {
 # rp_print_status [short]: what the collection looks like right now.
 rp_print_status() {
     local short="${1:-}" v key dest q st last code when result ls free drive _mg _ms
+    local cron_line cron_min cron_hr
     printf 'Amiga Retroplay status  %s(v%s, release %s)%s\n' "$RP_C_DIM" "$RP_SUITE_VERSION" "$RP_RELEASE" "$RP_C_OFF"
     echo "  Settings:      $(rp_conf_in_use)"
     if [ -f "$RP_STATE_DIR/last_run" ]; then
@@ -921,8 +965,23 @@ rp_print_status() {
         echo "  Output folder: NOT AVAILABLE - $drive"
     fi
     [ -n "$short" ] && return 0
-    if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -q "retroplay-all-sh"; then
-        echo "  Nightly run:   installed (every night at 2am)"
+    # The schedule is read back OUT of the crontab rather than assumed: the
+    # time is configurable (install_cron.sh --time), so "2am" was simply wrong
+    # for anyone who had changed it.
+    if command -v crontab >/dev/null 2>&1; then
+        cron_line="$(crontab -l 2>/dev/null | grep -F "retroplay-all-sh" | head -1)"
+        [ -n "$cron_line" ] || cron_line="$(crontab -l 2>/dev/null | grep -F "whdsync-all-sh" | head -1)"
+    else
+        cron_line=""
+    fi
+    if [ -n "$cron_line" ]; then
+        cron_min="$(printf '%s' "$cron_line" | awk '{print $1}')"
+        cron_hr="$(printf '%s' "$cron_line" | awk '{print $2}')"
+        case "$cron_min$cron_hr" in
+            *[!0-9]*|'') echo "  Nightly run:   installed" ;;
+            *) printf '  Nightly run:   installed (every night at %02d:%02d)\n' \
+                   "$((10#$cron_hr))" "$((10#$cron_min))" ;;
+        esac
     else
         echo "  Nightly run:   not installed (./install_cron.sh)"
     fi
@@ -931,7 +990,13 @@ rp_print_status() {
     else
         echo "  Notifications: off (set NTFY_TOPIC or NOTIFY_EMAIL in retroplay.conf)"
     fi
-    last="$(ls -1 "$RP_REPORT_ROOT"/*.txt 2>/dev/null | grep -v '_no_artwork' | sort | tail -1)"
+    last=""
+    for _r in "$RP_REPORT_ROOT"/*.txt; do
+        [ -e "$_r" ] || continue
+        case "$_r" in *_no_artwork*) continue ;; esac
+        last="$_r"
+    done
+    unset _r
     [ -n "$last" ] && echo "  Last report:   reports/${last##*/}"
     return 0
 }
@@ -1084,7 +1149,7 @@ rp_backup_state() {
         -C "$RP_BASE_DIR" .retroplay 2>/dev/null \
         && mv -f "$RP_BACKUP_DIR/.state-new.tgz" "$RP_BACKUP_DIR/state-$(date '+%Y%m%d-%H%M%S').tgz"
     rm -f "$RP_BACKUP_DIR/.state-new.tgz"
-    ls -1 "$RP_BACKUP_DIR"/state-*.tgz 2>/dev/null | sort -r | awk 'NR > 7' | while IFS= read -r old; do rm -f "$old"; done
+    rp_prune_oldest 7 "$RP_BACKUP_DIR/state-*.tgz"
     return 0
 }
 
@@ -1094,7 +1159,7 @@ rp_backup_state() {
 rp_restore_state_if_lost() {
     local latest
     [ -d "$RP_STATE_DIR/complete" ] && return 0
-    latest="$(ls -1 "$RP_BACKUP_DIR"/state-*.tgz 2>/dev/null | sort | tail -1)"
+    latest="$(rp_newest_matching "$RP_BACKUP_DIR/state-*.tgz" || true)"
     [ -n "$latest" ] || return 0
     if tar -xzf "$latest" -C "$RP_BASE_DIR" 2>/dev/null; then
         echo "The state folder (.retroplay) was missing - restored it from ${latest##*/}."
@@ -1268,12 +1333,20 @@ rp_dir_fingerprint() {
 # children only, so the lha/wget/7z that a worker subshell actually launched
 # survives a Ctrl-C and keeps writing. This walks the tree instead.
 rp_child_pids() {   # direct children of <pid>, one per line
+    # ALWAYS returns 0. "No children" is a normal answer, not a failure - but
+    # pgrep reports it with exit 1, and in a script running under set -e
+    # (sort.sh) that exit 1 inside the cleanup trap ended the script with
+    # status 1 after it had finished its work. It showed up only on macOS:
+    # BSD pgrep leaves out its own ancestors, including the $(...) subshell it
+    # runs in, so it found nothing there, while Linux pgrep found that subshell
+    # and succeeded. The pipeline reported "sorting failed" and nothing else.
     if command -v pgrep >/dev/null 2>&1; then
-        pgrep -P "$1" 2>/dev/null
+        pgrep -P "$1" 2>/dev/null || true
     else
         # BSD and GNU ps both understand this form.
-        ps -ax -o pid=,ppid= 2>/dev/null | awk -v p="$1" '$2 == p { print $1 }'
+        ps -ax -o pid=,ppid= 2>/dev/null | awk -v p="$1" '$2 == p { print $1 }' || true
     fi
+    return 0
 }
 
 rp_kill_tree() {   # rp_kill_tree <pid> [signal]
@@ -1290,7 +1363,10 @@ rp_kill_tree() {   # rp_kill_tree <pid> [signal]
 
 rp_reap_children() {
     local child pids
-    pids="$(rp_child_pids $$)"
+    # Called from cleanup traps, some of them in set -e scripts. Nothing in
+    # here may be allowed to end the script early, so the one command whose
+    # status could leak is guarded as well as rp_child_pids itself.
+    pids="$(rp_child_pids $$)" || pids=""
     [ -n "$pids" ] || return 0
     for child in $pids; do rp_kill_tree "$child" TERM; done
     # A moment to finish tidily, then insist.
@@ -1470,7 +1546,7 @@ rp_show_failed() {
             "$RP_MAX_EXTRACT_ATTEMPTS"
     fi
     printf '\nGames without artwork, from the newest run\n'
-    newest="$(ls -1 "$RP_REPORT_ROOT"/*_no_artwork.txt 2>/dev/null | sort | tail -1)"
+    newest="$(rp_newest_matching "$RP_REPORT_ROOT/*_no_artwork.txt" || true)"
     if [ -n "$newest" ]; then
         printf '  %s (%s games)\n' "reports/${newest##*/}" "$(grep -c . "$newest" 2>/dev/null || echo 0)"
         sed -n '1,10p' "$newest" | sed 's/^/    /'
@@ -1660,25 +1736,81 @@ rp_same_filesystem() {
 }
 
 # rp_replace_tree <candidate> <live> <backup folder>
-# Puts <candidate> in place of <live>, keeping the old one as a backup first.
-# Same filesystem: renames (atomic). Different filesystem: copies the
-# candidate in first, and only then swaps - the live folder is never removed
-# before its replacement is complete.
+# Puts <candidate> in place of <live>, keeping the old one as a backup.
+#
+# The invariant, and the whole reason this function exists: AT NO POINT is
+# there neither a complete <live> nor a complete replacement ready beside it.
+# Power can go out on any line below and the next run finds something usable.
+#
+# The order matters, and the old order was wrong. It used to back <live> up
+# FIRST - which across filesystems means "copy it, then delete it" - and only
+# then start copying the candidate in. Between those two steps there was no
+# collection at all, for as long as a full copy of a 9 GB tree takes. Now:
+#
+#   1. the candidate is staged BESIDE <live>, as <live>.incoming.$$
+#      (a rename when they share a filesystem, a copy when they do not -
+#      either way <live> is untouched while it happens);
+#   2. <live> is renamed to <live>.previous.$$  - same directory, atomic;
+#   3. the staged copy is renamed to <live>     - same directory, atomic;
+#   4. only now is the previous collection moved to <backup>.
+#
+# Steps 2 and 3 are two renames within one directory, so the window where
+# <live> does not exist is as short as the filesystem can make it, and step 3
+# failing puts the previous collection straight back.
+#
+# Step 4 failing does NOT fail the replacement: the new collection is already
+# live and correct. The previous one is left under its .previous name with a
+# warning, because deleting it silently is the one thing we must not do.
 rp_replace_tree() {
-    local cand="$1" live="$2" backup="$3" tmp
+    local cand="$1" live="$2" backup="$3" inc prev same_cand
+    [ -e "$cand" ] || return 1
     mkdir -p "$(dirname "$live")" || return 1
-    if [ -e "$live" ]; then
-        mkdir -p "$(dirname "$backup")" || return 1
-        if rp_same_filesystem "$live" "$backup"; then mv "$live" "$backup" || return 1
-        else cp -a "$live" "$backup" || return 1; rm -rf "$live" || return 1; fi
-    fi
+
+    # ---- 1. stage the candidate beside the live folder ----
+    inc="$live.incoming.$$"
+    rm -rf -- "$inc"
     if rp_same_filesystem "$cand" "$live"; then
-        mv "$cand" "$live" || return 1
+        same_cand=1
+        mv -- "$cand" "$inc" || return 1
     else
-        tmp="$live.incoming.$$"
-        rm -rf "$tmp"
-        cp -a "$cand" "$tmp" || { rm -rf "$tmp"; return 1; }
-        mv "$tmp" "$live" || { rm -rf "$tmp"; return 1; }
+        same_cand=0
+        cp -a "$cand" "$inc" || { rm -rf -- "$inc"; return 1; }
+    fi
+    [ -e "$inc" ] || { rm -rf -- "$inc"; return 1; }
+
+    # ---- 2/3. the swap: two renames in one directory ----
+    prev=""
+    if [ -e "$live" ]; then
+        prev="$live.previous.$$"
+        rm -rf -- "$prev"
+        if ! mv -- "$live" "$prev"; then
+            # Nothing has changed yet. Put the candidate back where it came
+            # from if we moved it, so the caller is no worse off.
+            [ "$same_cand" -eq 1 ] && [ ! -e "$cand" ] && mv -- "$inc" "$cand"
+            rm -rf -- "$inc"
+            return 1
+        fi
+    fi
+    if ! mv -- "$inc" "$live"; then
+        [ -n "$prev" ] && [ -d "$prev" ] && [ ! -e "$live" ] && mv -- "$prev" "$live"
+        [ "$same_cand" -eq 1 ] && [ ! -e "$cand" ] && [ -e "$inc" ] && mv -- "$inc" "$cand"
+        rm -rf -- "$inc"
+        return 1
+    fi
+
+    # ---- 4. retire the previous collection ----
+    if [ -n "$prev" ] && [ -e "$prev" ]; then
+        if mkdir -p "$(dirname "$backup")" 2>/dev/null; then
+            rm -rf -- "$backup"
+            if rp_same_filesystem "$prev" "$backup"; then
+                mv -- "$prev" "$backup" 2>/dev/null || true
+            else
+                cp -a "$prev" "$backup" 2>/dev/null && rm -rf -- "$prev"
+            fi
+        fi
+        if [ -e "$prev" ]; then
+            rp_warn "the new $(basename "$live") is in place, but the previous one could not be moved to $backup - it is still here as $(basename "$prev")"
+        fi
     fi
     return 0
 }
@@ -1799,7 +1931,7 @@ rp_tidy_state() {
     keep="${RP_ARTWORK_KEEP_BACKUPS:-2}"
     for d in "$RP_STATE_DIR"/artwork/backups/*; do
         [ -d "$d" ] || continue
-        ls -1d "$d"/*/ 2>/dev/null | sort -r | awk -v k="$keep" 'NR > k' | while IFS= read -r old; do rm -rf "$old"; done
+        rp_prune_oldest "$keep" "$d/*/"
         rmdir "$d" 2>/dev/null                            # nothing left to keep
     done
 
@@ -1863,15 +1995,159 @@ rp_pfs_reminder() {
 #   * or, if there is only one collection, that one
 #   * otherwise nothing, and the caller lists the choices
 rp_default_collection() {
-    local want="$1" d n=0 only=""
-    if [ -n "$want" ] && [ -d "$RP_BUILD_ROOT/retro_$want" ]; then
-        printf '%s\n' "$RP_BUILD_ROOT/retro_$want"; return 0
+    local want="$1" d n=0 only="" suffix=""
+    # The caller may hand us either spelling of a variant: the command-line
+    # token (aga-laced) or the folder suffix (aga_laced). Collections are
+    # always named with the folder suffix, so normalise before looking.
+    # Without this, "merge.sh --aga-laced" looked for build/retro_aga-laced,
+    # never found it, and silently fell through to the default build/retro.
+    if [ -n "$want" ]; then
+        suffix="$(rp_variant_suffix "$want")"
+        if [ -d "$RP_BUILD_ROOT/retro_$suffix" ]; then
+            printf '%s\n' "$RP_BUILD_ROOT/retro_$suffix"; return 0
+        fi
+        # A variant was named but has no collection yet. Returning "the only
+        # collection there is" would quietly write laced artwork into the
+        # plain AGA build, so stop and let the caller explain instead.
+        return 1
     fi
     for d in "$RP_BUILD_ROOT"/retro_*; do
         [ -d "$d" ] || continue
         n=$((n + 1)); only="$d"
     done
     [ "$n" -eq 1 ] && { printf '%s\n' "$only"; return 0; }
+    return 1
+}
+
+# rp_short_sleep: the pause in a "wait for a free job slot" loop.
+# `sleep 0.1` is not portable - a few older /bin/sleep implementations accept
+# whole seconds only and simply fail. That does not stop these scripts (they
+# do not run under set -e), but a failing sleep turns the wait loop into a
+# busy loop burning a whole core, which on a Pi Zero is worse than the delay
+# it was avoiding. So: probe once, then use whichever works.
+RP_FRACTIONAL_SLEEP=""
+rp_short_sleep() {
+    if [ -z "$RP_FRACTIONAL_SLEEP" ]; then
+        if sleep 0.1 2>/dev/null; then RP_FRACTIONAL_SLEEP=yes; return 0
+        else RP_FRACTIONAL_SLEEP=no; fi
+    fi
+    if [ "$RP_FRACTIONAL_SLEEP" = yes ]; then sleep 0.1; else sleep 1; fi
+}
+
+# rp_nice_prefix: how to launch a heavy worker so an unattended run does not
+# make the machine unusable. Prints a command prefix (possibly empty) for the
+# caller to put in front of a command.
+#
+# Only when NOT attached to a terminal - i.e. cron, a scheduled run, a
+# redirected log. An interactive run is one the person is sitting and waiting
+# for, and slowing that down on purpose would be rude.
+#
+# Never fails and never adds a dependency: without nice or ionice the prefix
+# is simply empty. ionice is Linux-only; macOS has no equivalent and gets the
+# plain nice.
+RP_NICE_PREFIX=""
+RP_NICE_PREFIX_SET=0
+rp_nice_prefix() {
+    if [ "$RP_NICE_PREFIX_SET" -eq 0 ]; then
+        RP_NICE_PREFIX_SET=1
+        RP_NICE_PREFIX=""
+        if [ ! -t 1 ] && [ "${RP_NICE:-auto}" != "no" ]; then
+            # -c2 -n7 is the idle end of the normal ("best effort") class:
+            # still scheduled, but it yields to anything the person is doing.
+            if command -v ionice >/dev/null 2>&1 && ionice -c2 -n7 true >/dev/null 2>&1; then
+                RP_NICE_PREFIX="ionice -c2 -n7 "
+            fi
+            if command -v nice >/dev/null 2>&1; then
+                RP_NICE_PREFIX="${RP_NICE_PREFIX}nice -n 10 "
+            fi
+        fi
+    fi
+    printf '%s' "$RP_NICE_PREFIX"
+}
+
+# rp_common_opt <arg> [next arg]: the options every script in the suite
+# understands, handled in one place so they behave identically everywhere.
+# Before this, only start.sh and all.sh honoured --quiet; running merge.sh or
+# sort.sh directly with it printed everything anyway.
+#
+#   --quiet           errors, warnings and the final result only
+#   --verbose         more operational detail
+#   --color=MODE      auto | always | never   (--colour is accepted too)
+#   --color MODE      the same, as two arguments
+#   --no-color        shorthand for --color=never
+#
+# --debug is deliberately NOT here: the stage scripts each have their own
+# --debug with extra per-stage behaviour, and hijacking it would change that.
+#
+# Returns 0 = handled, one argument consumed
+#         2 = handled, TWO arguments consumed (option plus its value)
+#         1 = not one of these; the caller decides what to do with it
+rp_common_opt() {
+    case "$1" in
+        --quiet)
+            RP_VERBOSITY=0; export RP_VERBOSITY; return 0 ;;
+        --verbose)
+            [ "$RP_VERBOSITY" -lt 2 ] && RP_VERBOSITY=2
+            export RP_VERBOSITY; return 0 ;;
+        --no-color|--no-colour)
+            RP_COLOR=never; export RP_COLOR; rp_set_colours; return 0 ;;
+        --color=*|--colour=*)
+            RP_COLOR="${1#*=}"; export RP_COLOR; rp_set_colours; return 0 ;;
+        --color|--colour)
+            rp_require_option_value "$1" 2 "${2-}"
+            RP_COLOR="$2"; export RP_COLOR; rp_set_colours; return 2 ;;
+    esac
+    return 1
+}
+
+# ---------------------------------------------------------- listing files ---
+# These three replace the `ls -1 ... | sort | awk` and `ls | grep -c .`
+# pipelines the suite used for its own report and backup folders. `ls` output
+# is not a safe list (ShellCheck SC2012): a newline in a name splits one entry
+# into two, and the exit status of the pipeline belongs to the last command,
+# not to ls. A glob is already sorted by the shell, and every name these are
+# used on is tool-generated - timestamps and state-*.tgz - so the shell's
+# lexicographic order is the chronological one.
+#
+# Each takes a glob PATTERN AS A STRING, deliberately unquoted inside, e.g.
+#   rp_newest_matching "$dir/state-*.tgz"
+
+rp_count_matching() {   # how many paths the glob matches
+    local p n=0
+    for p in $1; do [ -e "$p" ] && n=$((n + 1)); done
+    printf '%s\n' "$n"
+}
+
+rp_newest_matching() {  # the last matching path in shell order, or nothing
+    local p last=""
+    for p in $1; do [ -e "$p" ] && last="$p"; done
+    [ -n "$last" ] || return 1
+    printf '%s\n' "$last"
+}
+
+# rp_prune_oldest <keep> <glob>: remove all but the newest <keep> matches.
+# Directories and files both. Never touches anything the glob does not match.
+rp_prune_oldest() {
+    local keep="$1" p n=0 total
+    total="$(rp_count_matching "$2")"
+    [ "$total" -gt "$keep" ] || return 0
+    for p in $2; do
+        [ -e "$p" ] || continue
+        n=$((n + 1))
+        [ "$n" -le $((total - keep)) ] || break
+        rm -rf -- "$p"
+    done
+    return 0
+}
+
+# rp_glob_matches <pattern>: true when the glob matches at least one path.
+# Replaces `ls pattern >/dev/null 2>&1`, which forks a process, is what
+# ShellCheck flags as SC2012, and gets confused by odd filenames.
+rp_glob_matches() {
+    local p
+    for p in $1; do
+        [ -e "$p" ] || [ -L "$p" ] && return 0
+    done
     return 1
 }
 
@@ -1915,18 +2191,50 @@ rp_conf_in_use() {
 # A pack counts as installed when it holds a section folder (Covers/Screens/
 # Titles) - an empty iGame_AGA folder is NOT artwork, which is why the old
 # check reported only the pack whose folder happened to be absent.
+# rp_artwork_dir_for <variant>: where that variant's artwork lives, relative
+# to $RP_ARTWORK_ROOT - e.g. aga-laced -> iGame_AGA/laced. Nothing for a
+# variant with no pack of its own.
+#
+# The laced flavours are a SUBFOLDER of their pack, not a pack of their own:
+# there is no iGame_AGA_LACED directory anywhere. Anything that guesses the
+# folder name from the variant name instead of asking here gets that wrong and
+# reports perfectly good artwork as missing.
+rp_artwork_dir_for() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        aga)        printf 'iGame_AGA/lores' ;;
+        aga-laced|aga_laced)  printf 'iGame_AGA/laced' ;;
+        ecs)        printf 'iGame_ECS/lores' ;;
+        ecs-laced|ecs_laced)  printf 'iGame_ECS/laced' ;;
+        rtg)        printf 'iGame_RTG' ;;
+        tinylauncher) printf 'TinyLauncher' ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+# rp_artwork_installed <variant>: true when that variant's pack holds at least
+# one section folder. An empty iGame_AGA is not artwork.
+rp_artwork_installed() {
+    local base p
+    base="$(rp_artwork_dir_for "$1")" || return 1
+    for p in Covers Screens Titles; do
+        [ -d "$RP_ARTWORK_ROOT/$base/$p" ] && return 0
+    done
+    # artwork installed the older flat way counts too
+    case "$base" in
+        */lores|*/laced)
+            for p in Covers Screens Titles; do
+                [ -d "$RP_ARTWORK_ROOT/${base%/*}/$p" ] && return 0
+            done ;;
+    esac
+    return 1
+}
+
 rp_artwork_missing() {
     local want="$*" v base p found
     [ -n "$want" ] || want="$RP_VARIANTS"
     for v in $(printf '%s' "$want" | tr ',' ' '); do
-        case "$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]')" in
-            aga)        base="iGame_AGA/lores" ;;
-            aga-laced)  base="iGame_AGA/laced" ;;
-            ecs)        base="iGame_ECS/lores" ;;
-            ecs-laced)  base="iGame_ECS/laced" ;;
-            rtg)        base="iGame_RTG" ;;
-            *) continue ;;
-        esac
+        base="$(rp_artwork_dir_for "$v")" || continue
         found=""
         for p in Covers Screens Titles; do
             [ -d "$RP_ARTWORK_ROOT/$base/$p" ] && found=1 && break

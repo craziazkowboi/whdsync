@@ -5,7 +5,11 @@
 
 # Which variants all.sh builds (aga ecs rtg aga-laced ecs-laced, or the name
 # of any other iGame_NAME artwork folder).
-VARIANTS="aga ecs rtg"
+# Each variant is a COMPLETE collection of its own on the drive - five of
+# them is roughly five times the space of one, and five times the artwork
+# merge time. Trim this list on a small SD card or a Pi Zero, e.g.
+#   VARIANTS="aga ecs rtg"
+VARIANTS="aga ecs rtg aga-laced ecs-laced"
 
 # Where retro_*, new_* and working files go. Relative to this folder, or an
 # absolute path - e.g. a USB SSD, which is far faster than a Pi's SD card:
@@ -35,9 +39,12 @@ ARTWORK_SOURCE_URL="https://ftp2.grandis.nu/turran/FTP/Collection/Various/WHDLoa
 # Variants whose artwork is kept up to date by default (each fetches the
 # three sections: Covers, Screens, Titles). Use aga-laced / ecs-laced for the
 # Laced flavour; plain aga/ecs use LoRes.
-ARTWORK_PACKS="AGA ECS RTG"
+# Keep this in step with VARIANTS: a variant whose pack is not listed here is
+# built from the fallback chain, so retro_aga_laced would come out identical
+# to retro_aga.
+ARTWORK_PACKS="AGA ECS RTG AGA_Laced ECS_Laced"
 # Others, on request only: ./start.sh --artwork-sync --set art
-ARTWORK_OPTIONAL_PACKS="AGA_Laced ECS_Laced art TinyLauncher"
+ARTWORK_OPTIONAL_PACKS="art TinyLauncher"
 # If you've changed an artwork folder yourself:
 #   ask (keeps yours when unattended) | keep-local | backup-and-replace | fail
 ARTWORK_LOCAL_CHANGE_POLICY="ask"
@@ -60,9 +67,22 @@ ARTWORK_ARCHIVE_DIR="artwork_archive"
 # Examples of what people plug in here: an AI command line tool, an image
 # search API wrapper, or a script that picks from a folder of pictures.
 # Needs python3 with Pillow (sudo apt install python3-pil).
+# The command is called as:   <your command> "<game name>" "<output image>"
+# and should write a picture file to the path it is given. It may carry its
+# own arguments; the setting is split on whitespace into a plain argument
+# list and run directly, NOT through a shell. So:
+#   ARTWORK_FETCH_COMMAND="python3 /home/pi/bin/findart.py --source local"
+# works, while pipes, redirection, $VARIABLES, quotes and paths containing
+# spaces do not - put those in a small wrapper script and name that instead.
 ARTWORK_FETCH="no"
 ARTWORK_FETCH_COMMAND=""
 ARTWORK_FETCH_LIMIT=25
+
+# Be gentle with the machine during unattended runs: auto (the default) adds
+# nice, and ionice on Linux, to the extraction workers when the run is not
+# attached to a terminal - a nightly build then leaves a Pi usable. Set to
+# "no" to run everything at normal priority.
+# NICE="auto"
 
 # Amiga filename limits: pfs (107 characters) or ffs (30 characters).
 # For PFS, run  setfnsize <drive:> 107  on the Amiga first.

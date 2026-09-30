@@ -77,12 +77,40 @@ trap 'exit 130' INT TERM
 compliance_tmpdir=""
 cleanup_sort() {
     local st=$?
+    # This script runs under set -e, and errexit stays on inside an EXIT
+    # trap. Any cleanup step that returned non-zero used to end the script
+    # right there, with status 1, after the sort itself had finished - which
+    # is exactly how "Sort operation complete" was followed by "sorting
+    # failed" on macOS. Cleanup is best effort and must always reach the end.
+    set +e
+    # The "which command stopped us" trap is for the work, not for tidying up:
+    # inside this trap $BASH_COMMAND still names the last command of the main
+    # script, so a report from here would blame the wrong line.
+    trap - ERR
     rp_lock_release
     trap - EXIT
     rp_reap_children            # workers AND anything they launched
     [ -n "${compliance_tmpdir:-}" ] && rm -rf -- "$compliance_tmpdir"
     exit "$st"
 }
+
+# set -e stops the script at the first command that fails - silently. When
+# that happens, say which command it was and where, on screen and in
+# logs/sort.log (which the pipeline copies into retroerror.log), so a failed
+# sort is never again reported as nothing more than "sorting failed".
+# set -E carries the trap into functions, where most of the work happens.
+sort_stopped() {   # sort_stopped <exit status> <line> <command>
+    local msg
+    msg="sort.sh stopped at line $2: this command failed with exit $1:  $3"
+    printf '\nERROR: %s\n' "$msg" >&2
+    if [ -n "${RP_LOG_ROOT:-}" ]; then
+        mkdir -p "$RP_LOG_ROOT" 2>/dev/null
+        printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$msg" >> "$RP_LOG_ROOT/sort.log" 2>/dev/null
+    fi
+    return 0
+}
+set -E
+trap 'sort_stopped "$?" "$LINENO" "$BASH_COMMAND"' ERR
 # Run by hand? Then this is the run, and it takes the same lock all.sh
 # uses, so it cannot work on a collection a nightly build is midway through.
 rp_lock_for_stage "sort.sh ${RP_ORIG_ARGS:-}"
@@ -190,6 +218,14 @@ while [ $# -gt 0 ]; do
             break
             ;;
         *)
+            # --quiet / --verbose / --color are understood by every script in
+            # the suite; lib.sh handles them so they behave the same way here
+            # as they do in start.sh.
+            rp_common_opt "$1" "${2-}"; _co=$?
+            case "$_co" in
+                0) shift; continue ;;
+                2) shift 2; continue ;;
+            esac
             echo "Unknown option: $1" >&2
             exit 4
             ;;
@@ -218,8 +254,12 @@ Say which one, e.g.  --dest $RP_BUILD_ROOT/${_have##* }"
     fi
 fi
 
-LOGFILE="$(pwd)/sort.log"
-AMIGA_ISSUES_LOG="$(pwd)/amiga_filename_issues.log"
+# In logs/, not in whatever directory the run happened to start from. Where
+# these landed decided whether start.sh found them at all - run from another
+# folder, the compliance report was written somewhere nobody looked.
+mkdir -p "$RP_LOG_ROOT" 2>/dev/null
+LOGFILE="$RP_LOG_ROOT/sort.log"
+AMIGA_ISSUES_LOG="$RP_LOG_ROOT/amiga_filename_issues.log"
 : > "$AMIGA_ISSUES_LOG"
 
 # Detect platform for progress bar selection
@@ -528,7 +568,7 @@ _start_job() {
                 break
             fi
         done
-        sleep 0.1
+        rp_short_sleep
     done
 }
 
@@ -721,21 +761,10 @@ variant_sort_strict() {
 lang_sort() {
     echo "Sorting Languages (Be patient...)"
 
-    # Determine source root: /retro/WHDLoad or /WHDLoad under custom destination
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    DEFAULT_DEST="$RP_BUILD_ROOT/retro"
-    DEST="${DEST_OVERRIDE:-}"
-# With no --dest, work on the collection matching the variant asked for, or
-# the only collection there is - the same rule merge.sh uses.
-if [ -z "$DEST" ]; then
-    if _auto="$(rp_default_collection "")"; then
-        DEST="$_auto"
-        echo "Using collection: ${DEST##*/}   (no --dest given)"
-    else
-        DEST="$DEFAULT_DEST"
-    fi
-fi
-
+    # $DEST was resolved once, up at the top of the run, from --dest or from
+    # the collections that actually exist. Re-deriving it here used to reset
+    # it to build/retro whenever the first attempt could not pick one, so a
+    # run on retro_aga sorted a folder that was not there.
     SRC="$DEST/WHDLoad"
 
     # Build search list: all subdirs under WHDLoad except Languages
@@ -867,15 +896,11 @@ fi
 # AMIGA FILESYSTEM COMPLIANCE CHECK
 # ============================================================================
 if [ "$RUN_COMPLIANCE_CHECK" = true ]; then
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    DEFAULT_DEST="$RP_BUILD_ROOT/retro"
-
-    # If -d/--dest was given, only check that path; otherwise behave as before.
-    if [ -n "$DEST_OVERRIDE" ]; then
-        CHECK_ROOT="$DEST_OVERRIDE"
-    else
-        CHECK_ROOT="${DEST_OVERRIDE:-$DEFAULT_DEST}"
-    fi
+    # The compliance pass checks what this run sorted, which is $DEST. It used
+    # to fall back to build/retro when no --dest was given, so a standalone
+    # "./sort.sh" on a machine holding retro_aga reported on a folder that did
+    # not exist while the collection it had just sorted went unchecked.
+    CHECK_ROOT="$DEST"
 
     echo "Performing Amiga filesystem compliance check ($FS_TYPE: max $MAX_FILENAME_LEN chars) in: $CHECK_ROOT"
     echo
@@ -962,7 +987,12 @@ if [ "$RUN_COMPLIANCE_CHECK" = true ]; then
                     # that point in its chunk left completely unscanned).
                     # A command tested by `if` is exempt from errexit
                     # regardless of its exit status, so this form is safe.
-                    if issues=$(check_path_compliance "$file" 2>&1); then
+                    # Named reported_issues, not issues: check_path_compliance
+                    # has its own local array called issues, and two different
+                    # things under one name in the same file is how a string
+                    # ends up being indexed as an array by mistake (and what
+                    # ShellCheck flags as SC2178/SC2128).
+                    if reported_issues=$(check_path_compliance "$file" 2>&1); then
                         :
                     else
                         status=$?
@@ -974,7 +1004,7 @@ if [ "$RUN_COMPLIANCE_CHECK" = true ]; then
                                 echo "$file"
                                 while IFS= read -r issue; do
                                     echo " → $issue"
-                                done <<< "$issues"
+                                done <<< "$reported_issues"
                             } >> "$issue_file"
                         fi
                     fi

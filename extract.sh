@@ -211,7 +211,16 @@ while [ $# -gt 0 ]; do
         echo "Encoding preference: ASCII first, ISO-8859-1 second, system locale last"
         exit 0
         ;;
-    *) echo -e "${RED}Unknown option: $1${NC}"; exit 4 ;;
+        *)
+            # --quiet / --verbose / --color are understood by every script in
+            # the suite; lib.sh handles them so they behave the same way here
+            # as they do in start.sh.
+            rp_common_opt "$1" "${2-}"; _co=$?
+            case "$_co" in
+                0) shift; continue ;;
+                2) shift 2; continue ;;
+            esac
+            echo -e "${RED}Unknown option: $1${NC}"; exit 4 ;;
     esac
 done
 unset opt_lc
@@ -254,8 +263,12 @@ offer_install_pkg() {
         echo "  (no terminal attached to answer a prompt - skipping auto-install of $tool_name)"
         return 1
     fi
+    # The opt-in guard applies on EVERY platform. It used to sit inside the
+    # Darwin branch only, so a Linux build stopped in the middle to ask for a
+    # sudo password - exactly the surprise the setup-first dependency policy
+    # exists to prevent.
+    rp_may_install_tools || { rp_tool_missing_hint "$tool_name"; return 1; }
     if [[ "$OS_TYPE" == "darwin" ]]; then
-        rp_may_install_tools || { rp_tool_missing_hint "$tool_name"; return 1; }
         printf '%s is missing. Install it now via Homebrew (brew install %s)? [y/N] ' "$tool_name" "$brew_pkg"
     else
         printf '%s is missing. Install it now via apt (sudo apt install %s)? [y/N] ' "$tool_name" "$apt_pkg"
@@ -580,7 +593,7 @@ wait_for_job_slot() {
     while true; do
         job_count=$(jobs -r | wc -l | tr -d ' ')
         [ "$job_count" -lt "$max_jobs" ] && break
-        sleep 0.1
+        rp_short_sleep
     done
 }
 
@@ -633,6 +646,7 @@ extract_archive() {
     esac
     return $((1 - success))
 }
+NICE_PREFIX="$(rp_nice_prefix)"
 export -f extract_archive
 # extract_archive runs inside `timeout bash -c ...` when timeout exists - a
 # FRESH bash, which inherits exported variables only. Without these the
@@ -688,8 +702,13 @@ for srcdir in "${dirs[@]}"; do
             base="$(basename "$archive")"
             ext="${base##*.}"
 
+            # NICE_PREFIX is empty on an interactive run and "nice -n 10 "
+            # (plus ionice on Linux) under cron, so a nightly extraction on a
+            # Pi leaves the machine usable. Deliberately unquoted: it is a
+            # command prefix, not a filename.
             if [ -n "$TIMEOUT_CMD" ]; then
-                $TIMEOUT_CMD bash -c 'extract_archive "$1" "$2" "$3"' _ "$abs_archive" "$abs_destdir" "$ext"
+                # shellcheck disable=SC2086
+                $NICE_PREFIX $TIMEOUT_CMD bash -c 'extract_archive "$1" "$2" "$3"' _ "$abs_archive" "$abs_destdir" "$ext"
                 extract_rc=$?
             else
                 extract_archive "$abs_archive" "$abs_destdir" "$ext"

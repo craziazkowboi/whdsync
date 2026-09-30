@@ -57,22 +57,38 @@ rp_banner "update.sh"
 
 DRY_RUN=0
 CALLED_FROM_ALL="${RP_CHILD:-0}"   # run as one stage of an all.sh pipeline
-for _arg in "$@"; do
+# A shift loop, not "for _arg in $@": options that take a separate value
+# (--color never) need to consume two arguments, which a for loop cannot do.
+while [ $# -gt 0 ]; do
+    _arg="$1"
     case "$_arg" in
-        --dry-run) DRY_RUN=1 ;;
-        --called-from-all) CALLED_FROM_ALL=1 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --called-from-all) CALLED_FROM_ALL=1; shift ;;
         -h|--help)
-            echo "Usage: $(basename "$0") [--dry-run]"
-echo "  -h, --help   Show this help and exit."
+            echo "Usage: $(basename "$0") [options]"
+            echo
             echo "  Mirrors the Retroplay WHDLoad packs from the FTP server, logs new"
             echo "  files to update.log and queues them for processing."
-            echo "  --dry-run  Ask the server what WOULD be downloaded, without downloading."
+            echo
+            echo "  --dry-run       Ask the server what WOULD be downloaded, without"
+            echo "                  downloading anything."
+            echo "  --quiet         Errors, warnings and the final result only."
+            echo "  --verbose       More detail about each step."
+            echo "  --color=MODE    auto (default), always or never. NO_COLOR is honoured."
+            echo "  -h, --help      Show this help and exit."
+            echo
             echo "Exit codes: 0 = new files, 2 = nothing new, 3 = server/network error."
             exit 0 ;;
-        *) echo "Unknown option: $_arg (try --help)" >&2; exit 4 ;;
+        *)
+            rp_common_opt "$1" "${2-}"; _co=$?
+            case "$_co" in
+                0) shift; continue ;;
+                2) shift 2; continue ;;
+            esac
+            echo "Unknown option: $_arg (try --help)" >&2; exit 4 ;;
     esac
 done
-unset _arg
+unset _arg _co
 
 FTP_BASE="ftp://ftp:amiga@grandis.nu/Retroplay%20WHDLoad%20Packs"
 
@@ -107,20 +123,15 @@ if ! command -v wget >/dev/null 2>&1; then
     fi
 fi
 
-# Check for iGame / TinyLauncher artwork directories in current directory.
-# This is only a heads-up, not a hard requirement of THIS script (update.sh
-# only downloads WHDLoad/HD_Loaders/JST content) - it's here because if
-# these are missing, the later merge.sh step in the same pipeline run will
-# have nothing to merge, and it's more useful to warn about that now than
-# to let the user discover it after a long download.
-required_art_dirs=(
-  "iGame_art"
-  "iGame_ECS"
-  "iGame_RTG"
-  "iGame_AGA"
-  "TinyLauncher"
-)
-
+# A heads-up, not a hard requirement of THIS script (update.sh only downloads
+# WHDLoad/HD_Loaders/JST content) - it is here because if the artwork is
+# missing, the later merge.sh step in the same pipeline run will have nothing
+# to merge, and saying so now beats discovering it after a long download.
+#
+# (There used to be a hard-coded required_art_dirs list here as well. It was
+# never read - rp_artwork_missing below is the single source of truth for
+# which packs are wanted - and it had drifted out of date with the config.)
+#
 # Artwork check - the same one all.sh uses, so both agree on what is missing.
 missing_art="$(rp_artwork_missing | tr '\n' ' ')"
 if [ -n "$missing_art" ]; then
@@ -187,7 +198,12 @@ if [ "$DRY_RUN" -eq 1 ]; then
             while IFS= read -r fname; do
                 case "$fname" in *.lha|*.LHA|*.lzx|*.LZX|*.zip|*.ZIP) ;; *) continue ;; esac
                 if [ -n "$sub" ]; then rel="$dir/$sub/$fname"; else rel="$dir/$fname"; fi
-                if [ ! -e "$rel" ]; then
+                # Against the DOWNLOADS folder, not the current directory. The
+                # real download pass below cds into $RP_DOWNLOAD_ROOT first;
+                # this block runs before that, so a bare "$rel" was resolved
+                # next to the scripts, never matched, and every remote file was
+                # reported as new.
+                if [ ! -e "$RP_DOWNLOAD_ROOT/$rel" ]; then
                     missing=$((missing + 1))
                     [ "$missing" -le 5 ] && examples="$examples      $rel
 "

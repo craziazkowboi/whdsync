@@ -35,7 +35,7 @@ import argparse
 import os
 import struct
 import sys
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 try:
     from PIL import Image
@@ -46,6 +46,9 @@ except ImportError:                                    # pragma: no cover
     sys.exit(4)
 
 
+BMHD_PAYLOAD_MIN = 20          # w,h,x,y,planes,mask,compression,pad,transparent...
+
+
 def read_bmhd(path: str) -> Tuple[int, int, int]:
     """Width, height and bitplane count of an existing IFF ILBM file.
 
@@ -53,20 +56,54 @@ def read_bmhd(path: str) -> Tuple[int, int, int]:
     type ("ILBM"), then chunks of <4-byte id><4-byte length><payload>, each
     padded to an even length. BMHD is the bitmap header; its bitplane count
     sits at offset 8 within the payload.
+
+    The whole FORM is walked, not just its first 64 bytes. BMHD is
+    conventionally the first chunk, but nothing in the specification requires
+    it: a file that leads with ANNO, CAMG or a NAME chunk pushes BMHD past the
+    first 64 bytes, and reading a fixed 64-byte window reported those perfectly
+    valid files as having no BMHD at all.
+
+    The walk is bounded by the FORM's own declared length as well as by the
+    file's real size, so a truncated or lying header cannot send it off the end
+    or into a loop.
     """
     with open(path, "rb") as fh:
-        data = fh.read(64)
-    if data[0:4] != b"FORM" or data[8:12] != b"ILBM":
-        raise ValueError("not an IFF ILBM file: %s" % path)
-    pos = 12
-    while pos + 8 <= len(data):
-        cid = data[pos:pos + 4]
-        size = struct.unpack(">I", data[pos + 4:pos + 8])[0]
-        if cid == b"BMHD":
-            w, h = struct.unpack(">HH", data[pos + 8:pos + 12])
-            planes = data[pos + 16]
-            return w, h, planes
-        pos += 8 + size + (size & 1)                   # chunks are word aligned
+        header = fh.read(12)
+        if len(header) < 12:
+            raise ValueError("too short to be an IFF file: %s" % path)
+        if header[0:4] != b"FORM" or header[8:12] != b"ILBM":
+            raise ValueError("not an IFF ILBM file: %s" % path)
+        form_size = struct.unpack(">I", header[4:8])[0]
+        # The FORM length counts the 4-byte form type plus every chunk after
+        # it. Anything claiming more than the file holds is simply capped.
+        file_size = os.fstat(fh.fileno()).st_size
+        end = min(file_size, 8 + form_size)
+
+        pos = 12
+        while pos + 8 <= end:
+            fh.seek(pos)
+            head = fh.read(8)
+            if len(head) < 8:
+                break
+            cid = head[0:4]
+            size = struct.unpack(">I", head[4:8])[0]
+            if cid == b"BMHD":
+                if size < BMHD_PAYLOAD_MIN:
+                    raise ValueError("BMHD chunk is too short in %s" % path)
+                payload = fh.read(BMHD_PAYLOAD_MIN)
+                if len(payload) < BMHD_PAYLOAD_MIN:
+                    raise ValueError("BMHD chunk is cut short in %s" % path)
+                w, h = struct.unpack(">HH", payload[0:4])
+                planes = payload[8]
+                if w <= 0 or h <= 0 or not 1 <= planes <= 8:
+                    raise ValueError(
+                        "BMHD in %s is not usable (%dx%d, %d planes)"
+                        % (path, w, h, planes))
+                return w, h, planes
+            step = 8 + size + (size & 1)               # chunks are word aligned
+            if step <= 8:                              # a zero-length chunk...
+                step = 8                               # ...still moves forward
+            pos += step
     raise ValueError("no BMHD chunk in %s" % path)
 
 
@@ -129,7 +166,7 @@ def chunk(cid: bytes, payload: bytes) -> bytes:
     return out
 
 
-def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="to_ilbm.py",
         description="Convert an image into an Amiga IFF ILBM file.",
@@ -176,7 +213,7 @@ def convert(source: str, dest: str, width: int, height: int, planes: int) -> Non
     print("%s: %dx%d, %d colours" % (dest, width, height, colours))
 
 
-def main(argv: List[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
 
     width, height, planes = args.width, args.height, args.planes

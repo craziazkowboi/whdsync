@@ -8,11 +8,13 @@ Then it does the same again every night, by itself, and tells you only when some
 downloads/            →  extract  →  artwork  →  sort  →  build/retro_aga/
 (Retroplay archives)                                      build/retro_ecs/
                                                           build/retro_rtg/
+                                                          build/retro_aga_laced/
+                                                          build/retro_ecs_laced/
 ```
 
 - **Runs on** a Raspberry Pi (including a Pi Zero 2 W) or a Mac. Linux and macOS, nothing else needed.
 - **Safe by design.** It never deletes a collection until its replacement is ready, never overwrites artwork you changed yourself, and stops rather than guessing.
-- **Tested.** 386 automated tests plus 205 option checks, run offline on every change. GitHub Actions runs them on Ubuntu and on macOS (bash 3.2), with ShellCheck.
+- **Tested.** 511 automated tests plus 231 option checks, run offline on every change. GitHub Actions runs them on Ubuntu and on macOS (bash 3.2), with ShellCheck.
 
 ---
 
@@ -114,7 +116,9 @@ Each step announces itself with the time, and long jobs show a progress bar, so 
 
 **You can stop it at any time with Ctrl-C.** Nothing is left half-installed: an interrupted build is redone next time, and everything already downloaded is kept.
 
-When it finishes, your collections are in `build/retro_aga/`, `build/retro_ecs/` and `build/retro_rtg/`. Copy the one you want to your Amiga's drive, or point your A314 or network share at it.
+When it finishes, your collections are in `build/retro_aga/`, `build/retro_ecs/`, `build/retro_rtg/`, `build/retro_aga_laced/` and `build/retro_ecs_laced/`. Copy the one you want to your Amiga's drive, or point your A314 or network share at it.
+
+Five collections is five times the space and five times the artwork merge. On a small card, set `VARIANTS="aga ecs rtg"` (or just the one you use) in `retroplay.conf` — every run prints the list it is about to build.
 
 ---
 
@@ -149,7 +153,7 @@ whdsync/
 │   ├── iGame_RTG/{Covers,Screens,Titles}/...
 │   └── TinyLauncher/
 ├── build/            your finished collections — this is what you copy to the Amiga
-│   ├── retro_aga/  retro_ecs/  retro_rtg/
+│   ├── retro_aga/  retro_ecs/  retro_rtg/  retro_aga_laced/  retro_ecs_laced/
 │   └── new_aga/<date>/          only the games added that night
 ├── downloads/        the Retroplay mirror — the raw archives
 │   ├── WHDLoad/  HD_Loaders/  JST/
@@ -293,7 +297,8 @@ Settings live in `retroplay.conf`, looked for in this order: **the folder you ra
 
 | Setting | Default | What it does |
 |---|---|---|
-| `VARIANTS` | `aga ecs rtg` | Which collections to build |
+| `VARIANTS` | `aga ecs rtg aga-laced ecs-laced` | Which collections to build. Each is a full copy on the drive |
+| `NICE` | `auto` | Run extraction gently (`nice`, plus `ionice` on Linux) when nobody is watching — cron, a redirected log. `no` turns it off |
 | `OUTPUT_ROOT` | `.` | Where `build/` goes — point this at a USB SSD |
 | `ART_ORDER` | `Screens,Covers,Titles` | Which artwork iGame shows first |
 | `ART_ORDER_RTG` | `Covers,Screens,Titles` | Overrides the order for RTG (`ART_ORDER_<VARIANT>` works for any variant) |

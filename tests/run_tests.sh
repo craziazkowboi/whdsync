@@ -1309,7 +1309,10 @@ check "start.sh says how to fix missing tools instead of installing them" \
   'grep -q "Run ./setup.sh to install everything" "$ROOT/start.sh" && grep -q -- "--install-missing-tools" "$ROOT/start.sh"'
 check "the config is parsed, never sourced" \
   '! grep -nE "^\s*(\.|source) .*retroplay\.conf" "$ROOT"/*.sh'
-check "no eval anywhere in the suite" '! grep -nw eval "$ROOT"/*.sh'
+check "no eval anywhere in the suite" \
+  '( for f in "$ROOT"/*.sh; do
+        sed -e "s/[[:space:]]#.*$//" -e "s/^[[:space:]]*#.*$//" "$f" | grep -qw eval && exit 1
+     done; exit 0 )'
 
 
 section "50. A failed artwork download is never recorded as up to date"
@@ -1907,6 +1910,402 @@ check "the chosen locales are exported, not just set" \
   'grep -qE "^export RP_LC_LATIN1 RP_LC_UTF8" "$ROOT/extract.sh"'
 check "...and the function that uses them is exported too" \
   'grep -q "export -f extract_archive" "$ROOT/extract.sh"'
+
+
+section "71. A named variant resolves to its own collection, never to build/retro"
+# ./merge.sh --aga-laced looked for build/retro_aga-laced (hyphen), never
+# found it, and quietly fell back to build/retro - reporting "destination
+# folder not found" on a machine that had three working collections.
+mkdir -p "$T/coll/build/retro_aga" "$T/coll/build/retro_aga_laced" "$T/coll/build/retro_ecs"
+dc() { ( cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; RP_BUILD_ROOT='$T/coll/build'; rp_default_collection '$1'" ) 2>/dev/null; }
+check "the hyphen spelling finds the underscore folder" \
+  '[ "$(dc aga-laced)" = "$T/coll/build/retro_aga_laced" ]'
+check "the underscore spelling works too" \
+  '[ "$(dc aga_laced)" = "$T/coll/build/retro_aga_laced" ]'
+check "a plain variant still resolves" '[ "$(dc aga)" = "$T/coll/build/retro_aga" ]'
+check "a variant with no collection yet resolves to nothing, not to another one" \
+  '[ -z "$(dc rtg)" ]'
+check "with no variant named and one collection, that one is used" \
+  '[ "$(cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; RP_BUILD_ROOT=\"$T/coll/one\"; mkdir -p \"$T/coll/one/retro_rtg\"; rp_default_collection \"\"")" = "$T/coll/one/retro_rtg" ]'
+check "merge.sh says which collection is missing instead of naming build/retro" \
+  'grep -q "no collection for" "$ROOT/merge.sh"'
+
+section "72. Stage options imply their stage; a bare variant still opens the menu"
+check "--refresh-artwork on its own means the artwork merge" \
+  'grep -q "ACTION=\"merge\"" "$ROOT/start.sh"'
+check "a bare variant flag is documented as picking the collection, not a stage" \
+  'grep -q "Work on retro_aga_laced" "$ROOT/start.sh"'
+check "...and the menu says which collection it is about to work on" \
+  'grep -q "Working on:" "$ROOT/start.sh"'
+check "start.sh no longer claims --aga runs merge.sh" \
+  '! grep -q "Run merge.sh with --aga" "$ROOT/start.sh"'
+
+section "73. all.sh builds the laced variants, and aga/ecs take --laced"
+check "the shipped default builds all five collections" \
+  'grep -q "aga ecs rtg aga-laced ecs-laced" "$ROOT/lib.sh"'
+check "the laced artwork packs are fetched by default too" \
+  'grep -q "RP_ARTWORK_PACKS=\"AGA ECS RTG AGA_Laced ECS_Laced\"" "$ROOT/lib.sh"'
+check "all.sh understands --laced and --all" \
+  'grep -q -- "--laced)     WANT_LACED=1" "$ROOT/all.sh" && grep -q -- "--all)" "$ROOT/all.sh"'
+check "aga.sh --laced asks for the laced variant" \
+  'grep -q -- "--laced) VARIANT=\"--aga-laced\"" "$ROOT/aga.sh"'
+check "ecs.sh --laced asks for the laced variant" \
+  'grep -q -- "--laced) VARIANT=\"--ecs-laced\"" "$ROOT/ecs.sh"'
+run agahelp ./aga.sh --help
+check "./aga.sh --help is about aga.sh, not a build nobody asked for" \
+  'grep -q "Usage: aga.sh" "$T/agahelp.log" && ! grep -q "start.sh --sync" "$T/agahelp.log"'
+run rtghelp ./rtg.sh --help
+check "./rtg.sh --help likewise" 'grep -q "Usage: rtg.sh" "$T/rtghelp.log"'
+check "a run says how many collections it is about to build" \
+  'grep -q "Collections this run:" "$ROOT/all.sh"'
+
+section "74. The long silent pause in merge.sh says what it is doing"
+check "the artwork scan announces itself before it starts" \
+  'grep -q "Reading artwork" "$ROOT/merge.sh"'
+check "each source reports how much it found" \
+  'grep -q "artwork folders" "$ROOT/merge.sh"'
+check "and the total, with how long it took" \
+  'grep -q "Artwork index ready" "$ROOT/merge.sh"'
+check "the destination is checked BEFORE the scan, not after it" \
+  'code="$(sed -e "s/^[[:space:]]*#.*$//" "$ROOT/merge.sh")"
+   d="$(printf "%s" "$code" | grep -n "ERROR: destination folder not found" | head -1 | cut -d: -f1)"
+   r="$(printf "%s" "$code" | grep -n "rp_info \"Reading artwork" | head -1 | cut -d: -f1)"
+   [ -n "$d" ] && [ -n "$r" ] && [ "$d" -lt "$r" ]'
+check "one find per section and category, not one per letter of the alphabet" \
+  '! grep -q "for dir_prefix in {A..Z} {0..9}" "$ROOT/merge.sh" && grep -q "mindepth 2 -maxdepth 2" "$ROOT/merge.sh"'
+check "the lower-case index key is an expansion, not two forked processes" \
+  '! grep -q "_lckey=\"\$(printf" "$ROOT/merge.sh"'
+check "the platform-tuning block appears once, not twice" \
+  '[ "$(grep -c "Basic platform tuning for progress and parallelism" "$ROOT/merge.sh")" -eq 1 ]'
+
+section "75. Paths that pointed at the pre-migration layout"
+check "TinyLauncher is looked for with the other artwork packs" \
+  'grep -q "TINYLAUNCHER_SRC=\"\$RP_ARTWORK_ROOT/TinyLauncher\"" "$ROOT/merge.sh"'
+check "...and the old spot still works for anyone who has not migrated" \
+  'grep -q "SCRIPT_DIR/TinyLauncher" "$ROOT/merge.sh"'
+check "update.sh --dry-run compares against the downloads folder" \
+  'grep -q "RP_DOWNLOAD_ROOT/\$rel" "$ROOT/update.sh"'
+check "sort.sh checks compliance on the collection it just sorted" \
+  'grep -q "CHECK_ROOT=\"\$DEST\"" "$ROOT/sort.sh"'
+check "...and does not reset the destination to build/retro halfway through" \
+  '[ "$(grep -c "DEFAULT_DEST=\"\$RP_BUILD_ROOT/retro\"" "$ROOT/sort.sh")" -eq 0 ]'
+check "merge errors land in logs/, where the run looks for them" \
+  'grep -q "RP_LOG_ROOT/merge_errors.log" "$ROOT/merge.sh"'
+check "sort logs land in logs/ too, not in whatever folder you started from" \
+  'grep -q "LOGFILE=\"\$RP_LOG_ROOT/sort.log\"" "$ROOT/sort.sh"'
+check "the pipeline gathers each stage's log into retroerror.log" \
+  'grep -q "collect_stage_logs" "$ROOT/all.sh"'
+
+section "76. Settings are read exactly as written"
+cfg() { ( cd "$ROOT" && bash -c "SCRIPT_DIR=.; RP_INVOKED_FROM='$T/cfg'; . ./lib.sh; rp_load_config; printf '%s' \"\$$1\"" ) 2>/dev/null; }
+mkdir -p "$T/cfg"
+cat > "$T/cfg/retroplay.conf" << 'CFGEOF'
+# a whole-line comment mentioning #hashes
+NTFY_TOPIC="retro#build"
+VARIANTS="aga ecs"          # a trailing comment
+LOG_KEEP=6   # six of them
+NTFY_SERVER='https://ntfy.sh/#x'
+CFGEOF
+check "a # inside a double-quoted value is kept" '[ "$(cfg RP_NTFY_TOPIC)" = "retro#build" ]'
+check "a # inside a single-quoted value is kept" '[ "$(cfg RP_NTFY_SERVER)" = "https://ntfy.sh/#x" ]'
+check "a trailing comment after a quoted value is dropped" '[ "$(cfg RP_VARIANTS)" = "aga ecs" ]'
+check "a trailing comment after a bare value is dropped" '[ "$(cfg RP_LOG_KEEP)" = "6" ]'
+printf 'UPDATE_CHECK_INTERVAL_HOURS=%s\n' "soon" > "$T/cfg/retroplay.conf"
+check "a non-numeric update interval falls back to the default" '[ "$(cfg RP_UPDATE_CHECK_INTERVAL_HOURS)" = "24" ]'
+printf 'UPDATE_CHECK_INTERVAL_HOURS=-5\n' > "$T/cfg/retroplay.conf"
+check "a negative one does too" '[ "$(cfg RP_UPDATE_CHECK_INTERVAL_HOURS)" = "24" ]'
+printf 'UPDATE_CHECK_INTERVAL_HOURS=0\n' > "$T/cfg/retroplay.conf"
+check "zero is allowed and means every run" '[ "$(cfg RP_UPDATE_CHECK_INTERVAL_HOURS)" = "0" ]'
+printf 'NICE=maybe\n' > "$T/cfg/retroplay.conf"
+check "NICE only accepts auto or no" '[ "$(cfg RP_NICE)" = "auto" ]'
+rm -f "$T/cfg/retroplay.conf"
+
+section "77. Replacing a collection never leaves the drive without one"
+rt() { ( cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; $*" ) 2>/dev/null; }
+rm -rf "$T/rt"; mkdir -p "$T/rt/cand" "$T/rt/live"
+echo new > "$T/rt/cand/f"; echo old > "$T/rt/live/f"
+rt "rp_replace_tree '$T/rt/cand' '$T/rt/live' '$T/rt/bk/keep'"
+check "the new tree is live" '[ "$(cat "$T/rt/live/f")" = "new" ]'
+check "the old one is kept as the backup" '[ "$(cat "$T/rt/bk/keep/f")" = "old" ]'
+check "no staging folders are left behind" \
+  '[ -z "$(find "$T/rt" -maxdepth 1 -name "live.*" 2>/dev/null)" ]'
+rm -rf "$T/rt2"; mkdir -p "$T/rt2/live"; echo old > "$T/rt2/live/f"
+rt "rp_replace_tree '$T/rt2/missing' '$T/rt2/live' '$T/rt2/bk'"
+check "a missing candidate changes nothing" '[ "$(cat "$T/rt2/live/f")" = "old" ]'
+# The backup cannot be made (its parent is a file), but the swap must still
+# finish - and the previous collection must NOT be deleted to hide that.
+rm -rf "$T/rt3"; mkdir -p "$T/rt3/cand" "$T/rt3/live"
+echo new > "$T/rt3/cand/f"; echo old > "$T/rt3/live/f"; : > "$T/rt3/blocked"
+rt "rp_replace_tree '$T/rt3/cand' '$T/rt3/live' '$T/rt3/blocked/sub/keep'"
+check "an unusable backup location does not stop the replacement" \
+  '[ "$(cat "$T/rt3/live/f")" = "new" ]'
+check "...and the previous collection is kept, not quietly deleted" \
+  '[ -n "$(find "$T/rt3" -maxdepth 1 -name "live.previous.*" 2>/dev/null)" ]'
+check "the candidate is staged beside the live folder before the swap" \
+  'grep -q "inc=\"\$live.incoming" "$ROOT/lib.sh"'
+
+section "78. BMHD is found wherever it sits in the IFF file"
+python3 - "$T" << 'PYIFF'
+import struct, sys, os
+d = sys.argv[1]
+def chunk(cid, p):
+    out = cid + struct.pack(">I", len(p)) + p
+    return out + (b"\x00" if len(p) & 1 else b"")
+def bmhd(w, h, planes):
+    return struct.pack(">HHhhBBBBHBBhh", w, h, 0, 0, planes, 0, 1, 0, 0, 10, 11, w, h)
+def form(body): return b"FORM" + struct.pack(">I", 4 + len(body)) + b"ILBM" + body
+open(os.path.join(d, "first.iff"), "wb").write(form(chunk(b"BMHD", bmhd(320, 128, 8))))
+# BMHD pushed past the first 64 bytes by a leading ANNO chunk
+open(os.path.join(d, "late.iff"), "wb").write(form(chunk(b"ANNO", b"x" * 120) + chunk(b"BMHD", bmhd(160, 64, 5))))
+open(os.path.join(d, "none.iff"), "wb").write(form(chunk(b"ANNO", b"y" * 8)))
+open(os.path.join(d, "cut.iff"), "wb").write(form(chunk(b"ANNO", b"z" * 200))[:40])
+PYIFF
+bm() { ( cd "$ROOT" && python3 -c "
+import importlib.util, sys
+s = importlib.util.spec_from_file_location('t', 'to_ilbm.py')
+m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+try: print('%dx%dx%d' % m.read_bmhd(sys.argv[1]))
+except Exception as e: print('refused')
+" "$1" ) 2>/dev/null; }
+check "BMHD as the first chunk still reads" '[ "$(bm "$T/first.iff")" = "320x128x8" ]'
+check "BMHD past the first 64 bytes is found" '[ "$(bm "$T/late.iff")" = "160x64x5" ]'
+check "a file with no BMHD is refused, not guessed at" '[ "$(bm "$T/none.iff")" = "refused" ]'
+check "a truncated file is refused without a traceback" '[ "$(bm "$T/cut.iff")" = "refused" ]'
+check "the supported Python version is not in doubt (no X | None at runtime)" \
+  '! grep -q "List\[str\] | None" "$ROOT/to_ilbm.py"'
+
+section "79. The artwork search command may carry its own arguments"
+check "it is split into an argument list, never run through a shell" \
+  'grep -q "FETCH_CMD=(\$RP_ARTWORK_FETCH_COMMAND)" "$ROOT/artwork_fetch.sh"'
+check "...and never through eval" '! grep -qE "^[^#]*\beval\b" "$ROOT/artwork_fetch.sh"'
+check "the command is run from that array" 'grep -q "\"\${FETCH_CMD\[@\]}\"" "$ROOT/artwork_fetch.sh"'
+check "an executable that is not on PATH is reported before anything is tried" \
+  'grep -q "which is not an executable on PATH" "$ROOT/artwork_fetch.sh"'
+
+section "80. Every script understands the same output options"
+for s in update.sh extract.sh merge.sh sort.sh; do
+  check "$s accepts --quiet, --verbose and --color" "grep -q 'rp_common_opt' \"\$ROOT/$s\""
+done
+run quietmerge ./merge.sh --quiet --nonsense-option
+check "an unknown option is still refused after the common ones are handled" \
+  '[ "$?" -ne 0 ] || grep -q "Unknown option" "$T/quietmerge.log"'
+check "setup.sh takes its colours from the shared decision, not raw escapes" \
+  '! grep -q "printf .\\\\n\\\\033\[1m== " "$ROOT/setup.sh" && grep -q "RP_C_HEAD" "$ROOT/setup.sh"'
+check "start.sh no longer blanks the colours lib.sh just chose" \
+  '! grep -qE "^RED=\"\"" "$ROOT/start.sh"'
+
+section "81. Housekeeping without parsing ls output"
+check "no script builds a file list out of ls" \
+  '( for f in "$ROOT"/*.sh; do
+       case "${f##*/}" in doctor.sh) continue ;; esac
+       sed -e "s/[[:space:]]#.*$//" -e "s/^[[:space:]]*#.*$//" "$f" | grep -q "ls -1" && exit 1
+     done; exit 0 )'
+lsh() { ( cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; $*" ) 2>/dev/null; }
+rm -rf "$T/ls"; mkdir -p "$T/ls"
+for i in 1 2 3 4 5; do : > "$T/ls/state-2026010$i.tgz"; done
+check "counting matches a glob" '[ "$(lsh "rp_count_matching \"$T/ls/state-*.tgz\"")" = "5" ]'
+check "counting nothing gives zero, not an error" '[ "$(lsh "rp_count_matching \"$T/ls/none-*\"")" = "0" ]'
+check "the newest is the last in shell order" \
+  '[ "$(lsh "rp_newest_matching \"$T/ls/state-*.tgz\"")" = "$T/ls/state-20260105.tgz" ]'
+lsh "rp_prune_oldest 2 \"$T/ls/state-*.tgz\""
+check "pruning keeps exactly the newest few" '[ "$(lsh "rp_count_matching \"$T/ls/state-*.tgz\"")" = "2" ]'
+check "...and the ones it keeps are the newest" '[ -e "$T/ls/state-20260105.tgz" ] && [ ! -e "$T/ls/state-20260101.tgz" ]'
+check "the interactive artwork prompt reads with -r" \
+  'grep -q "read -r -t 30 -p" "$ROOT/merge.sh"'
+
+section "82. Unattended runs are gentle, interactive ones are not slowed down"
+check "nice is only applied off a terminal" 'grep -q "\[ ! -t 1 \]" "$ROOT/lib.sh"'
+check "extraction workers use the prefix" 'grep -q "NICE_PREFIX \$TIMEOUT_CMD" "$ROOT/extract.sh"'
+check "NICE=no turns it off" \
+  '[ -z "$(cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; RP_NICE=no; rp_nice_prefix")" ]'
+check "a missing nice or ionice is not an error" \
+  'grep -q "command -v ionice >/dev/null 2>&1 && ionice" "$ROOT/lib.sh" &&
+   grep -q "command -v nice >/dev/null 2>&1" "$ROOT/lib.sh" &&
+   ( cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; rp_nice_prefix" >/dev/null 2>&1 )'
+check "the wait loop never busy-spins when sleep has no fractions" \
+  'grep -q "rp_short_sleep" "$ROOT/lib.sh" && ! grep -qE "^[^#]*sleep 0\.1" "$ROOT/extract.sh" "$ROOT/merge.sh" "$ROOT/sort.sh"'
+
+section "83. Package installs stay behind the explicit opt-in on every platform"
+check "extract.sh checks the opt-in before the platform branch" \
+  '[ "$(grep -n "rp_may_install_tools" "$ROOT/extract.sh" | head -1 | cut -d: -f1)" -lt "$(grep -n "OS_TYPE.*==.*darwin" "$ROOT/extract.sh" | head -1 | cut -d: -f1)" ]'
+check "start.sh's helper checks it too" \
+  'grep -q "rp_may_install_tools" "$ROOT/start.sh"'
+
+section "84. Counting and numbering the user actually sees"
+check "all.sh announces all five of the steps it counts" \
+  '[ "$(grep -c "rp_step [1-5] \"\$TOTAL_STEPS\"" "$ROOT/all.sh")" -ge 5 ]'
+check "setup.sh numbers its steps 1-9 with none repeated" \
+  '[ "$(grep -o "step \"[0-9]\." "$ROOT/setup.sh" | sort -u | wc -l | tr -d " ")" = "$(grep -c "step \"[0-9]\." "$ROOT/setup.sh")" ]'
+check "the schedule is read back from the crontab, not assumed to be 2am" \
+  '! grep -q "every night at 2am" "$ROOT/lib.sh"'
+check "merge.sh lists --only-missing once" \
+  '[ "$(grep -c "echo \"  --only-missing " "$ROOT/merge.sh")" -eq 1 ]'
+check "start.sh has no dead quick.sh dispatch left" \
+  '! grep -q "build_quick_args" "$ROOT/start.sh" || ! grep -q "ACTION\" = \"quick\"" "$ROOT/start.sh"'
+
+
+section "85. Each collection's reported time is its own work, not zero"
+check "vstart is set before a variant's work, not only read" \
+  '[ "$(grep -c "^[[:space:]]*vstart=\$SECONDS" "$ROOT/all.sh")" -ge 3 ]'
+check "...once for each of the three places a collection is worked on" \
+  '[ "$(grep -c "variant_row" "$ROOT/all.sh")" -ge 4 ]'
+# A real run must now show a non-zero time for the collection it built.
+check "the summary's Time column is filled in from real work" \
+  'grep -q "rp_format_duration" "$ROOT/all.sh"'
+
+
+section "86. doctor.sh reports on the folders the suite actually uses"
+# A self-contained tree: a built collection, real downloads, laced artwork
+# installed the way artwork_sync.sh installs it (inside its pack, not beside it).
+DOC="$T/doc"; rm -rf "$DOC"; mkdir -p "$DOC"
+cp "$REPO"/*.sh "$REPO"/to_ilbm.py "$DOC"/ 2>/dev/null
+chmod +x "$DOC"/*.sh
+mkdir -p "$DOC/build/retro_aga/WHDLoad/Games" \
+         "$DOC/downloads/WHDLoad" "$DOC/downloads/old" \
+         "$DOC/artwork/iGame_AGA/lores/Covers/Games/A" \
+         "$DOC/artwork/iGame_AGA/laced/Covers/Games/A" \
+         "$DOC/artwork/TinyLauncher" \
+         "$DOC/.retroplay/complete"
+echo keep > "$DOC/build/retro_aga/WHDLoad/Games/keep"
+echo art  > "$DOC/artwork/iGame_AGA/laced/Covers/Games/A/iGame.iff"
+head -c 9000000 /dev/zero > "$DOC/downloads/WHDLoad/big.lha"
+printf 'VARIANTS="aga aga-laced rtg"\n' > "$DOC/retroplay.conf"
+( cd "$DOC" && ./doctor.sh ) > "$T/doctor.log" 2>&1
+sed -e 's/\x1b\[[0-9;]*m//g' "$T/doctor.log" > "$T/doctor.txt"
+check "a built collection is reported as built, not as missing" \
+  'grep -q "retro_aga: built" "$T/doctor.txt"'
+check "...and one that really is missing still reads as not built" \
+  'grep -q "retro_rtg: not built yet" "$T/doctor.txt"'
+check "the downloads folder is measured, not the script folder" \
+  '! grep -q "downloads use 0 MB" "$T/doctor.txt"'
+check "laced artwork inside its pack counts as installed" \
+  'grep -q "aga-laced: artwork installed" "$T/doctor.txt"'
+check "...so it is not reported as a missing iGame_AGA_LACED folder" \
+  '! grep -q "iGame_AGA_LACED" "$T/doctor.txt"'
+check "a pack that really is absent is still reported" \
+  'grep -q "for the .rtg. variant" "$T/doctor.txt"'
+check "TinyLauncher in artwork/ is found" \
+  'grep -q "TinyLauncher (last-resort screenshots)" "$T/doctor.txt"'
+check "the artwork folder is named, not 'next to the scripts'" \
+  '! grep -q "next to the scripts" "$T/doctor.txt"'
+check "doctor changes nothing it reports on" \
+  '[ ! -e "$DOC/HD_Loaders" ] && [ ! -e "$DOC/WHDLoad" ] && [ ! -d "$DOC/retro_aga" ]'
+
+section "87. doctor.sh honours NO_COLOR and the shared colour decision"
+( cd "$DOC" && NO_COLOR=1 ./doctor.sh ) > "$T/doctor_nc.log" 2>&1
+check "NO_COLOR leaves no escape sequences in a saved report" \
+  '! grep -q "$(printf "\033")" "$T/doctor_nc.log"'
+( cd "$DOC" && ./doctor.sh --color=never ) > "$T/doctor_cn.log" 2>&1
+check "--color=never does the same" '! grep -q "$(printf "\033")" "$T/doctor_cn.log"'
+( cd "$DOC" && ./doctor.sh --nonsense ) > "$T/doctor_bad.log" 2>&1
+check "an unknown option is still refused" \
+  '[ "$?" -ne 0 ] || grep -q "Unknown option" "$T/doctor_bad.log"'
+( cd "$DOC" && ./doctor.sh --help ) > "$T/doctor_help.log" 2>&1
+check "--help still works and says it changes nothing" \
+  'grep -q "Changes nothing" "$T/doctor_help.log"'
+check "no raw escape sequences left in the source" \
+  '! grep -q "printf .  .\\\\033\[32m" "$DOC/doctor.sh"'
+
+section "88. doctor.sh reads the schedule back instead of assuming it"
+mkdir -p "$T/docbin"
+cat > "$T/docbin/crontab" << 'CRONEOF'
+#!/usr/bin/env bash
+[ "${1:-}" = "-l" ] && { cat "$(dirname "$0")/ct.txt" 2>/dev/null; exit 0; }
+cat > "$(dirname "$0")/ct.txt"; exit 0
+CRONEOF
+chmod +x "$T/docbin/crontab"
+for m in retroplay-all-sh-cron whdsync-all-sh-cron; do
+  printf '45 3 * * * cd /x && ./all.sh --cron # %s\n' "$m" > "$T/docbin/ct.txt"
+  ( cd "$DOC" && PATH="$T/docbin:$PATH" ./doctor.sh ) 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' > "$T/doctor_$m.txt"
+  check "the $m marker is recognised" 'grep -q "installed: 45 3" "$T/doctor_'"$m"'.txt"'
+  check "...and the real time is reported, not 2am ($m)" \
+    'grep -q "runs every night at 03:45" "$T/doctor_'"$m"'.txt"'
+done
+: > "$T/docbin/ct.txt"
+( cd "$DOC" && PATH="$T/docbin:$PATH" ./doctor.sh ) 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' > "$T/doctor_nocron.txt"
+check "no entry reads as not installed" 'grep -q "not installed (optional)" "$T/doctor_nocron.txt"'
+
+section "89. One rule for where each variant's artwork lives"
+ad() { ( cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; rp_artwork_dir_for '$1'" ) 2>/dev/null; }
+check "aga maps to its lores folder"        '[ "$(ad aga)" = "iGame_AGA/lores" ]'
+check "aga-laced maps INSIDE the same pack" '[ "$(ad aga-laced)" = "iGame_AGA/laced" ]'
+check "ecs-laced likewise"                  '[ "$(ad ecs-laced)" = "iGame_ECS/laced" ]'
+check "rtg has no flavour folder"           '[ "$(ad rtg)" = "iGame_RTG" ]'
+check "the folder spelling works too"       '[ "$(ad aga_laced)" = "iGame_AGA/laced" ]'
+check "an unknown variant maps to nothing"  '[ -z "$(ad nonsense)" ]'
+check "doctor and update.sh share the rule rather than each keeping a copy" \
+  'grep -q "rp_artwork_installed" "$ROOT/doctor.sh" &&
+   ! grep -q "iGame_\$(printf" "$ROOT/doctor.sh"'
+
+
+section "90. A build works with macOS pgrep, and a failed stage says why"
+# macOS's BSD pgrep leaves out its own ancestors, so asked for the children
+# of a process that has none it exits 1. sort.sh runs under set -e, and that
+# exit 1 in its cleanup trap turned a finished sort into "sorting failed" -
+# on the Mac only, with nothing in the logs. This pgrep behaves like BSD's.
+mkdir -p "$T/bsdbin"
+cat > "$T/bsdbin/pgrep" << 'PGEOF'
+#!/usr/bin/env bash
+[ "${1:-}" = "-P" ] || exec /usr/bin/pgrep "$@"
+ppid="$2"; anc=" $$ "; p=$$
+while [ "${p:-1}" -gt 1 ]; do p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"; [ -n "$p" ] || break; anc="$anc$p "; done
+out="$(ps -ax -o pid=,ppid= | awk -v pp="$ppid" '$2 == pp {print $1}' |
+       while read -r c; do case "$anc" in *" $c "*) ;; *) echo "$c" ;; esac; done)"
+[ -n "$out" ] && { echo "$out"; exit 0; }
+exit 1
+PGEOF
+chmod +x "$T/bsdbin/pgrep"
+check "the BSD-style pgrep really does exit 1 with no children (the trigger)" \
+  '! "$T/bsdbin/pgrep" -P $$ >/dev/null'
+run bsdsort env PATH="$T/bsdbin:$PATH" ./all.sh --rebuild --variants aga; st=$?
+check "a full build succeeds with BSD pgrep semantics" '[ "$st" -eq 0 ]'
+check "...and never reports that sorting failed" '! grep -qi "sorting.*failed" "$T/bsdsort.log"'
+check "rp_child_pids returns 0 when a process has no children" \
+  '( cd "$ROOT" && PATH="$T/bsdbin:$PATH" bash -c "set -e; SCRIPT_DIR=.; . ./lib.sh; rp_child_pids \$\$ >/dev/null" )'
+# Judged by whether the cleanup REACHED ITS END, not by the exit status: bash
+# 5 can exit 0 even when errexit cut an EXIT trap short (bash 3.2 on a Mac
+# exits 1), so the status alone would pass on Linux with the bug still there.
+# (A script file with a cleanup FUNCTION, as sort.sh has - the inline bash -c
+# form does not trip it.)
+rm -f "$T/reaped.marker"
+cat > "$T/reapprobe.sh" << 'RPEOF'
+set -euo pipefail
+SCRIPT_DIR=.; . ./lib.sh
+cleanup() { local st=$?; rp_reap_children; touch "$MARK"; exit "$st"; }
+trap cleanup EXIT
+echo "work done"
+RPEOF
+( cd "$ROOT" && MARK="$T/reaped.marker" PATH="$T/bsdbin:$PATH" bash "$T/reapprobe.sh" ) >/dev/null 2>&1; st=$?
+check "a set -e cleanup trap runs to its end after reaping (BSD pgrep)" \
+  '[ -e "$T/reaped.marker" ] && [ "$st" -eq 0 ]'
+( cd "$ROOT" && PATH="$T/bsdbin:$PATH" RP_CHILD=1 bash ./sort.sh --dest "$ROOT/build/retro_aga" --skip-variant-sort --called-from-all ) > "$T/bsd_sortonly.log" 2>&1; st=$?
+check "sort.sh itself exits 0 under BSD pgrep, as all.sh runs it" '[ "$st" -eq 0 ]'
+check "sort.sh's cleanup cannot be cut short by errexit" \
+  'sed -n "/^cleanup_sort()/,/^}/p" "$ROOT/sort.sh" | grep -q "set +e"'
+check "an ordinary sort does not trip the new error trap" \
+  '! grep -q "sort.sh stopped at line" "$T/bsdsort.log" "$T"/*.log 2>/dev/null'
+
+# A stage that really does fail must say which, how, and where to look.
+# sort.sh's own handler, lifted out and run against a command that fails.
+mkdir -p "$T/failsort"
+( cd "$ROOT" && bash -c "
+    set -euo pipefail
+    RP_LOG_ROOT='$T/failsort/logs'
+    $(sed -n '/^sort_stopped()/,/^}/p' "$ROOT/sort.sh")
+    set -E
+    trap 'sort_stopped \"\$?\" \"\$LINENO\" \"\$BASH_COMMAND\"' ERR
+    ls /definitely/not/here >/dev/null
+" ) > "$T/failsort/out.log" 2>&1
+check "a silent errexit now names the command that failed" \
+  'grep -q "this command failed with exit" "$T/failsort/out.log" && grep -q "/definitely/not/here" "$T/failsort/out.log"'
+check "...and records it in logs/sort.log for retroerror.log" \
+  'grep -q "/definitely/not/here" "$T/failsort/logs/sort.log"'
+check "a failed stage reports its exit status and where the details are" \
+  'grep -q "failed with exit status" "$ROOT/all.sh" && grep -q "Details: \$RP_LOG_ROOT/retroerror.log" "$ROOT/all.sh"'
+check "...and writes that into retroerror.log, not just the screen" \
+  'sed -n "/^stage_failed()/,/^}/p" "$ROOT/all.sh" | grep -q "retroerror.log"'
+check "no stage still fails with a bare message" \
+  '! grep -q "fail \"sorting failed\"" "$ROOT/all.sh"'
 
 # ================================================================ summary ===
 echo

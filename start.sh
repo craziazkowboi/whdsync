@@ -19,15 +19,17 @@ RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
 # WHAT THIS SCRIPT DOES:
 #   The main entry point for the whole toolkit - a single command line (or
 #   interactive menu, if run with no options) that runs whichever of
-#   update.sh / extract.sh / merge.sh / sort.sh / quick.sh you need,
-#   forwarding the right options to each. --auto runs all four of the
-#   first scripts in sequence (a full collection refresh); the other
-#   single-word actions (--update/--extract/--merge/--sort/--quick) run
+#   update.sh / extract.sh / merge.sh / sort.sh you need, forwarding the
+#   right options to each. --sync (--auto) runs the whole pipeline through
+#   all.sh; the single-word actions (--update/--extract/--merge/--sort) run
 #   just one step, for when you only need to redo part of the pipeline.
+#   --quick / --preview-new also go through all.sh, building the dated batch
+#   of new games without touching the collection. quick.sh itself is now a
+#   compatibility shim around that, not a stage of its own.
 #
 #   Every option this script accepts is really just collected here and
 #   then handed off to the relevant sub-script - see build_merge_args,
-#   build_sort_args, build_extract_args and build_quick_args further down
+#   build_sort_args and build_extract_args further down
 #   for exactly which options go where.
 
 script_start_time=$(date +%s)
@@ -197,10 +199,11 @@ DELEGATED_AUTO=0
 AUTO_EXIT=0
 NOTHING_NEW_FALLBACK=0
 
-# Basic environment / colors (no color for now)
+# Colours come from lib.sh's single rp_set_colours decision (--color, NO_COLOR,
+# terminal or not). These two used to be blanked here, right after that
+# decision was made, which is why start.sh's own messages came out plain even
+# with colour on.
 OS_TYPE="$(uname -s | tr '[:upper:]' '[:lower:]')"
-RED=""
-NC=""
 
 # Prompts to auto-install a missing tool via the platform's package manager.
 # Returns 0 if the tool is available afterwards, 1 otherwise. Declines
@@ -211,6 +214,9 @@ offer_install_pkg() {
     echo "  (no terminal attached to answer a prompt - skipping auto-install of $tool_name)"
     return 1
   fi
+  # The only call site already checks --install-missing-tools; checking again
+  # here means a future one cannot forget to.
+  rp_may_install_tools || { rp_tool_missing_hint "$tool_name"; return 1; }
   if [[ "$OS_TYPE" == "darwin" ]]; then
     printf '%s is missing. Install it now via Homebrew (brew install %s)? [y/N] ' "$tool_name" "$brew_pkg"
   else
@@ -476,12 +482,16 @@ while [ $# -gt 0 ]; do
       echo "  --extract             Only extract archives."
       echo "  --merge               Only merge artwork."
       echo "  --sort                Only sort languages."
-      echo "  --quick               Only process new files (quick.sh)."
-      echo "  --ecs                 Run merge.sh with --ecs."
-      echo "  --aga                 Run merge.sh with --aga."
-      echo "  --rtg                 Run merge.sh with --rtg."
-      echo "  --ecs-laced           Run merge.sh with --ecs-laced (matches iGame_ECS_Laced)."
-      echo "  --aga-laced           Run merge.sh with --aga-laced (matches iGame_AGA_Laced)."
+      echo "  --quick               Old name for --preview-new: build the dated batch"
+      echo "                        of new games and leave the collection alone."
+      echo "  --ecs                 Work on retro_ecs."
+      echo "  --aga                 Work on retro_aga."
+      echo "  --rtg                 Work on retro_rtg."
+      echo "  --ecs-laced           Work on retro_ecs_laced (iGame_ECS_Laced artwork)."
+      echo "  --aga-laced           Work on retro_aga_laced (iGame_AGA_Laced artwork)."
+      echo "                        On their own these pick the collection and the menu"
+      echo "                        decides what to do; add --sync to build, or"
+      echo "                        --refresh-artwork to redo its artwork now."
       echo "  --set [name]          Run merge.sh with --set NAME (any iGame_NAME directory)."
       echo "  --ffs                 Run sort.sh with --ffs (FFS filename limits)."
       echo "  --pfs                 Run sort.sh with --pfs (PFS filename limits, default)."
@@ -785,11 +795,33 @@ while [ $# -gt 0 ]; do
 done
 unset opt_lc
 
+# No action word on the command line, but options that only make sense for
+# one stage? Then that stage is the action. Without this, options like
+#   ./start.sh --aga-laced --refresh-artwork
+# fell through to the interactive menu, which looks like the flags were
+# ignored - and they were.
+if [ -z "$ACTION" ]; then
+  if [ "${#MERGE_EXTRA_ARGS[@]}" -gt 0 ] || [ "$ONLY_MISSING_OPT" -eq 1 ] \
+     || [ -n "$REPORT_MISSING_OPT" ]; then
+    # --refresh-artwork / --only-missing / --report-missing only mean anything
+    # to the artwork merge, so that is the action.
+    #
+    # A BARE variant flag (./start.sh --rtg) deliberately does NOT imply an
+    # action: it selects the collection and the menu still chooses what to do
+    # with it. That has always been its meaning and scripts rely on it.
+    ACTION="merge"
+  fi
+fi
+
 # If no action was specified via CLI, show interactive menu
 if [ -z "$ACTION" ]; then
   echo
   echo "Amiga Retroplay Archive Minimal CLI Dispatcher"
   echo "Version: ${RP_SUITE_VERSION}"
+  if [ -n "$MERGE_OPT" ] || [ -n "$SET_OPT" ]; then
+    # Otherwise a named variant with no action looks like the flag was ignored.
+    echo "Working on: ${MERGE_OPT#--}${SET_OPT:+set $SET_OPT}   (pick what to do with it below)"
+  fi
   echo
   rp_print_status short
   echo
@@ -995,17 +1027,9 @@ build_extract_args() {
   return 0
 }
 
-# Build the quick.sh argument list, forwarding every option it understands.
-build_quick_args() {
-  quick_args=()
-  [ -n "$MERGE_OPT" ] && quick_args+=("$MERGE_OPT")
-  [ -n "$SET_OPT" ] && quick_args+=(--set "$SET_OPT")
-  [ -n "$ART_ORDER_OPT" ] && quick_args+=(--art "$ART_ORDER_OPT")
-  [ -n "$DEMO_ART_OPT" ] && quick_args+=(--demo-art "$DEMO_ART_OPT")
-  [ -n "$DEST_OPT" ] && quick_args+=(-d "$DEST_OPT")
-  [ "$NO_DETOX" -eq 1 ] && quick_args+=(--no-detox)
-  return 0
-}
+# (There used to be a build_quick_args here, and a "quick" action to go with
+# it. Both were dead: --quick has run through the engine as --preview-new
+# since quick.sh became a compatibility shim, so ACTION was never "quick".)
 
 # Main dispatcher logic
 #
@@ -1108,9 +1132,6 @@ elif [ "$ACTION" = "extract" ]; then
 elif [ "$ACTION" = "sort" ]; then
   build_sort_args
   run_step "sort.sh" ./sort.sh "${sort_args[@]+"${sort_args[@]}"}"
-elif [ "$ACTION" = "quick" ]; then
-  build_quick_args
-  run_step "quick.sh" ./quick.sh "${quick_args[@]+"${quick_args[@]}"}"
 else
   echo
   echo "No valid action resolved. Use -h or --help to see available options."

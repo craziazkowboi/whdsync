@@ -70,6 +70,30 @@ if [ -z "$RP_ARTWORK_FETCH_COMMAND" ]; then
     rp_info  "  There is nothing to ask. retroplay.conf.example shows what to put there."
     exit "$RP_EXIT_CONFIG"
 fi
+# ARTWORK_FETCH_COMMAND may carry arguments of its own, e.g.
+#   ARTWORK_FETCH_COMMAND="python3 /home/pi/bin/findart.py --source mobygames"
+# It is split on whitespace into an argv array - NOT run through eval and NOT
+# through a shell, so nothing in it is expanded, substituted or globbed. Two
+# consequences worth knowing, and both are documented in
+# retroplay.conf.example: a path containing spaces will not survive the split
+# (use a small wrapper script), and shell syntax such as pipes or && has no
+# meaning here. Before, the whole string was used as a single executable name,
+# so anything with an argument in it could not run at all.
+FETCH_CMD=()
+set -f                      # no globbing while the string is split
+# shellcheck disable=SC2206  # deliberate word splitting; see above
+FETCH_CMD=($RP_ARTWORK_FETCH_COMMAND)
+set +f
+if [ "${#FETCH_CMD[@]}" -eq 0 ]; then
+    rp_error "ARTWORK_FETCH_COMMAND is set but empty once whitespace is removed"
+    exit "$RP_EXIT_CONFIG"
+fi
+if ! command -v "${FETCH_CMD[0]}" >/dev/null 2>&1; then
+    rp_error "ARTWORK_FETCH_COMMAND starts with '${FETCH_CMD[0]}', which is not an executable on PATH"
+    rp_info  "  Full setting: $RP_ARTWORK_FETCH_COMMAND"
+    rp_action "check ARTWORK_FETCH_COMMAND in retroplay.conf, or set ARTWORK_FETCH=no"
+    exit "$RP_EXIT_CONFIG"
+fi
 # python3 + Pillow are what turn a downloaded picture into an Amiga IFF.
 # Both checks keep their output to themselves: a missing module otherwise
 # prints an ImportError traceback in front of the explanation.
@@ -140,7 +164,7 @@ while IFS= read -r rel; do
     # .png, because most tools choose the format from the extension. Whatever
     # arrives is read by content, so a JPEG saved under this name is fine too.
     img="$TMP/$TRIED.png"
-    if ! "$RP_ARTWORK_FETCH_COMMAND" "$game" "$img" > "$TMP/cmd.log" 2>&1 || [ ! -s "$img" ]; then
+    if ! "${FETCH_CMD[@]}" "$game" "$img" > "$TMP/cmd.log" 2>&1 || [ ! -s "$img" ]; then
         printf ' nothing found\n'
         FAILED=$((FAILED + 1)); continue
     fi

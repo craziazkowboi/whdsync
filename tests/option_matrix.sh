@@ -152,8 +152,31 @@ fi
 if sec 5; then
 echo "== wrappers"
 for w in aga ecs rtg; do tt "0|2" "$w.sh" ./$w.sh; tt "0" "$w.sh --rebuild" ./$w.sh --rebuild; tt "0|2" "$w.sh --skip-update --force" ./$w.sh --skip-update --force; done
+# --help is about the wrapper, not about start.sh --sync --<variant> --help
+for w in aga ecs rtg; do tt "0" "$w.sh --help" ./$w.sh --help; done
+# --laced picks the laced collection; rtg has no laced pack, so it has no flag
+for w in aga ecs; do
+  tt "0" "$w.sh --laced --rebuild" ./$w.sh --laced --rebuild
+  tt "0|2" "$w.sh --laced --skip-update" ./$w.sh --laced --skip-update
+done
 fi
 if sec 6; then
+echo "== laced variants and --all"
+tt "0|2" "all.sh --laced --skip-update" ./all.sh --laced --skip-update
+tt "0|2" "all.sh --aga --laced --skip-update" ./all.sh --aga --laced --skip-update
+tt "0|2" "all.sh --all --skip-update" ./all.sh --all --skip-update
+tt "0|2" "all.sh --variants aga-laced --skip-update" ./all.sh --variants aga-laced --skip-update
+tt "0|2" "all.sh --laced --dry-run" ./all.sh --laced --dry-run
+
+echo "== the same output options everywhere"
+for s2 in update.sh extract.sh merge.sh sort.sh; do
+  tt "0|2|3|4" "$s2 --quiet --help" ./$s2 --quiet --help
+  tt "0|2|3|4" "$s2 --color=never --help" ./$s2 --color=never --help
+  tt "0|2|3|4" "$s2 --no-color --help" ./$s2 --no-color --help
+done
+tt "4" "update.sh --color (no value)" ./update.sh --color
+tt "4" "merge.sh --color (no value)" ./merge.sh --color
+
 echo "== leaf scripts directly"
 tt "0" "extract.sh -u -d x1" ./extract.sh -u -d x1
 tt "0" "extract.sh --exclude-tags AGA,CD32" ./extract.sh -u -d x2 --exclude-tags AGA,CD32

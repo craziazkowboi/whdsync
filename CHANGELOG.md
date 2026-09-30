@@ -1,5 +1,204 @@
 # Changelog
 
+## 0.5 - 2026-09-30 (laced variants, the Pi "hang", and the paths that pointed at the old layout)
+
+### Added
+- **`all.sh` builds the laced variants.** The shipped default is now
+  `VARIANTS="aga ecs rtg aga-laced ecs-laced"`, and `ARTWORK_PACKS` fetches
+  `AGA_Laced` and `ECS_Laced` to match - a laced variant whose pack is not
+  fetched is built from the fallback chain and comes out identical to the
+  plain one, which is worse than not building it.
+  **This is five complete collections on the drive where there were three.**
+  Trim `VARIANTS` in `retroplay.conf` on a small card; the run now prints the
+  list it is about to build, and the existing space check still stops before
+  anything is overwritten.
+- `all.sh --laced` builds the laced form of each AGA/ECS variant selected, and
+  `all.sh --all` builds every variant.
+- `./aga.sh --laced` and `./ecs.sh --laced`.
+- `--quiet`, `--verbose`, `--color=MODE` and `--no-color` now work on
+  `update.sh`, `extract.sh`, `merge.sh` and `sort.sh` when they are run
+  directly, through one `rp_common_opt` in `lib.sh`. Previously only
+  `start.sh` and `all.sh` honoured them.
+- `NICE=auto|no` in `retroplay.conf`. Off a terminal - cron, a redirected log
+  - extraction workers run under `nice` (and `ionice` on Linux), so a nightly
+  build leaves a Pi usable. An interactive run is never slowed down.
+
+### Fixed
+- **`merge.sh --aga-laced` reported "destination folder not found:
+  build/retro" on a machine with three working collections.**
+  `rp_default_collection` was handed the command-line spelling
+  (`aga-laced`) and looked for `build/retro_aga-laced`; collections are named
+  with the folder spelling (`retro_aga_laced`). It now normalises, and when a
+  variant genuinely has no collection yet it says so instead of silently
+  falling back to `build/retro`.
+- **`retro_rtg` looked like it had hung after "installing and adding
+  artwork".** It had not - `merge.sh` was reading the artwork packs, and said
+  nothing at all while it did. Three things changed:
+  - it now names each source as it indexes it, with a count and a total;
+  - the index does one `find` per section and category instead of one per
+    letter of the alphabet - 9 calls per source where there were 324, and an
+    RTG build reads seven sources;
+  - the lower-case index key is a parameter expansion instead of
+    `printf | tr`, removing two forked processes per artwork folder.
+  The destination check and the settings banner also moved *before* the scan,
+  so a wrong `--dest` is reported in a second rather than after it.
+- `./start.sh --aga-laced --refresh-artwork` dropped into the menu.
+  `--refresh-artwork`, `--only-missing` and `--report-missing` only mean
+  anything to the artwork merge, so they now select that stage. A bare variant
+  flag still opens the menu - that is what it has always meant - but the menu
+  now says which collection it is about to work on, and the help no longer
+  claims `--aga` "runs merge.sh".
+- `./aga.sh --help` ran `start.sh --sync --aga --help` and described a build
+  nobody had asked for. Same for `ecs.sh` and `rtg.sh`.
+- `merge.sh` looked for TinyLauncher beside the scripts - the pre-migration
+  location - so the TinyLauncher fallback never fired on a current install.
+- `update.sh --dry-run` compared remote names against the *script* folder
+  rather than `downloads/`, reporting every file on the server as new.
+- `sort.sh`'s compliance check reset the destination to `build/retro` after
+  the run had already resolved it, so a standalone run reported on a folder
+  that was not there while the collection it had just sorted went unchecked.
+- `merge.sh` wrote `merge_errors.log` beside the scripts and `sort.sh` wrote
+  its logs into whatever folder you started from. Both go to `logs/` now, and
+  `all.sh` gathers each stage's log into `retroerror.log` - it calls the stage
+  scripts directly, so the gathering `start.sh` does at the end of a manual
+  run never happened for a pipeline run, and the summary reported "No errors
+  logged" after a stage had written a page of them.
+- `ARTWORK_FETCH_COMMAND` could not carry arguments: the whole string was used
+  as one executable name, so `python3 /path/script.py` could not run at all.
+  It is split into an argument list and run directly - no shell, no `eval` -
+  and an executable that is not on `PATH` is reported before anything starts.
+- A `#` in a setting truncated it: `NTFY_TOPIC="retro#build"` became `retro`.
+  A `#` inside quotes is now an ordinary character, and only a `#` following
+  whitespace starts a comment.
+- `UPDATE_CHECK_INTERVAL_HOURS` was never checked for being a number, so
+  `soon` or `-5` produced malformed arithmetic and a remote check every run.
+- **`rp_replace_tree` could leave the drive with no collection at all.** It
+  backed the live tree up first - across filesystems that means copy, then
+  delete - and only then started copying the replacement in. The window with
+  nothing in place was as long as a full copy of a 9 GB tree. The candidate is
+  now staged beside the live folder first, then two renames in one directory
+  swap them, and the previous collection is retired last. A backup location
+  that cannot be written no longer fails the replacement, and never causes the
+  previous collection to be deleted to hide it.
+- `to_ilbm.py` searched only the first 64 bytes for the BMHD chunk, so a
+  perfectly valid IFF that leads with `ANNO` or `CAMG` was reported as having
+  none. The whole FORM is walked now, bounded by both its declared length and
+  the real file size.
+- `extract.sh` applied the "don't install packages mid-run" opt-in on macOS
+  only, so a Linux build could stop at a `sudo` prompt.
+- `--status` said the nightly run was "every night at 2am" whatever time was
+  actually installed. It reads the time back out of the crontab now.
+- `all.sh` announced five steps and only ever printed four, so a long build
+  sat on "[4/5] Plan" for the whole job.
+- `setup.sh` had two steps numbered 6 and no 7.
+- `start.sh` blanked `RED` and `NC` immediately after `lib.sh` had chosen the
+  colours, so its own messages came out plain even with colour on.
+- `setup.sh` printed raw ANSI escapes and ignored `NO_COLOR`, so a piped setup
+  log was full of control characters.
+- `merge.sh --help` listed `--only-missing` twice, attached its explanation to
+  the wrong option, and gave the wrong default destination.
+
+### Changed
+- `ls -1 ... | sort | awk` and `ls | grep -c .` are gone from the report and
+  backup housekeeping, replaced by `rp_count_matching`, `rp_newest_matching`
+  and `rp_prune_oldest` in `lib.sh` (ShellCheck SC2012; a newline in a name
+  split one entry into two).
+- `sleep 0.1` in the "wait for a free job slot" loops is now `rp_short_sleep`,
+  which probes once and falls back to `sleep 1`. A `sleep` that rejects
+  fractions turned that loop into a busy loop burning a core.
+- `sort.sh`'s worker no longer calls a string `issues` while
+  `check_path_compliance` has a local array of the same name (SC2178/SC2128).
+- `rp_atomic_write` and a few other `A && B || C` chains are spelled out as
+  `if`/`else`. `rp_atomic_write` decides whether a queue survives a crash and
+  should be readable at a glance.
+- Removed dead code: `build_quick_args` and the `quick` action in `start.sh`
+  (unreachable since `quick.sh` became a shim), and `required_art_dirs` in
+  `update.sh` (never read, and out of date with the config).
+
+- `all.sh` reported every collection's build time as zero: `vstart` was read
+  as `${vstart:-$SECONDS}` and never assigned anywhere, so the Time column in
+  the summary was always `SECONDS - SECONDS`. It is set at the start of each
+  collection's own work now.
+
+### "ERROR: sorting failed" on macOS
+- **Every build on a Mac failed at the sort, after the sort had finished.**
+  `sort.sh` runs under `set -e`, and its cleanup trap asks `pgrep -P` for any
+  child processes left to stop. With none left, `pgrep` exits 1. On Linux
+  that never happened, because procps `pgrep` counts the `$(...)` subshell it
+  runs in as a child. macOS's BSD `pgrep` leaves out its own ancestors, so it
+  found nothing, exited 1, and errexit ended the cleanup right there, taking
+  the whole sort down with status 1 after it printed "Sort operation
+  complete". That is why it worked on the Pi and failed on the Mac, and why
+  there was nothing in the logs: nothing had actually gone wrong with the
+  sort. Introduced in 0.4 with the whole-tree child cleanup.
+  Fixed three ways: `rp_child_pids` always returns 0 ("no children" is an
+  answer, not an error); `rp_reap_children` guards its one fallible line;
+  and `sort.sh`'s cleanup turns errexit off before it starts, so no tidy-up
+  step can ever again cut a finished run short.
+- **A failed stage now says what happened.** "ERROR: sorting failed" said
+  neither which stage, nor how, nor where to look. Every stage failure now
+  gives the exit status and its meaning, confirms the collection was not
+  changed and the archives stay queued, and points at `logs/retroerror.log`,
+  which gets the same record.
+- **`sort.sh` names the command that stopped it.** It runs under `set -e`,
+  which stops at the first failing command without a word. It now prints the
+  command, its exit status and the line, and writes the same into
+  `logs/sort.log`, which the pipeline copies into `retroerror.log`.
+
+### doctor.sh
+Brought into scope on request. Every fix below was reproduced on a real
+folder tree first.
+- **Every finished collection was reported as "not built yet".** It looked
+  for `<output>/retro_aga`; collections have lived in `build/retro_aga` since
+  the layout change.
+- **"downloads use 0 MB", always.** The archives were measured with bare
+  relative names from the scripts' folder instead of `downloads/`, so the
+  rebuild-space warning computed from that figure could never fire either.
+  The quarantine folder (`downloads/old`) had the same problem.
+- **The laced artwork was reported missing however often it was
+  downloaded.** doctor built the folder name from the variant name and looked
+  for `iGame_AGA_LACED` / `iGame_AGA_Laced`, which have never existed - the
+  laced flavour lives inside its pack, at `iGame_AGA/laced`. With laced now in
+  the default variants, this would have warned on every machine. doctor now
+  asks `lib.sh` (`rp_artwork_dir_for`, `rp_artwork_installed`), the same rule
+  `update.sh` and `all.sh` use, instead of keeping two private copies of it.
+- TinyLauncher in `artwork/` was never reported (it looked beside the
+  scripts), and the "no artwork" message said "next to the scripts".
+- A schedule installed with the current `whdsync-all-sh` marker read as "not
+  installed". Both markers are matched now, as plain text (`grep -F`), the
+  way `install_cron.sh` writes them - and the time shown is read out of the
+  crontab rather than assumed to be 2am.
+- The locale check demanded `en_US.ISO-8859-1` by name and called anything
+  else a problem, though `extract.sh` is equally happy with the en_AU and
+  en_GB ones. It now checks the same candidate lists through the same helper
+  `extract.sh` uses; a missing Latin-1 locale is a warning, since it only
+  affects a few old archive names.
+- Raw ANSI escapes throughout, so `NO_COLOR` was ignored and a saved report -
+  the thing people send to someone else - was full of control characters.
+  It uses the shared colour decision now and accepts `--color=MODE`.
+- The "no bash 4" fix always said `brew install bash`, on Linux too.
+
+### Notes on what was NOT changed
+- No blanket `set -e`. Adding errexit everywhere fails 121 of the tests: the
+  pipeline deliberately tolerates non-zero and turns "3 archives failed" into
+  a completed build with a warning.
+- The `${ARRAY[@]+"${ARRAY[@]}"}` guards stay: bash < 4.4 errors on
+  `"${arr[@]}"` for an empty array under `set -u`, and every guarded array has
+  an empty case in ordinary use.
+- No `kill 0`.
+- The proposed rewrite of `all.sh` into a fixed five-phase display was not
+  done. The reported problem is the opposite - not enough output during the
+  long silent stretches - and the concrete symptom (step 5 never printed) is
+  fixed above.
+- `--support-bundle`, `--why-queued` and `--status --json` remain deferred.
+- ShellCheck could not be run in the environment these changes were made in
+  (no package for it there). The ShellCheck-class findings above were fixed
+  and verified by hand and by test; CI is still the authority on the rest.
+
+### Tests
+511 automated tests (was 386) and 231 option checks (was 205). Every fix above
+has a test that fails without it.
+
 ## 0.4 - 2026-09-29 (hardening pass: strict mode, temp files, child processes)
 ### Fixed
 - **The Latin-1 extraction passes still never ran on Linux.** Yesterday's
