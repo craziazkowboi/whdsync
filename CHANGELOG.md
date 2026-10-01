@@ -1,6 +1,194 @@
 # Changelog
 
-## 0.5 - 2026-09-30 (laced variants, the Pi "hang", and the paths that pointed at the old layout)
+## 0.5 - 2026-10-01 (laced variants, the Pi "hang", the macOS sort failure, and the paths that pointed at the old layout)
+
+### Last checks before release
+- **Licence: MIT, stated once and consistently.** `LICENSE` said MIT while
+  `start.sh`'s header said Creative Commons BY-NC 4.0 (and a different
+  year). Both now say MIT, copyright 2025-2026 Craziazkowboi and whdsync
+  contributors, and the README and `GITHUB_SETUP.md` agree.
+- **Installing an update could leave a game half-copied in the live
+  collection.** Each changed game's folder was deleted and the new one copied
+  in its place. Now each game is copied in beside the old one and swapped in
+  by renaming, loose files (the `.info` icons) by copy-then-rename, and a
+  marker records that an install is under way; a run stopped part-way is
+  finished or undone, game by game, before the next run touches that
+  collection. Files only the old version had still disappear with it.
+- **Archives are unpacked one at a time in a sealed folder.** The extraction
+  tree sits in the output folder next to the finished collections, and an
+  archive member named `../../..` could have written beside them. Each archive
+  now unpacks several empty levels down inside its own folder; anything that
+  climbs out is caught there, the archive is refused ("REFUSED: it has
+  entries that climb out of their folder") and goes through the normal
+  retry-then-set-aside path. Links pointing out of an archive are removed.
+  Roughly one extra rename and two tiny scans per archive.
+- **Artwork packs: the `..` check was both too strict and useless.** It
+  refused a whole pack if any folder had two dots in its name ("Dr..Doom"),
+  and could not catch a real `../` escape, which has already happened by the
+  time the tree is looked at. Packs now unpack in the same sealed way; links
+  and hard links are still refused.
+- **Lock record removed after the lock was released.** A new run could take
+  the lock and write its record in between, and the old run then deleted the
+  new run's record. The record is now removed first.
+- **Two runs breaking the same stale lock (no `flock`) could both go ahead.**
+  It was broken with "rm, then mkdir". Now an atomic rename decides which run
+  breaks it, and a run that finds the record changed underneath it backs off.
+  Tested with eight runs racing for it: exactly one holds it.
+- **A recycled PID kept a dead run's lock alive.** After a reboot the PID in a
+  stale lock can belong to an unrelated process; `kill -0` alone then called
+  the lock live, for ever. The live process must now also be running the
+  script that took the lock. Anything uncertain still counts as alive.
+- **Replacing an artwork pack removed the old backup before the new one
+  existed**, so a failed move left no rollback copy at all.
+- **Reports gave "build" a time for builds that never started** - a
+  nothing-to-do run, or one stopped in Preflight, reported its plan or
+  preflight time under "build".
+- The support bundle shows a setting's value only if it is one of the suite's
+  own settings known to say nothing private; anything else, including a
+  setting it does not recognise, is `<hidden>`. E-mail addresses and
+  `token=`/`key=`/`password=` values are hidden wherever they appear.
+- Manifests record `archive_fingerprint` (the downloaded archive names) and
+  `artwork_fingerprint` (the packs used, as artwork_sync recorded them, plus
+  the art order). Both are cheap listings, defined in `lib.sh`.
+- "Automatic" job counts live in one tested function (`rp_auto_jobs`) instead
+  of two copies; the numbers are exactly the ones used before (checked across
+  48 machine sizes), and `--verbose` says what was chosen and why.
+- A run building four or more collections says what that multiplies.
+- The suite stamp is `2026.10.01.2`, so these files cannot be mixed with the
+  earlier 0.5 download without the run refusing.
+
+### A314 GUI, last checks
+- New: **Status** and **Check set-up** (read-only, so they never trigger the
+  copy to the Amiga), **Rebuild**, **Skip update**, **Refresh artwork** and
+  **Verbose output** - all options `start.sh` has. A test now checks every
+  option the GUI can send against `start.sh`'s own parser.
+- The output list was created by passing tags inline to `CreateGadgetA()`,
+  which takes a pointer to a tag array; fixed like the `SystemTagList` call.
+- On a screen smaller than the window (a 640x256 PAL Workbench) Intuition now
+  fits the window to it instead of refusing to open it.
+- The two settings to edit are in a box at the top of the file.
+
+### Release housekeeping
+- **The scripts said "release 0.4"** on every banner, `--version` and in the
+  release check, although this changelog was already describing 0.5.
+  `RP_RELEASE` is 0.5 and every script carries the 2026.10.01 stamp. The test
+  that checked the banner had the old number written into it; it now reads
+  the release from `lib.sh` and checks it against the top of this file.
+- `gitignore.txt` is now `.gitignore`, which is what `GITHUB_SETUP.md` has
+  always said it was.
+
+### Fixed in the final pass
+- **`./start.sh --doctor` refused to run when the archive tools were
+  missing** - the one command whose job is to explain how to install them.
+  `--status`, `--plan`, every `--why-*`, `--show-failed` and `--unlock-stale`
+  were blocked the same way. Commands that extract nothing now skip the tool,
+  unlzx, detox and locale checks; a real build still stops for them.
+- **The next ordinary run deleted a `--preview-new` batch** as "wrong folder
+  layout from the old path bug": the layout rule took the preview's own
+  `PREVIEW_ONLY.txt` for debris. Preview batches now carry a machine-readable
+  `.preview_marker`, and only a folder with that marker may hold the readme.
+- **A preview stamped the live collection's manifest `kind=preview`** with
+  that day's date, although a preview leaves the collection untouched.
+- **A hand-run `--artwork-sync` could change packs underneath a nightly
+  build.** It took a private `.artwork.lock` that nothing else held (and no
+  lock at all without `flock`). It now takes the same run lock as every
+  other stage.
+- **An interrupted artwork swap was never put right.** 0.5's safer
+  replacement stages under `<name>.incoming.<pid>` and retires under
+  `<name>.previous.<pid>`; a power cut between its two renames left the pack
+  missing until a successful re-download. The next artwork run now puts the
+  previous version back, removes the half-staged one, and leaves alone
+  anything belonging to a run that is still going.
+- `./aga.sh --rebuild --help` (help anywhere but first) passed `--help` on to
+  a sync; `start.sh` only recognised `--help` in first place before its tool
+  check. Help is recognised anywhere now, and never runs anything.
+- `setup.sh` offered three variants by default while everything else built
+  five, and wrote every artwork pack into the config whatever was chosen. It
+  now defaults to the five, says what five cost before asking, and fetches
+  only the packs the chosen variants use.
+
+### A314 GUI (`a314_retroplay_gui.c`)
+- **The ECS-Lo and AGA-Lo boxes sent `--ecs-lo` / `--aga-lo`, which
+  `start.sh` has never accepted** - every run with one ticked stopped with
+  "Unknown option". They are now **ECS laced** and **AGA laced**
+  (`--ecs-laced` / `--aga-laced`); plain ECS and AGA already are LoRes.
+- **"Merge with Amiga" copied from `PI0:retro`**, a folder the scripts stopped
+  producing when collections became one per variant. `PI_RETRO_SOURCE` is now
+  `PI_BUILD_SOURCE` (the Pi's `build/` folder) and the collection copied is
+  the one for the variant ticked. The window logs both settings when it
+  opens.
+- **The output list was created with `CreateGadgetA()` and inline tags**, the
+  calling convention of the varargs `CreateGadget()`; the first tag value was
+  read as the tag-list address.
+- The command line was built with `strcpy`/`strcat` into a 512-byte buffer
+  that the four text fields together could overrun. Everything now goes
+  through bounded `CopyStr`/`AppendStr`; a command or path that does not fit
+  is refused and logged, never run or copied cut short.
+- Text fields containing a quote, `*` (the AmigaDOS escape character) or a
+  shell metacharacter are refused: they would change the command run on the
+  Pi. Filenames with `"` or `*` are skipped with a note rather than passed to
+  `Copy`.
+- A C99 compound literal is gone, so the SAS/C build line in the header works.
+- Checked with a C99 syntax pass (`-Wall -Wextra`, stub Amiga headers) and the
+  string helpers run under AddressSanitizer. It has still not been compiled or
+  run on a real Amiga.
+
+### Added in the final pass
+- `./start.sh --why-queued NAME`: read-only. Which collections have an archive
+  waiting and why, when it was downloaded, how often it has failed, whether it
+  was set aside as corrupt or replaced by a newer version, and which
+  collections leave it out on purpose (e.g. AGA releases in ECS).
+- `./start.sh --support-bundle`: `logs/whdsync-support-<date>.tar.gz` with
+  versions, tools, settings, status, the doctor report, queue and manifest
+  summaries and recent logs. Private values are replaced with `<hidden>` in
+  every file, logs included; no game, archive or artwork file goes in.
+- `./start.sh --clean-backups [--yes]`. A build no longer ends by asking
+  whether to delete backups - that question came before the summary, so a
+  finished run sat looking unfinished for up to three minutes. The report
+  mentions them once they pass 200 MB.
+- **Five phases**: `[1/5] Preflight`, `[2/5] Updates` (artwork and archives),
+  `[3/5] Plan`, `[4/5] Build`, `[5/5] Finalise`. Artwork used to be a
+  numbered step of its own and nothing marked the end. The `=====` / `---`
+  banners inside the build go through the shared presentation API
+  (`rp_task`, `rp_subtask`; `rp_phase`, `rp_detail`, `rp_summary_row` added
+  alongside), so they follow `--quiet` and the colour setting.
+- The report now shows how long extracting, sorting, the artwork merge and
+  installing took, summed over all collections - taken from `$SECONDS` around
+  work that happens anyway, not from extra scans.
+- `NOCOLOR` is honoured like `NO_COLOR`. An explicit `--color=always` still
+  wins over both, as the no-color.org convention asks.
+- The lock record includes the script version, and `--unlock-stale` shows
+  PID, machine, start time, command and version one per line.
+- Manifests carry `manifest_version=1`, and each collection gets its own copy
+  as `.whdsync_manifest.conf` (a dotfile, so the layout rule is unaffected),
+  so a collection copied elsewhere still says what it is.
+
+### Considered and not done
+- **`NO_COLOR` overriding `--color=always`** (one review): no-color.org says
+  a per-run command-line option should override the variable, which is what
+  the suite already did.
+- **Automatic `JOBS` from storage type**: each stage already scales from CPU
+  count and caps by memory (now in one tested function). Telling a USB SSD
+  from an SD card through a USB bridge is unreliable, and guessing wrong
+  makes a Pi slower, not faster. The per-stage timings are the evidence to
+  tune from.
+- **Rewriting all output into a new format**: the phases and banners were
+  brought into the shared API; the per-game progress inside each stage was
+  left as it is.
+- **Replacing `rp_swap_collection` with `rp_replace_tree`** (one review
+  called it critical): the swap is two renames in one folder with a recovery
+  step that runs before anything else, and it is now tested at every point
+  it could be cut. It is separate on purpose - a collection keeps no backup
+  copy (a second 9 GB tree per variant), an artwork pack does.
+- **Listing every archive before unpacking it**: parsing four tools' listing
+  formats on two systems could not be tested here, and a check that works on
+  one system only is worse than none. Unpacking in a sealed folder catches
+  the same thing on every system.
+- **A full ownership record for every temporary object**: the in-flight names
+  carry the PID of the run that made them, recovery acts only when that run
+  is gone, and the collection-level ones are only ever touched under the run
+  lock. A record file per object would add a write to every game installed.
+
 
 ### Added
 - **`all.sh` builds the laced variants.** The shipped default is now
@@ -196,7 +384,7 @@ folder tree first.
   and verified by hand and by test; CI is still the authority on the rest.
 
 ### Tests
-511 automated tests (was 386) and 231 option checks (was 205). Every fix above
+651 automated tests (was 386) and 231 option checks (was 205). Every fix above
 has a test that fails without it.
 
 ## 0.4 - 2026-09-29 (hardening pass: strict mode, temp files, child processes)

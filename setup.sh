@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.09.29   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.10.01.2   (every script in the set must carry the same stamp)
 # Remember where the user ran this from, before any cd: retroplay.conf is
 # looked for there first (see lib.sh).
 RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
@@ -292,17 +292,35 @@ fi
 step "5. Settings (retroplay.conf)"
 if [ -f "$RP_CONF_FILE" ]; then ok "retroplay.conf already exists - left as it is"
 else
-    variants="$(ask "Which variants to build (aga ecs rtg aga-laced ecs-laced)" "aga ecs rtg")"
+    # The default matches what all.sh builds with no settings at all. Each
+    # variant is a full collection of its own, so say what that costs before
+    # asking - on an SD card or a Pi Zero, three is the sensible start, and
+    # the laced ones can be added to VARIANTS later without redoing anything.
+    note "Each variant is a complete collection: five of them take about five times the"
+    note "space and merge time of one. On a small card, answer: aga ecs rtg"
+    variants="$(ask "Which variants to build (aga ecs rtg aga-laced ecs-laced)" "aga ecs rtg aga-laced ecs-laced")"
+    # Fetch the artwork packs the chosen variants use, and only those: a
+    # laced collection built without its pack comes out identical to the
+    # plain one, and a pack nobody builds from is a wasted download.
+    packs=""
+    for _v in $variants; do
+        case "$(printf '%s' "$_v" | tr '[:upper:]' '[:lower:]')" in
+            aga) packs="$packs AGA" ;;  ecs) packs="$packs ECS" ;;  rtg) packs="$packs RTG" ;;
+            aga-laced) packs="$packs AGA_Laced" ;;  ecs-laced) packs="$packs ECS_Laced" ;;
+        esac
+    done
+    packs="${packs# }"; unset _v
     out="$(ask "Where should the collection go (a folder, e.g. a USB drive; '.' = here)" ".")"
     if [ "$out" != "." ] && [ ! -d "$out" ]; then
         note "$out doesn't exist - using this folder for now (change OUTPUT_ROOT in retroplay.conf later)"
         out="."
     fi
     topic="$(ask "ntfy topic for failure notifications (blank = none)" "")"
-    if [ "$DRY" -eq 1 ]; then echo "  + write retroplay.conf (VARIANTS=\"$variants\", OUTPUT_ROOT=\"$out\")"
+    if [ "$DRY" -eq 1 ]; then echo "  + write retroplay.conf (VARIANTS=\"$variants\", ARTWORK_PACKS=\"$packs\", OUTPUT_ROOT=\"$out\")"
     else
-        awk -v v="$variants" -v o="$out" -v t="$topic" '
+        awk -v v="$variants" -v o="$out" -v t="$topic" -v p="$packs" '
             /^VARIANTS=/    { print "VARIANTS=\"" v "\""; next }
+            /^ARTWORK_PACKS=/ { if (p != "") { print "ARTWORK_PACKS=\"" p "\""; next } }
             /^OUTPUT_ROOT=/ { print "OUTPUT_ROOT=\"" o "\""; next }
             /^NTFY_TOPIC=/  { print "NTFY_TOPIC=\"" t "\""; next }
             { print }' "$SCRIPT_DIR/retroplay.conf.example" > "$RP_CONF_FILE" \

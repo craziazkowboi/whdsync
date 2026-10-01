@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.09.29   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.10.01.2   (every script in the set must carry the same stamp)
 # Remember where the user ran this from, before any cd: retroplay.conf is
 # looked for there first (see lib.sh).
 RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
@@ -482,26 +482,10 @@ get_cpu_cores() {
     echo 4
 }
 
-# Calculate optimal parallel jobs (75% of cores, capped at 16)
-NUM_JOBS=$(( $(get_cpu_cores) * 3 / 4 ))
-[ "$NUM_JOBS" -lt 2 ] && NUM_JOBS=2
-[ "$NUM_JOBS" -gt 16 ] && NUM_JOBS=16
-
-# Lightly cap on very low-memory devices too. These jobs just mv/cp files
-# (much cheaper than extract.sh's decompression), so this is a smaller
-# safety margin than extract.sh's - just enough to avoid piling on dozens
-# of simultaneous file-move jobs on something like a Pi Zero 2W's 512MB.
-_mem_kb=""
-if [ -r /proc/meminfo ]; then
-    _mem_kb=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null)
-elif command -v sysctl >/dev/null 2>&1; then
-    _mem_bytes=$(sysctl -n hw.memsize 2>/dev/null)
-    [ -n "$_mem_bytes" ] && _mem_kb=$((_mem_bytes / 1024))
-fi
-if [ -n "$_mem_kb" ] && [ "$_mem_kb" -gt 0 ] && [ "$_mem_kb" -lt 786432 ] && [ "$NUM_JOBS" -gt 4 ]; then
-    NUM_JOBS=4
-fi
-unset _mem_kb _mem_bytes
+# Parallel jobs: three quarters of the cores, 2-16, at most 4 on a machine
+# under 768 MB. These jobs only move files, so the margin is smaller than
+# extract.sh's. The rule lives in lib.sh (rp_auto_jobs).
+NUM_JOBS="$(rp_auto_jobs sort)"
 # SORT_JOBS (or JOBS, or --jobs N) overrides all of the above; "auto" keeps it.
 NUM_JOBS="$(rp_jobs sort "$NUM_JOBS")"
 

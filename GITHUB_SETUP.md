@@ -31,7 +31,7 @@ With SSH instead: `git@github.com:<your-account>/whdsync.git`.
 ## 4. Check the workflow ran
 
 Open the **Actions** tab. `.github/workflows/tests.yml` runs on every push:
-the 213 tests and the option matrix on Ubuntu and on macOS (which still ships
+the automated tests and the option matrix on Ubuntu and on macOS (which still ships
 bash 3.2 - the reason the scripts are written for it), plus ShellCheck.
 
 This is the first time those run anywhere but Linux, so expect the macOS run
@@ -48,7 +48,7 @@ whdsync/
 ├── tests/                   run_tests.sh, option_matrix.sh - both run offline
 ├── .github/workflows/       CI
 ├── .gitignore               keeps downloads, artwork, builds and logs out
-├── LICENSE                  MIT - change it if you'd rather something else
+├── LICENSE                  MIT
 ├── README.md
 └── CHANGELOG.md
 ```
@@ -69,6 +69,5 @@ outside their temporary folder.
 
 ## A note on the licence
 
-I put MIT in `LICENSE` because it suits a tool like this, but it's your
-project - replace it if you'd prefer something else. It covers these scripts
-only, not the WHDLoad archives, the artwork packs or the games.
+whdsync is MIT-licensed (`LICENSE`). The licence covers these scripts only,
+not the WHDLoad archives, the artwork packs or the games.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.09.29   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.10.01.2   (every script in the set must carry the same stamp)
 # Remember where the user ran this from, before any cd: retroplay.conf is
 # looked for there first (see lib.sh).
 RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
@@ -361,11 +361,24 @@ download_archive() {   # <archive>; leaves a validated file in the cache
 # expected shape. Each archive holds ONE section's category folders
 # (Games/Demos/Magazines/Beta), either at the top level or inside one
 # wrapping folder (sometimes with the section folder in between).
+#
+# Safety, precisely:
+#   * the archive is unpacked several empty folders deep inside this run's
+#     own work folder (see install_pack), so a member named ../x or ../../x
+#     lands inside the work folder rather than in your artwork - and anything
+#     that turns up there, outside the staging folder, means the archive tried
+#     to escape and it is refused;
+#   * no symlinks (one could point anywhere);
+#   * no hard links (a file with a second name is how an archive can tie a
+#     staged file to one outside).
+# A name merely CONTAINING two dots ("Dr..Doom") is an ordinary name: this
+# used to refuse any pack with one such folder, and could never catch a real
+# ../ escape anyway - by the time it looked, the file had already left.
 validate_staging() {   # <staging folder> <target path>
     local stage="$1" target="$2" bad tops n inner t
-    bad="$(cd "$stage" && find . -name '*..*' -o -type l 2>/dev/null | head -5)"
+    bad="$(cd "$stage" && find . \( -type l -o \( -type f -links +1 \) \) -print 2>/dev/null | head -5)"
     if [ -n "$bad" ]; then
-        rp_warn "$target: the archive contains links or '..' paths - refusing it"; return 5
+        rp_warn "$target: the archive contains links - refusing it"; return 5
     fi
     tops="$(cd "$stage" && find . -mindepth 1 -maxdepth 1 | sed 's|^\./||')"
     [ -n "$tops" ] || { rp_warn "$target: the archive is empty"; return 5; }
@@ -398,7 +411,7 @@ _is_category_set() {
 }
 
 install_pack() {   # <archive> <target path, may contain />
-    local archive="$1" target="$2" live="$RP_ARTWORK_ROOT/$2" key state cand backup ts owned=0
+    local archive="$1" target="$2" live="$RP_ARTWORK_ROOT/$2" key state cand backup ts owned=0 stage escaped
     key="$(target_key "$target")"
     state="$(target_state "$target")"
     # iGame_AGA, iGame_ECS, iGame_RTG (with their laced/lores subfolders) and
@@ -430,11 +443,21 @@ install_pack() {   # <archive> <target path, may contain />
     esac
 
     MY_WORK="$WORK_DIR/$key.$$"
-    rm -rf "$MY_WORK"; mkdir -p "$MY_WORK/x" || return 1
+    # Unpacked three empty levels down: a ../ (or ../../../) member stays
+    # inside MY_WORK, where the check below sees it, instead of reaching the
+    # live artwork next door.
+    stage="$MY_WORK/j/j/j/x"
+    rm -rf "$MY_WORK"; mkdir -p "$stage" || return 1
     printf '  unpacking %s -> %s\n' "$archive" "${RP_ARTWORK_ROOT##*/}/$target"
-    ( cd "$MY_WORK/x" && lha x "$CACHE_DIR/$archive" ) > /dev/null 2>&1 || {
+    ( cd "$stage" && lha x "$CACHE_DIR/$archive" ) > /dev/null 2>&1 || {
         rp_warn "$target: could not unpack $archive - the live folder is unchanged"; FAILED=$((FAILED + 1)); return 5; }
-    cand="$(validate_staging "$MY_WORK/x" "$target")" || { FAILED=$((FAILED + 1)); return 5; }
+    escaped="$(find "$MY_WORK" -mindepth 1 ! -path "$MY_WORK/j" ! -path "$MY_WORK/j/j" \
+                 ! -path "$MY_WORK/j/j/j" ! -path "$stage" ! -path "$stage/*" -print 2>/dev/null | head -3)"
+    if [ -n "$escaped" ]; then
+        rp_warn "$target: $archive has entries that climb out of the folder it is unpacked in (../) - refusing it; the live folder is unchanged"
+        FAILED=$((FAILED + 1)); return 5
+    fi
+    cand="$(validate_staging "$stage" "$target")" || { FAILED=$((FAILED + 1)); return 5; }
 
     ts="$(date '+%Y%m%d-%H%M%S')"; backup="$BACKUP_DIR/$key/$ts"
     if [ "$owned" -eq 1 ]; then
@@ -625,18 +648,18 @@ cmd_rollback() {
 # =============================================================================
 mkdir -p "$ART_STATE" "$MANIFEST_DIR" "$WORK_DIR" "$BACKUP_DIR" "$REMOTE_CACHE" 2>/dev/null
 
-# Standalone runs take their own lock; in library mode all.sh already holds
-# the one global lock, so taking another here would deadlock.
-if [ "$CALLED_FROM_ALL" -eq 0 ] && [ "$CMD" != "status" ] && [ "$CMD" != "plan" ] && [ "$CMD" != "verify" ]; then
-    ART_LOCK="$ART_STATE/.artwork.lock"
-    FLOCK_BIN="$(command -v flock 2>/dev/null)"
-    if [ -z "$FLOCK_BIN" ] && command -v brew >/dev/null 2>&1; then
-        p="$(brew --prefix util-linux 2>/dev/null)"; [ -x "$p/bin/flock" ] && FLOCK_BIN="$p/bin/flock"
-    fi
-    if [ -n "$FLOCK_BIN" ]; then
-        exec 8>"$ART_LOCK"
-        "$FLOCK_BIN" -n 8 || rp_die "$RP_EXIT_CONFIG" "another artwork sync is already running"
-    fi
+# Commands that change artwork (sync, rollback) take the ONE run lock that
+# all.sh and every other stage script use. This used to be a private
+# .artwork.lock that nothing else held, so a hand-run --artwork-sync could
+# swap packs while a nightly build was part-way through reading them in the
+# artwork merge - and with no flock installed it took no lock at all.
+# rp_lock_for_stage has the mkdir fallback, and is a no-op in library mode
+# (--called-from-all), where all.sh already holds the lock.
+if [ "$CMD" != "status" ] && [ "$CMD" != "plan" ] && [ "$CMD" != "verify" ]; then
+    rp_lock_for_stage "artwork_sync.sh --$CMD"
+    # A pack swap cut in half by a power cut or a kill leaves the previous
+    # pack under a .previous.<pid> name; put it back before anything else.
+    rp_recover_replacements "$RP_ARTWORK_ROOT"
 fi
 
 case "$CMD" in

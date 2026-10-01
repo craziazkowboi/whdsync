@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.09.29   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.10.01.2   (every script in the set must carry the same stamp)
 # Remember where the user ran this from, before any cd: retroplay.conf is
 # looked for there first (see lib.sh).
 RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
@@ -289,7 +289,13 @@ VARIANT_ROWS=""
 # Per-stage seconds, so a slow run can be explained rather than guessed at.
 # (Per-variant time is already in the summary table; this is the breakdown.)
 STAGE_TIMES=""
+# Inside the build phase, where the time went: added up across every
+# collection and batch, so the report can say whether a slow night was the
+# extraction, the sort, the artwork merge or copying into place. Taken from
+# $SECONDS around calls that happen anyway - nothing is re-scanned to get it.
+EXTRACT_SECS=0; SORT_SECS=0; MERGE_SECS=0; INSTALL_SECS=0
 _stage_t0=0
+BUILD_TIMER_STARTED=0   # build_seconds is only recorded for a build that began
 stage_start() { _stage_t0="$SECONDS"; }
 stage_end()   { STAGE_TIMES="$STAGE_TIMES$1=$(( SECONDS - _stage_t0 ))
 "; }
@@ -302,7 +308,11 @@ variant_row() {   # variant_row <key> <started at $SECONDS> [note]
     games="$(rp_count_games "$dest")"; kb="$(rp_du_kb "$dest")"
     VARIANT_ROWS="$VARIANT_ROWS$key|${games:-0}|$(( ${kb:-0} / 1024 ))|$(rp_format_duration $(( SECONDS - t0 )))|${art:-none}|$note
 "
-    # Record what this collection now is, while the numbers are in hand.
+    # Record what this collection now is, while the numbers are in hand. A
+    # preview left the collection exactly as it was, so there is nothing new
+    # to record - writing one here used to stamp the untouched live
+    # collection "kind=preview" with today's date.
+    [ "$note" = "preview" ] && return 0
     case "$note" in
         built)   kind=full ;;
         updated) kind=update ;;
@@ -362,6 +372,11 @@ done
 # copy on the drive, so "why is this taking all night" and "why is the disk
 # full" both start here.
 rp_info "Collections this run: ${V_TOK[*]}   (set VARIANTS in retroplay.conf to change)"
+if [ "${#V_TOK[@]}" -ge 4 ]; then
+    # Said on every run, plan included: on an SD card this is the line that
+    # explains a full drive or a build that takes all night.
+    rp_info "  Each is a complete collection: ${#V_TOK[@]} of them take about ${#V_TOK[@]} times the space and artwork-merge time of one."
+fi
 if [ -n "$DEST_OVERRIDE" ] && [ "${#V_TOK[@]}" -gt 1 ]; then
     rp_die "$RP_EXIT_CONFIG" "--dest can only be used when building a single variant."
 fi
@@ -394,7 +409,10 @@ fi
 
 finish() {
     local st=$? errs=0 result body sname ssecs free_left
-    stage_end build_seconds
+    # Only a build that actually began has a build time. finish() runs for
+    # every exit, so without this a "nothing to do" run, or one stopped in
+    # Preflight, reported its plan or preflight time as "build".
+    [ "$BUILD_TIMER_STARTED" -eq 1 ] && stage_end build_seconds
     if [ "$DRY_RUN" -eq 0 ]; then rp_lock_release; fi
     rm -f "$REPORT_TMP".* 2>/dev/null        # .missing, .fetch and anything else
     if [ "$DRY_RUN" -eq 1 ]; then rm -f "$REPORT_TMP"; return; fi
@@ -411,6 +429,7 @@ finish() {
     printf 'code=%s\ntime=%s\nresult=%s\nreport=reports/%s.txt\n' "$st" "$(rp_ts)" "$result" "$RUN_TS" \
         | rp_atomic_write "$RP_STATE_DIR/last_run"
     if [ "$st" -ne 2 ] || [ -s "$REPORT_TMP" ]; then
+        rp_step 5 "$TOTAL_STEPS" "Finalise - report, notifications, tidy-up"
         mkdir -p "$REPORT_DIR"
         {
             echo "Amiga Retroplay run report - $(date '+%Y-%m-%d %H:%M:%S')"
@@ -434,6 +453,11 @@ finish() {
                     [ -n "$sname" ] || continue
                     printf '  %-22s %s\n' "${sname%_seconds}" "$ssecs"
                 done
+            fi
+            if [ $((EXTRACT_SECS + SORT_SECS + MERGE_SECS + INSTALL_SECS)) -gt 0 ]; then
+                echo "Inside the build (seconds, all collections together):"
+                printf '  %-22s %s\n' "extract" "$EXTRACT_SECS" "sort" "$SORT_SECS" \
+                    "artwork merge" "$MERGE_SECS" "install" "$INSTALL_SECS"
             fi
             echo
             [ -s "$REPORT_TMP" ] && cat "$REPORT_TMP" && echo
@@ -491,7 +515,7 @@ echo "${RP_C_DIM}Collection: $RP_BUILD_ROOT   Archives: $RP_DOWNLOAD_ROOT   Artw
 fi
 if [ "$DRY_RUN" -eq 0 ]; then
     stage_start
-    rp_step 1 "$TOTAL_STEPS" "Checking the setup and the output drive"
+    rp_step 1 "$TOTAL_STEPS" "Preflight - settings, tools and the output drive"
     rp_restore_state_if_lost
     # After the restore: this writes a timestamp into the state folder, and
     # doing it earlier made a lost state folder look present.
@@ -512,7 +536,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
     rp_backup_state
     rp_done "ready"
 else
-    rp_step 1 "$TOTAL_STEPS" "Checking the setup (plan only)"
+    rp_step 1 "$TOTAL_STEPS" "Preflight - settings and tools (plan only)"
     rp_check_output_root dry || rp_die "$RP_EXIT_CONFIG" "the output folder isn't available (drive not mounted?)"
 fi
 
@@ -552,14 +576,14 @@ artwork_preflight() {
     local missing
     missing="$(rp_artwork_missing "$(printf '%s ' "${V_TOK[@]}")" | tr '\n' ' ')"
     if [ -n "$missing" ]; then
-        rp_step 2 "$TOTAL_STEPS" "[Artwork] missing: $missing- downloading it now"
+        rp_info "  Artwork: not installed yet for $missing- downloading it now"
     else
         # Nothing missing: only check again when the interval says so.
         if [ "$mode" != "auto" ] && [ "$mode" != "yes" ]; then
             rp_debug "artwork present and ARTWORK_SYNC=$mode - not checking for updates"
             return 0
         fi
-        rp_step 2 "$TOTAL_STEPS" "[Artwork] checking for updates ($art_args)"
+        rp_info "  Artwork: checking the packs for updates ($art_args)"
     fi
     # shellcheck disable=SC2086
     ./artwork_sync.sh --sync $art_args --called-from-all; rc=$?
@@ -587,6 +611,10 @@ artwork_preflight() {
     esac
     return 0
 }
+# The five phases the run announces - Preflight, Updates, Plan, Build,
+# Finalise - are owned here. Artwork and the archive server are both
+# "updates", so they are lines under phase 2 rather than phases of their own.
+rp_step 2 "$TOTAL_STEPS" "Updates - artwork packs and new archives"
 stage_start
 artwork_preflight
 stage_end artwork_seconds
@@ -602,13 +630,15 @@ if [ "$DRY_RUN" -eq 0 ]; then
         # previous one under a .previous_ name: put it back before anything
         # else looks at the folder.
         rp_recover_swap "${V_DEST[$i]}"
+        # Likewise a batch of games cut off while being installed.
+        rp_recover_collection "${V_KEY[$i]}" "${V_DEST[$i]}"
         rp_adopt_legacy "${V_KEY[$i]}" "${V_DEST[$i]}"
     done
 fi
 
 stage_start
 if [ "$SKIP_UPDATE" -eq 0 ]; then
-    rp_step 3 "$TOTAL_STEPS" "Checking the Retroplay server for new archives"
+    rp_info "  Archives: checking the Retroplay server for new ones"
     if [ "$DRY_RUN" -eq 1 ]; then
         RP_CHILD=1 ./update.sh --dry-run
     else
@@ -621,6 +651,8 @@ if [ "$SKIP_UPDATE" -eq 0 ]; then
         esac
     fi
     echo
+else
+    rp_info "  Archives: not checked this run (--skip-update / --rebuild) - using what is already downloaded"
 fi
 
 # ============================================================================
@@ -655,7 +687,7 @@ done
 
 stage_end update_seconds
 stage_start
-rp_step 4 "$TOTAL_STEPS" "Plan - working out what needs doing"
+rp_step 3 "$TOTAL_STEPS" "Plan - working out what each collection needs"
 echo
 for i in "${!V_TOK[@]}"; do
     printf '  %-16s %-8s %s%s\n' "${V_KEY[$i]}" "${V_ACT[$i]}" "${V_WHY[$i]}" \
@@ -714,6 +746,7 @@ if [ "$any_work" -eq 0 ]; then
 fi
 stage_end plan_seconds
 stage_start
+BUILD_TIMER_STARTED=1
 mkdir -p "$WORK_ROOT" "$STAGE_ROOT"
 
 # extract.sh writes extract_errors.log into the folder it runs from; when
@@ -791,12 +824,13 @@ ATTEMPTS_FILE="$RP_STATE_DIR/extract_attempts.list"      # "<count><TAB><archive
 
 # run_extract <failure-accumulator> <extract.sh args...>  (from the current folder)
 run_extract() {
-    local acc="$1" tmp st; shift
+    local acc="$1" tmp st t0=$SECONDS; shift
     tmp="$WORK_ROOT/.failed.$$.${RANDOM:-0}"
     # Run from the downloads folder so the paths inside the collection stay
     # WHDLoad/... rather than downloads/WHDLoad/...
     ( cd "$RP_DOWNLOAD_ROOT" && RP_EXTRACT_FAILED_LIST="$tmp" RP_CHILD=1 \
         bash "$SCRIPT_DIR/extract.sh" --called-from-all "$@" ); st=$?
+    EXTRACT_SECS=$((EXTRACT_SECS + SECONDS - t0))
     [ -s "$tmp" ] && cat "$tmp" >> "$acc"
     rm -f "$tmp"
     case "$st" in
@@ -863,20 +897,27 @@ handle_failed() {
 STAGE_RESULT="$WORK_ROOT/.stage_result.$$"
 merge_variant() {   # (adds --refresh-artwork when asked for)
     local i="$1" dir="$2"; shift 2
-    local refresh=""
+    local refresh="" t0=$SECONDS st
     [ "$REFRESH_ART" -eq 1 ] && refresh="--refresh-artwork"
     mkdir -p "$WORK_ROOT" 2>/dev/null
     # shellcheck disable=SC2086
     RP_CHILD=1 RP_RESULT_FILE="$STAGE_RESULT" bash "$SCRIPT_DIR/merge.sh" \
         ${V_MFLAGS[$i]} --art "${V_ART[$i]}" --demo-art "$DEMO_ART" \
         -d "$dir" $DEBUG_FLAG $refresh --called-from-all "$@"
+    st=$?
+    MERGE_SECS=$((MERGE_SECS + SECONDS - t0))
+    return "$st"
 }
 
 sort_folder() {
+    local t0=$SECONDS st
     mkdir -p "$WORK_ROOT" 2>/dev/null
     # shellcheck disable=SC2086
     RP_CHILD=1 RP_RESULT_FILE="$STAGE_RESULT" bash "$SCRIPT_DIR/sort.sh" \
         "$FS_FLAG" $DETOX_FLAG --dest "$1" --called-from-all
+    st=$?
+    SORT_SECS=$((SORT_SECS + SECONDS - t0))
+    return "$st"
 }
 
 # stage_result <key> : the last stage's figure, or empty. Never parses text.
@@ -916,9 +957,7 @@ save_missing_list() {   # <index> <missing-list-file> ; prints the count
 # ============================================================================
 # 3. Full builds - every archive extracted and sorted ONCE for all of them
 # ============================================================================
-# The run announces five steps; this is the fifth, and it never said so. On a
-# long build that left the display stuck on "[4/5] Plan" for the entire job.
-rp_step 5 "$TOTAL_STEPS" "Building the collections"
+rp_step 4 "$TOTAL_STEPS" "Build - extract, sort, add artwork, install"
 FULL=()
 for i in "${!V_TOK[@]}"; do [ "${V_ACT[$i]}" = full ] && FULL+=("$i"); done
 # A preview shows what the NEW archives would add. A collection that does not
@@ -934,7 +973,7 @@ fi
 
 if [ "${#FULL[@]}" -gt 0 ]; then
     names=""; for i in "${FULL[@]}"; do names="$names ${V_KEY[$i]}"; done
-    echo "===== Full build:$names ====="
+    rp_task "Full build:$names"
     arch_kb="$(rp_du_kb "$RP_DOWNLOAD_ROOT")"
     [ "$arch_kb" -gt 0 ] || fail_with "$RP_EXIT_CONFIG" "no downloaded archives found yet (HD_Loaders/, JST/, WHDLoad/) - run once without --rebuild/--skip-update first"
     est_kb=$((arch_kb * RP_SPACE_FACTOR))
@@ -957,14 +996,14 @@ if [ "${#FULL[@]}" -gt 0 ]; then
 
     COMMON="$WORK_ROOT/common"
     if [ -n "$ALL_EXCL" ]; then
-        echo "--- Extracting archives without $ALL_EXCL (shared by all variants) ---"
+        rp_subtask "Extracting archives without $ALL_EXCL (shared by all variants)"
         run_extract "$WORK_ROOT/failed_fresh.list" -u -d "$COMMON" --exclude-tags "$ALL_EXCL" $DEBUG_FLAG
     else
-        echo "--- Extracting all archives ---"
+        rp_subtask "Extracting all archives"
         run_extract "$WORK_ROOT/failed_fresh.list" -u -d "$COMMON" $DEBUG_FLAG
     fi
     mkdir -p "$COMMON"
-    echo "--- Sorting and checking filenames ---"
+    rp_subtask "Sorting and checking filenames"
     sort_folder "$COMMON" || stage_failed "$?" "sorting the extracted games" "sort"
     collect_stage_logs "sort" || true
     check_layout "$COMMON"
@@ -980,7 +1019,7 @@ if [ "${#FULL[@]}" -gt 0 ]; then
         [ "$seen" -eq 1 ] && continue
         n="${#EXTRA_SET[@]}"
         EXTRA_SET+=("$ex"); EXTRA_DIR+=("$WORK_ROOT/extra_$n")
-        echo "--- Extracting the $ALL_EXCL archives${ex:+ (without $ex)} ---"
+        rp_subtask "Extracting the $ALL_EXCL archives${ex:+ (without $ex)}"
         if [ -n "$ex" ]; then
             run_extract "$WORK_ROOT/failed_fresh.list" -u -d "$WORK_ROOT/extra_$n" --only-tags "$ALL_EXCL" --exclude-tags "$ex" $DEBUG_FLAG
         else
@@ -998,12 +1037,11 @@ if [ "${#FULL[@]}" -gt 0 ]; then
         dest="${V_DEST[$i]}"; key="${V_KEY[$i]}"
         extra=""
         for n in ${EXTRA_SET[@]+"${!EXTRA_SET[@]}"}; do [ "${EXTRA_SET[$n]}" = "${V_EXCL[$i]}" ] && extra="${EXTRA_DIR[$n]}"; done
-        echo
         # When this collection's own work starts. ${vstart:-$SECONDS} was the
         # fallback for a variable nothing ever set, so every "Time" in the
         # summary came out as zero.
         vstart=$SECONDS
-        echo "===== $key: installing and adding artwork ====="
+        rp_task "$key: installing and adding artwork"
         # The last variant MOVES the shared tree rather than copying it, so only
         # the extras need room. Work out which measurement is wanted first and
         # take it once: this is a full walk of the staged collection.
@@ -1023,11 +1061,13 @@ if [ "${#FULL[@]}" -gt 0 ]; then
         staged="$(rp_staged_path "$dest")"
         rm -rf -- "$staged"
         mkdir -p "$(dirname "$dest")"
+        _it0=$SECONDS
         if [ "$remaining" -eq 0 ]; then
             mv "$COMMON" "$staged" || fail "could not move the build into $staged"
         else
             cp -a "$COMMON" "$staged" || fail "could not copy the build into $staged"
         fi
+        INSTALL_SECS=$((INSTALL_SECS + SECONDS - _it0))
         [ -n "$extra" ] && { cp -a "$extra/." "$staged/" || fail "could not copy the $ALL_EXCL releases into $staged"; }
         miss="$REPORT_TMP.missing"; : > "$miss"
         merge_variant "$i" "$staged" --report-missing "$miss" || stage_failed "$?" "adding artwork to $key" "$key"
@@ -1035,7 +1075,9 @@ if [ "${#FULL[@]}" -gt 0 ]; then
         # Everything is in place and merged: now, and only now, the previous
         # collection is replaced - two renames in one folder, so the moment
         # where neither is complete is as short as the filesystem can make it.
+        _it0=$SECONDS
         rp_swap_collection "$dest" || fail "could not put the new $key in place - your previous collection was kept"
+        INSTALL_SECS=$((INSTALL_SECS + SECONDS - _it0))
         variant_row "$key" "${vstart:-$SECONDS}" "built"
         rp_mark_complete "$key" "$dest"
         rp_queue_clear "$key"
@@ -1095,8 +1137,7 @@ for g in ${G_SIG[@]+"${!G_SIG[@]}"}; do
     lead="$1"; members="$*"; nmembers=$#
     list="$STAGE_ROOT/applicable_${V_KEY[$lead]}.list"
     names=""; for i in $members; do names="$names ${V_KEY[$i]}"; done
-    echo
-    echo "===== Update:$names ====="
+    rp_task "Update:$names"
 
     if [ ! -s "$list" ]; then
         for i in $members; do
@@ -1118,11 +1159,13 @@ for g in ${G_SIG[@]+"${!G_SIG[@]}"}; do
     rp_require_space "$RP_OUTPUT_ROOT" $((est_kb * (1 + 2 * nmembers))) "processing $narch new archive(s)" \
         || fail_with "$RP_EXIT_CONFIG" "not enough disk space to process the new downloads"
 
-    echo "--- Extracting $narch new archive(s) ---"
+    rp_subtask "Extracting $narch new archive(s)"
     : > "$STAGE_ROOT/failed_$g.list"
+    _xt0=$SECONDS
     (cd "$src" && RP_EXTRACT_FAILED_LIST="$STAGE_ROOT/failed_$g.list" RP_CHILD=1 \
         bash "$SCRIPT_DIR/extract.sh" --called-from-all -u -d "$batch" $DEBUG_FLAG)
     xst=$?
+    EXTRACT_SECS=$((EXTRACT_SECS + SECONDS - _xt0))
     rescue_extract_log "$src"
     case "$xst" in
         0|5) ;;
@@ -1144,7 +1187,7 @@ for g in ${G_SIG[@]+"${!G_SIG[@]}"}; do
     clear_extract_failures "$STAGE_ROOT/ok_$g.list"
     nfailed="$(grep -c . "$failed_rels" 2>/dev/null)"; nfailed="${nfailed:-0}"
     mkdir -p "$batch"
-    echo "--- Sorting and checking filenames ---"
+    rp_subtask "Sorting and checking filenames"
     sort_folder "$batch" || stage_failed "$?" "sorting the new archives" "sort (new batch)"
     collect_stage_logs "sort (new batch)" || true
     mkdir -p "$batch"          # sort.sh removes empty folders
@@ -1163,9 +1206,8 @@ for g in ${G_SIG[@]+"${!G_SIG[@]}"}; do
     for i in $members; do
         remaining=$((remaining - 1))
         key="${V_KEY[$i]}"; dest="${V_DEST[$i]}"; vcopy="$WORK_ROOT/v_$key"
-        echo
         vstart=$SECONDS
-        echo "===== $key: adding artwork and installing the new batch ====="
+        rp_task "$key: adding artwork and installing the new batch"
         if [ "$remaining" -eq 0 ]; then
             mv "$batch" "$vcopy" || fail "could not prepare the batch for $key"
         else
@@ -1177,7 +1219,16 @@ for g in ${G_SIG[@]+"${!G_SIG[@]}"}; do
         if [ "$PREVIEW_ONLY" -eq 1 ]; then
             rp_info "  preview only - $key itself was not changed"
         else
-            rp_replace_and_copy "$vcopy" "$dest" || fail "copying the new batch into $dest failed"
+            _it0=$SECONDS
+            # The marker says "games are being swapped into this collection";
+            # if the run dies before it is removed, the next run finishes or
+            # undoes each swap before doing anything else (rp_recover_collection).
+            mkdir -p "$RP_STATE_DIR/installing" 2>/dev/null
+            printf 'pid=%s\nrun_id=%s\nstarted=%s\n' "$$" "${RUN_ID:-}" "$(rp_ts)" \
+                | rp_atomic_write "$RP_STATE_DIR/installing/$key"
+            rp_replace_and_copy "$vcopy" "$dest" || fail "copying the new batch into $dest failed - every game already installed is complete, the rest stay queued"
+            rm -f -- "$RP_STATE_DIR/installing/$key"
+            INSTALL_SECS=$((INSTALL_SECS + SECONDS - _it0))
         fi
 
         # Keep a dated copy of just this batch (e.g. for copying to the Amiga).
@@ -1193,6 +1244,11 @@ for g in ${G_SIG[@]+"${!G_SIG[@]}"}; do
                 "$key itself was not changed, and these archives are still" \
                 "queued: the next ordinary run installs them properly." \
                 > "${V_NEW[$i]}/$RUN_TS/PREVIEW_ONLY.txt"
+            # The machine-readable marker: what the tools check. The .txt is
+            # for people browsing the folder.
+            printf 'preview=1\ncollection=%s\ncreated_at=%s\nrun_id=%s\nsuite_version=%s\n' \
+                "$key" "$(rp_ts)" "${RUN_ID:-}" "$RP_SUITE_VERSION" \
+                > "${V_NEW[$i]}/$RUN_TS/.preview_marker"
         fi
         rp_prune_batches "${V_NEW[$i]}" "$RP_KEEP_NEW_BATCHES"
 
@@ -1235,9 +1291,8 @@ done
 # ============================================================================
 for i in "${!V_TOK[@]}"; do
     [ "${V_ACT[$i]}" = gapfill ] || continue
-    echo
     vstart=$SECONDS
-    echo "===== ${V_KEY[$i]}: artwork gap-fill ====="
+    rp_task "${V_KEY[$i]}: artwork gap-fill"
     if [ "$REFRESH_ART" -eq 1 ]; then
         echo "  refreshing artwork for ${V_KEY[$i]} (every game)..."
         gapmode=""
@@ -1257,33 +1312,22 @@ for i in "${!V_TOK[@]}"; do
 done
 
 # ----- Saved backups -----
-# State backups and previous artwork versions build up over time. Offer to
-# clear them at the end of a hands-on run. Unattended runs never ask, and
-# the question times out after 3 minutes answering "no", so a run started by
-# hand and left alone can't hang.
-offer_backup_cleanup() {
-    local kb mb reply
-    [ "$DRY_RUN" -eq 0 ] && [ "$CRON" -eq 0 ] || return 0
-    rp_is_interactive || return 0
+# State backups and previous artwork versions build up over time. The run
+# used to ask here whether to delete them - but "here" is before the summary,
+# so a finished build sat looking unfinished, waiting up to three minutes on
+# a question about something else. Now it only says how much they use, once
+# they are worth mentioning, and deleting them is its own command:
+#   ./start.sh --clean-backups
+# Nothing is ever deleted without that explicit request.
+note_backup_space() {
+    local kb
+    [ "$DRY_RUN" -eq 0 ] || return 0
     kb="$(rp_du_kb "$RP_BACKUP_DIR" "$RP_STATE_DIR/artwork/backups")"
-    [ "${kb:-0}" -gt 0 ] || return 0
-    mb=$(( kb / 1024 ))
-    echo
-    echo "Saved backups are using ${mb} MB:"
-    [ -d "$RP_BACKUP_DIR" ] && echo "  $(rp_count_matching "$RP_BACKUP_DIR/state-*.tgz") state backup(s)   ${RP_BACKUP_DIR##*/}/"
-    [ -d "$RP_STATE_DIR/artwork/backups" ] && echo "  previous artwork versions   .retroplay/artwork/backups/"
-    printf 'Delete them? (rollback of artwork won'"'"'t be possible afterwards) [y/N] '
-    reply=""
-    read -r -t 180 reply || { echo; echo "No answer in 3 minutes - keeping them."; return 0; }
-    case "$reply" in
-        [Yy]*)
-            rm -rf "$RP_BACKUP_DIR" "$RP_STATE_DIR/artwork/backups"
-            echo "Deleted. (New backups are made on the next run.)" ;;
-        *) echo "Kept." ;;
-    esac
+    [ "${kb:-0}" -ge $((RP_BACKUP_NOTE_MB * 1024)) ] || return 0
+    report "Saved backups use $((kb / 1024)) MB (state backups and previous artwork). To remove them: ./start.sh --clean-backups"
     return 0
 }
-offer_backup_cleanup
+note_backup_space
 
 # All possible work is done; report extraction failures with exit 5.
 [ "$INTEGRITY_ISSUES" -eq 1 ] && exit "$RP_EXIT_INTEGRITY"

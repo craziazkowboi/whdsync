@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.09.29   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.10.01.2   (every script in the set must carry the same stamp)
 # Remember where the user ran this from, before any cd: retroplay.conf is
 # looked for there first (see lib.sh).
 RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
@@ -13,8 +13,8 @@ RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
 #
 
 # Amiga Retroplay Archive Minimal CLI Dispatcher
-# Copyright (c) 2025 Craziazkowboi
-# License: Creative Commons BY‑NC 4.0 International
+# Copyright (c) 2025-2026 Craziazkowboi and whdsync contributors
+# License: MIT - see LICENSE
 #
 # WHAT THIS SCRIPT DOES:
 #   The main entry point for the whole toolkit - a single command line (or
@@ -45,9 +45,19 @@ INSTALL_MISSING_TOOLS=0
 for _a in "$@"; do [ "$_a" = "--install-missing-tools" ] && { INSTALL_MISSING_TOOLS=1; RP_ALLOW_TOOL_INSTALL=1; export RP_ALLOW_TOOL_INSTALL; }; done
 unset _a
 
-case "${1:-}" in
-    -h|--help)    SHOW_HELP_ONLY=1; HELP_TOPIC="${2:-}" ;;
-esac
+# --help anywhere on the line means help, not "run this, then show help":
+# "./start.sh --sync --help" must never start a sync. The word after --help
+# is a topic ("--help advanced") unless it is another option.
+HELP_TOPIC=""
+_prev=""
+for _a in "$@"; do
+    if [ "$SHOW_HELP_ONLY" -eq 1 ] && [ -z "$HELP_TOPIC" ] && [ "$_prev" = "--help" ]; then
+        case "$_a" in -*) ;; *) HELP_TOPIC="$_a" ;; esac
+    fi
+    case "$_a" in -h|--help) SHOW_HELP_ONLY=1; _prev="--help"; continue ;; esac
+    _prev="$_a"
+done
+unset _a _prev
 
 show_usage_and_exit() {
   # Everyday commands first, in the order someone actually reaches for them;
@@ -82,9 +92,12 @@ show_usage_and_exit() {
   echo "  --why-build VARIANT   Why this collection would (or would not) be rebuilt."
   echo "  --why-artwork NAME    Where artwork for one game was looked for."
   echo "  --why-space           Where the disk space has gone."
+  echo "  --why-queued NAME     Why an archive is (or is not) waiting to be processed."
   echo "  --show-failed         Archives that would not extract, and games with no artwork."
   echo "  --retry-failed        Try the set-aside archives once more."
   echo "  --unlock-stale        Clear a lock left by a run that no longer exists."
+  echo "  --support-bundle      A file to send when asking for help (private values hidden)."
+  echo "  --clean-backups       Delete saved state backups and previous artwork (asks first)."
   echo
   echo "Advanced"
   echo "  --rebuild --clean --skip-update --force --preview-new"
@@ -314,6 +327,23 @@ if [ "${SHOW_HELP_ONLY:-0}" = "1" ]; then
     show_usage_and_exit "${HELP_TOPIC:-}"
 fi
 
+# Commands that only read state (or tidy up a lock) never extract anything,
+# so the archive-tool, unlzx, detox and locale checks below must not stand
+# in their way. Without this, "./start.sh --doctor" - whose whole job is to
+# explain how to install missing tools - refused to run because tools were
+# missing, and so did --status, --plan, the --why-* commands and
+# --unlock-stale.
+NO_TOOLS_NEEDED=0
+for _a in "$@"; do
+    case "$_a" in
+        --status|--doctor|--why-*|--show-failed|--retry-failed|--unlock-stale|\
+        --plan|--dry-run|--test-notify|--support-bundle|--clean-backups)
+            NO_TOOLS_NEEDED=1 ;;
+    esac
+done
+unset _a
+
+if [ "$NO_TOOLS_NEEDED" -eq 0 ]; then
 # ----- Tool dependency check (lha, 7z, unar detox) -----
 missing=()
 for tool in lha 7z unar; do
@@ -452,6 +482,7 @@ elif [[ "$OS_TYPE" != "darwin" ]]; then
     fi
   fi
 fi
+fi   # NO_TOOLS_NEEDED
 
 # Error handler to show which command failed
 error_handler() {
@@ -679,6 +710,23 @@ while [ $# -gt 0 ]; do
       rp_show_failed
       exit 0
       ;;
+    --why-queued)
+      # Read-only: which collections have this archive waiting, and why.
+      rp_require_option_value "$1" "$#" "${2:-}"
+      rp_why_queued "$2"
+      exit $?
+      ;;
+    --clean-backups)
+      # Deleting rollback data is never done by a build; only by asking.
+      if [ "${2:-}" = "--yes" ]; then rp_clean_backups --yes; else rp_clean_backups; fi
+      exit $?
+      ;;
+    --support-bundle)
+      # A redacted archive of versions, settings, status and recent logs for
+      # someone helping you. Nothing private and no game files go in it.
+      rp_support_bundle
+      exit $?
+      ;;
     --retry-failed)
       rp_retry_failed
       exit $?
@@ -704,17 +752,31 @@ while [ $# -gt 0 ]; do
       echo "Run lock"
       echo "  File:     $RP_LOCK_FILE"
       [ -e "$RP_LOCK_FILE.d" ] && echo "  Folder:   $RP_LOCK_FILE.d"
-      echo "  Held by:  $(rp_lock_holder || echo 'unknown - no record file')"
+      if [ -f "$RP_LOCK_FILE.info" ]; then
+        # One line per fact, so the decision below can be checked by eye.
+        echo "  PID:      $(rp_lock_field pid)"
+        echo "  Machine:  $(rp_lock_field host)"
+        echo "  Started:  $(rp_lock_field started)"
+        echo "  Command:  $(rp_lock_field command)"
+        _lver="$(rp_lock_field suite_version)"; _lrel="$(rp_lock_field release)"
+        echo "  Scripts:  ${_lver:-not recorded (taken by a version before 0.5)}${_lrel:+ (release $_lrel)}"
+        echo "  Run id:   $(rp_lock_field run_id)"
+      else
+        echo "  Held by:  unknown - no record file"
+      fi
       _lpid="$(rp_lock_field pid)"; _lhost="$(rp_lock_field host)"
       if [ "$_lhost" != "$RP_LOCK_HOST" ]; then
         rp_warn "that lock was taken on '$_lhost', not on this machine ($RP_LOCK_HOST)"
         rp_info "  Nothing was removed. Check that machine before unlocking by hand."
         exit "$RP_EXIT_CONFIG"
       fi
-      if [ -n "$_lpid" ] && kill -0 "$_lpid" 2>/dev/null; then
-        rp_warn "process $_lpid is still running - that run is alive, not stale"
+      if [ -n "$_lpid" ] && rp_lock_owner_alive "$_lpid" "$(rp_lock_field command)"; then
+        rp_warn "process $_lpid is still running $(rp_lock_field command | cut -d' ' -f1) - that run is alive, not stale"
         rp_info "  Nothing was removed. Wait for it to finish, or stop it yourself."
         exit "$RP_EXIT_CONFIG"
+      fi
+      if [ -n "$_lpid" ] && kill -0 "$_lpid" 2>/dev/null; then
+        rp_info "  (process $_lpid exists, but it is running something else - the number was reused)"
       fi
       if [ ! -e "$RP_LOCK_FILE.d" ]; then
         rp_info "  There is only a leftover record file; flock itself holds no lock now."
@@ -911,6 +973,7 @@ set -e
 # Set error trap
 trap 'error_handler ${LINENO} $?' ERR
 
+if [ "$NO_TOOLS_NEEDED" -eq 0 ]; then
 # ----- Locale check for ASCII & Latin-1 -----
 ascii_locale="C.utf8"
 latin1_locale="en_US.iso88591"
@@ -952,6 +1015,7 @@ if [ "$(uname -s)" != "Darwin" ]; then
     exit 1
   fi
 fi
+fi   # NO_TOOLS_NEEDED
 
 # ----- Helper function: Check if subscript exists -----
 check_script() {

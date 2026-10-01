@@ -14,7 +14,7 @@ downloads/            →  extract  →  artwork  →  sort  →  build/retro_ag
 
 - **Runs on** a Raspberry Pi (including a Pi Zero 2 W) or a Mac. Linux and macOS, nothing else needed.
 - **Safe by design.** It never deletes a collection until its replacement is ready, never overwrites artwork you changed yourself, and stops rather than guessing.
-- **Tested.** 511 automated tests plus 231 option checks, run offline on every change. GitHub Actions runs them on Ubuntu and on macOS (bash 3.2), with ShellCheck.
+- **Tested.** 651 automated tests plus 231 option checks, run offline on every change. GitHub Actions runs them on Ubuntu and on macOS (bash 3.2), with ShellCheck.
 
 ---
 
@@ -104,15 +104,15 @@ It's safe to run again at any time: every step checks first and only does what's
 
 What to expect, in order:
 
-| Step | What happens | How long |
+| Phase | What happens | How long |
 |---|---|---|
-| 1 | Checks your setup and that the drive is there | seconds |
-| 2 | Downloads the artwork packs | minutes |
-| 3 | Mirrors the Retroplay archives | **hours** on a first run |
-| 4 | Works out what needs building | seconds |
-| 5 | Extracts, adds artwork, sorts and installs each variant | **hours** on a Pi |
+| `[1/5] Preflight` | Checks your settings, the tools and that the drive is there | seconds |
+| `[2/5] Updates` | Fetches the artwork packs, then mirrors the Retroplay archives | minutes; **hours** on a first run |
+| `[3/5] Plan` | Works out what each collection needs | seconds |
+| `[4/5] Build` | Extracts, sorts, adds artwork and installs each collection | **hours** on a Pi |
+| `[5/5] Finalise` | Writes the report, sends notifications, tidies up | seconds |
 
-Each step announces itself with the time, and long jobs show a progress bar, so you can always tell it's working. A readable report is written to `reports/`, and a summary appears at the end.
+Each phase announces itself with the time, and long jobs show progress, so you can always tell it's working. A readable report is written to `reports/`, and a summary appears at the end, including how long extracting, sorting, the artwork merge and installing each took — the numbers to look at before changing any `JOBS` setting.
 
 **You can stop it at any time with Ctrl-C.** Nothing is left half-installed: an interrupted build is redone next time, and everything already downloaded is kept.
 
@@ -263,7 +263,7 @@ Within each pack, sections are tried in `ART_ORDER` — `Screens,Covers,Titles` 
 Once a day, a run will tell you if a newer release exists:
 
 ```
- A newer release is available: 0.5   (you are running 0.4)
+ A newer release is available: 0.6   (you are running 0.5)
  Nothing has been downloaded - have a look and decide yourself:
    https://github.com/craziazkowboi/whdsync/releases
 ```
@@ -340,10 +340,25 @@ It checks the whole setup and, for anything wrong, tells you the command that fi
 ./start.sh --why-build aga     # why this collection would (or wouldn't) be rebuilt
 ./start.sh --why-artwork NAME  # where artwork for one game was looked for
 ./start.sh --why-space         # where the disk space has gone
+./start.sh --why-queued Zool   # why an archive is (or isn't) waiting to be processed
 ./start.sh --show-failed       # archives that wouldn't extract, games with no artwork
 ./start.sh --retry-failed      # try the set-aside archives once more
 ./start.sh --unlock-stale      # clear a lock left by a run that no longer exists
+./start.sh --support-bundle    # one file to send when asking for help
+./start.sh --clean-backups     # delete saved state backups and old artwork (asks first)
 ```
+
+None of these need the archive tools, so `--doctor` and `--status` still work on
+a machine where `lha` or `7z` is what's missing.
+
+**`--support-bundle`** writes `logs/whdsync-support-<date>.tar.gz`: versions, OS
+and tool versions, your settings, `--status`, the doctor report, queue and
+manifest summaries and the last 500 lines of each log. It never contains a
+game, archive or artwork file, and your ntfy topic, notification e-mail,
+artwork search command, anything named like a token, key or password,
+passwords in URLs and your home folder's name are replaced with `<hidden>`
+or `~` — in the logs as well as the settings. Look inside before you send it:
+`tar -tzvf logs/whdsync-support-*.tar.gz`.
 
 Each answers from what the run actually recorded — the queues, the build markers
 and each collection's own manifest — not from a guess.
@@ -352,7 +367,8 @@ and each collection's own manifest — not from a guess.
 (`merge.sh`, `sort.sh`, `extract.sh`, `update.sh`) take the same one when you run
 them by hand, so nothing can work on a collection a nightly build is halfway
 through. If a run is killed outright, the next one takes the lock over by itself;
-`--unlock-stale` is there for the rare case where it can't, and it never removes a
+`--unlock-stale` is there for the rare case where it can't. It shows the PID,
+machine, start time, command and script version that took the lock, and it never removes a
 lock whose run is still alive or which was taken on another machine.
 
 **Exit codes**, if you script around it: `0` done, `2` nothing to do, `3` network, `4` setup problem, `5` some archives failed, `130` interrupted.
@@ -434,7 +450,7 @@ Every script takes `-h` / `--help`. Options are case-insensitive where a variant
 | `--preview-new` | Build the dated folder of just the new games; leave the collection alone |
 | `--jobs N` | How many things to do at once (overrides `JOBS` in the config) |
 | `--quiet` / `--verbose` / `--debug` | How much to print |
-| `--color=auto\|always\|never` | Colour, regardless of whether output is a terminal |
+| `--color=auto\|always\|never` | Colour, regardless of whether output is a terminal. `NO_COLOR` or `NOCOLOR` set to anything turns colour off; an explicit `--color=always` still wins, as the [no-color.org](https://no-color.org) convention says |
 
 ### `start.sh` — the front end
 
@@ -538,3 +554,10 @@ Contributions welcome — please keep the tests passing, add one for whatever yo
 To Retroplay for the WHDLoad archives, to the iGame artwork packs and their maintainers, and to the EAB community.
 
 This tool downloads publicly published archives. Make sure you're entitled to the games you use.
+
+---
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE). It covers these scripts only; the WHDLoad
+archives, artwork packs and games belong to their respective authors.

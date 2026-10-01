@@ -401,13 +401,74 @@ rp_config_fingerprint() {
 }
 
 # rp_write_manifest <key> <dest> <kind: full|update> <games> <size kb> <art order> [artwork stamp]
+# rp_write_manifest <key> <collection> <kind> <games> <kb> <art order> <artwork>
+#
+# Records what a collection now is. Called ONLY after the collection has been
+# installed (swapped or updated into place), never before - a failed or
+# interrupted build must never look complete.
+#
+# Written in two places, the same content in both:
+#   .retroplay/manifest/<key>            what the tools read (--why-build,
+#                                        --status); lives with the rest of
+#                                        the state and survives the collection
+#                                        being deleted or moved.
+#   <collection>/.whdsync_manifest.conf  travels WITH the collection, so a copy
+#                                        on the Amiga or a backup drive can
+#                                        still say what it is. A dotfile, so
+#                                        the "only WHDLoad, HD_Loaders and JST
+#                                        at the top" layout rule is unaffected.
+# manifest_version lets the format change later without guessing. The copy in
+# the collection is best effort: a read-only or full collection drive must
+# not fail a build that has otherwise finished.
+#
+# The fingerprints, exactly:
+#   archive_fingerprint   checksum of the sorted list of archive NAMES in
+#                         downloads/ (WHDLoad, HD_Loaders, JST) when the
+#                         collection was recorded. Retroplay puts the version in
+#                         every archive name, so a new or updated game changes
+#                         it; it is a listing, never a read of the archives.
+#   artwork_fingerprint   checksum of the fingerprints artwork_sync.sh recorded
+#                         for the packs this variant uses, plus the art order.
+#                         A pack update changes it.
+#   config_fingerprint    the content-producing settings only (rp_config_
+#                         fingerprint): a changed notification topic is not a
+#                         reason to rebuild, a changed art order is.
+# All three are cheap enough to take at every install. A collection with no
+# manifest (built before 0.5) is simply "details unknown", never "broken".
+RP_MANIFEST_VERSION=1
+rp_archive_fingerprint() {
+    local d
+    for d in WHDLoad HD_Loaders JST; do
+        [ -d "$RP_DOWNLOAD_ROOT/$d" ] && ( cd "$RP_DOWNLOAD_ROOT" && find "$d" -type f \
+            \( -iname '*.lha' -o -iname '*.lzx' -o -iname '*.zip' \) 2>/dev/null )
+    done | LC_ALL=C sort | cksum | awk '{print $1 "-" $2}'
+}
+rp_artwork_fingerprint() {   # <variant> <art order>
+    local dir prefix f
+    dir="$(rp_artwork_dir_for "$1" 2>/dev/null)" || dir=""
+    prefix="$(printf '%s' "$dir" | tr '/' '_')"
+    {
+        printf 'art_order=%s\n' "${2:-}"
+        if [ -n "$prefix" ]; then
+            for f in "${RP_ARTWORK_STATE_ROOT:-$RP_STATE_DIR/artwork}/manifests/$prefix"*; do
+                [ -f "$f" ] && sed -n 's/^fingerprint=//p' "$f"
+            done
+        fi
+    } | LC_ALL=C sort | cksum | awk '{print $1 "-" $2}'
+}
 rp_write_manifest() {
+    local body variant
     rp_state_init
     mkdir -p "$RP_STATE_DIR/manifest" 2>/dev/null || return 0
-    printf 'suite_version=%s\nrelease=%s\nvariant=%s\ncollection_path=%s\ncompleted_at=%s\nkind=%s\ngame_count=%s\nsize_kb=%s\nart_order=%s\nartwork=%s\nfilesystem=%s\nconfig_fingerprint=%s\n' \
-        "$RP_SUITE_VERSION" "$RP_RELEASE" "$1" "$2" "$(rp_ts)" "$3" \
+    variant="${1#retro_}"; variant="$(printf '%s' "$variant" | tr '_' '-')"
+    body="$(printf 'manifest_version=%s\nsuite_version=%s\nrelease=%s\nvariant=%s\ncollection_path=%s\ncompleted_at=%s\nkind=%s\ngame_count=%s\nsize_kb=%s\nart_order=%s\nartwork=%s\nfilesystem=%s\nconfig_fingerprint=%s\narchive_fingerprint=%s\nartwork_fingerprint=%s\n' \
+        "$RP_MANIFEST_VERSION" "$RP_SUITE_VERSION" "$RP_RELEASE" "$1" "$2" "$(rp_ts)" "$3" \
         "${4:-0}" "${5:-0}" "${6:-}" "${7:-}" "${RP_FILESYSTEM:-pfs}" "$(rp_config_fingerprint)" \
-        | rp_atomic_write "$(rp_manifest_file "$1")"
+        "$(rp_archive_fingerprint)" "$(rp_artwork_fingerprint "$variant" "${6:-}")")"
+    printf '%s\n' "$body" | rp_atomic_write "$(rp_manifest_file "$1")"
+    if [ -d "$2" ]; then
+        printf '%s\n' "$body" | rp_atomic_write "$2/.whdsync_manifest.conf" 2>/dev/null || true
+    fi
     return 0
 }
 
@@ -507,14 +568,83 @@ rp_count_games() { rp_game_roots "$1" | grep -c . || true; }
 # first REPLACES its existing folder (removing it), so files that only
 # existed in an older version of that game don't linger alongside the new
 # version. Everything else is merged in normally.
+# rp_replace_and_copy <batch> <collection>
+# Installs a batch of new or updated games into a live collection.
+#
+# Invariant: no game folder in the collection is ever missing or half-copied,
+# however the run ends. This used to delete the old game folder and then copy
+# the new one in, so an interruption left the game gone or partial in the very
+# collection that gets copied to the Amiga. Now each game is:
+#   1. copied in beside the old one as  <game>.incoming.<pid>  (old untouched)
+#   2. old renamed to                   <game>.previous.<pid>  (same folder)
+#   3. new renamed into place           <game>                 (same folder)
+#   4. old deleted
+# Steps 2 and 3 are renames in one directory. A run cut short anywhere is put
+# right by rp_recover_replacements (see rp_recover_collection), which the
+# next run calls before it touches the collection.
+#
+# Everything that is NOT inside a game folder (each game's .info icon, and
+# anything else at the top of a section) is copied file by file, each one via
+# a temporary name and a rename, so a file is likewise old or new, never
+# partly written. The batch itself is left exactly as it was - it is kept
+# afterwards as the dated new_<variant> folder.
+#
+# Returns non-zero on the first failure. Whatever was installed by then is
+# complete; the archives stay queued, so the next run installs the rest.
 rp_replace_and_copy() {
-    local src="$1" dest="$2" rel
+    local src="$1" dest="$2" rel inc prev roots f dir tmpf
     mkdir -p "$dest" || return 1
+    roots="$(rp_game_roots "$src")"
     while IFS= read -r rel; do
         [ -n "$rel" ] || continue
-        [ -d "$dest/$rel" ] && rm -rf -- "${dest:?}/$rel"
-    done < <(rp_game_roots "$src")
-    cp -a "$src/." "$dest/"
+        inc="$dest/$rel.incoming.$$"; prev="$dest/$rel.previous.$$"
+        mkdir -p "$(dirname "$dest/$rel")" || return 1
+        rm -rf -- "$inc" "$prev"
+        cp -a "$src/$rel" "$inc" || { rm -rf -- "$inc"; return 1; }
+        if [ -e "$dest/$rel" ]; then
+            mv -- "$dest/$rel" "$prev" || { rm -rf -- "$inc"; return 1; }
+        fi
+        if ! mv -- "$inc" "$dest/$rel"; then
+            [ -e "$prev" ] && [ ! -e "$dest/$rel" ] && mv -- "$prev" "$dest/$rel"
+            rm -rf -- "$inc"
+            return 1
+        fi
+        rm -rf -- "$prev"
+    done <<EOF
+$roots
+EOF
+    # The rest, one file at a time, each replaced by a rename. One awk pass
+    # drops everything inside a game folder (installed whole above).
+    ( cd "$src" && find . \( -type f -o -type l \) -print ) | sed 's|^\./||' |
+    RP_ROOTS="$roots" awk '
+        BEGIN { n = split(ENVIRON["RP_ROOTS"], r, "\n") }
+        {
+            for (i = 1; i <= n; i++)
+                if (r[i] != "" && index($0, r[i] "/") == 1) next
+            print
+        }' |
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        dir="$(dirname "$dest/$f")"
+        mkdir -p "$dir" || exit 1
+        tmpf="$dir/.${f##*/}.incoming.$$"
+        if ! cp -a "$src/$f" "$tmpf"; then rm -f -- "$tmpf"; exit 1; fi
+        if ! mv -f -- "$tmpf" "$dest/$f"; then rm -f -- "$tmpf"; exit 1; fi
+    done
+}
+
+# rp_recover_collection <key> <collection>
+# Before a run works on a collection: if an earlier run was installing games
+# into it when it stopped (its marker is still there), finish or undo every
+# game it left in flight. Only then, and only for that collection, is the
+# collection walked, so an ordinary run pays nothing for this.
+rp_recover_collection() {
+    local key="$1" dest="$2" mark="$RP_STATE_DIR/installing/$1"
+    [ -e "$mark" ] || return 0
+    rp_recover_replacements "$dest" 5 retire
+    rm -f -- "$mark"
+    rp_warn "the last run was stopped while installing games into $key - every game it was working on is complete again (the archives stay queued)"
+    return 0
 }
 
 # ============================================================================
@@ -722,10 +852,20 @@ rp_sweep_stale_temp() {   # rp_sweep_stale_temp <folder-glob>...
 # The only folders allowed at the top of retro_*, new_*/<batch> and every
 # extracted tree. Prints each unexpected (non-hidden) entry, one per line.
 rp_layout_problems() {
-    local e
+    local e preview=0
+    # A preview batch carries a readme at the top on purpose. Without this
+    # exception the next ordinary run took that readme for debris from the
+    # old path bug and deleted the very preview that had been asked for.
+    # Only in a folder that has the preview marker - a PREVIEW_ONLY.txt that
+    # turns up in a real collection is still reported.
+    [ -f "$1/.preview_marker" ] && preview=1
     for e in "$1"/*; do
         [ -e "$e" ] || continue
-        case "${e##*/}" in WHDLoad|HD_Loaders|JST) ;; *) printf '%s\n' "${e##*/}" ;; esac
+        case "${e##*/}" in
+            WHDLoad|HD_Loaders|JST) ;;
+            PREVIEW_ONLY.txt) [ "$preview" -eq 1 ] || printf '%s\n' "${e##*/}" ;;
+            *) printf '%s\n' "${e##*/}" ;;
+        esac
     done
 }
 
@@ -734,8 +874,8 @@ rp_layout_problems() {
 # can do real damage - e.g. an older extract.sh recreating
 # Users/<you>/Downloads/Amiga/... inside retro_* - so the set is checked as
 # a whole. Prints each script whose stamp doesn't match this lib.sh.
-RP_SUITE_VERSION="2026.09.29"
-RP_RELEASE="0.4"                  # the release these scripts belong to
+RP_SUITE_VERSION="2026.10.01.2"
+RP_RELEASE="0.5"                  # the release these scripts belong to
 RP_SUITE_FILES="all.sh start.sh extract.sh merge.sh sort.sh update.sh quick.sh aga.sh ecs.sh rtg.sh doctor.sh install_cron.sh uninstall_deps.sh setup.sh artwork_sync.sh artwork_fetch.sh"
 
 rp_suite_mismatches() {
@@ -773,9 +913,17 @@ rp_quiet()   { [ "$RP_VERBOSITY" -le 0 ]; }
 rp_verbose_on() { [ "$RP_VERBOSITY" -ge 2 ]; }
 
 # Colour: auto (a terminal, with NO_COLOR empty), always, never.
-# NO_COLOR follows the published convention - ANY non-empty value turns
-# colour off, not only "1". --color=always is a deliberate per-run choice
-# (piping into "less -R"), so it wins over the environment.
+#
+# Precedence, highest first:
+#   1. --color=never / --color=always   (this run's explicit choice)
+#   2. NO_COLOR or NOCOLOR set to anything non-empty -> no colour
+#   3. auto: colour only when stdout is a terminal
+#
+# NO_COLOR follows https://no-color.org - ANY non-empty value turns colour
+# off, not only "1" - and that standard says a per-invocation command-line
+# option overrides it, which is why --color=always (piping into "less -R")
+# still wins. NOCOLOR is the older spelling some tools use; it is treated
+# exactly the same.
 RP_COLOR="${RP_COLOR:-auto}"
 case "$RP_COLOR" in auto|always|never) ;; *) RP_COLOR=auto ;; esac
 rp_colour_on() {
@@ -784,6 +932,7 @@ rp_colour_on() {
         never)  return 1 ;;
     esac
     [ -n "${NO_COLOR:-}" ] && return 1
+    [ -n "${NOCOLOR:-}" ] && return 1
     [ "${RP_FORCE_TTY:-0}" = "1" ] && return 0     # set only by the test suite
     [ -t 1 ]
 }
@@ -811,6 +960,25 @@ rp_step() {
     printf '\n%s[%s/%s]%s %s %s(%s)%s\n' "$RP_C_HEAD" "$n" "$of" "$RP_C_OFF" "$*" "$RP_C_DIM" "$(date '+%H:%M:%S')" "$RP_C_OFF"
 }
 rp_done() { rp_quiet && return 0; printf '      %s%s%s %s\n' "$RP_C_OK" "done" "$RP_C_OFF" "$*"; }
+
+# The rest of the presentation API. One place decides how every kind of line
+# looks, so the whole run reads as one program:
+#   rp_phase <n> <of> <text>   a top-level phase: [2/5] Updates ...   (= rp_step)
+#   rp_task <text>             one collection or job inside a phase
+#   rp_subtask <text>          a step of that job (extracting, sorting ...)
+#   rp_detail <text>           an indented fact under a task
+#   rp_summary_row <cols...>   one aligned row of a summary table
+# plus rp_info / rp_ok / rp_warn / rp_error / rp_action / rp_debug above.
+# Informational lines go to stdout and vanish under --quiet; warnings and
+# errors go to stderr and never do.
+rp_phase()   { rp_step "$@"; }
+rp_task()    { rp_quiet && return 0; printf '\n%s== %s%s\n' "$RP_C_HEAD" "$*" "$RP_C_OFF"; }
+rp_subtask() { rp_quiet && return 0; printf '%s-- %s%s\n' "$RP_C_DIM" "$*" "$RP_C_OFF"; }
+rp_detail()  { rp_quiet && return 0; printf '     %s\n' "$*"; }
+rp_summary_row() {   # rp_summary_row <col1> <col2> ... : fixed widths, plain text
+    rp_quiet && return 0
+    printf '  %-16s %-12s %s\n' "${1:-}" "${2:-}" "${3:-}"
+}
 rp_ts()    { date '+%Y-%m-%d %H:%M:%S'; }
 rp_log()   { printf '[%s] %s\n' "$(rp_ts)" "$*"; }
 rp_warn()  { printf '%sWARNING: %s\n' "$(rp_stamp2 2>/dev/null || true)" "$*" >&2; }
@@ -1461,6 +1629,63 @@ rp_pick_locale() {
 # CPU count alone is a poor guide for small-file work on one USB SSD queue,
 # but the right numbers per platform have to be measured, not guessed - so
 # auto is deliberately unchanged until there are stage timings to look at.
+# ------------------------------------------------- automatic job counts ---
+# What "auto" means, in one place. The numbers are the ones each stage has
+# always used - this only gathers them so they are the same everywhere, can
+# be tested without the hardware, and are explained under --verbose.
+#
+#   extract  one job per CPU core, at most 8, and then by memory:
+#            under 768 MB -> 1 (a Pi Zero 2 W: decompressing in parallel there
+#            invites the out-of-memory killer), under 1.5 GB -> 2.
+#   sort     three quarters of the cores, at least 2, at most 16 (moving
+#            files is cheap); under 768 MB -> at most 4.
+#   merge    worked out by merge.sh itself (cores up to 8, then 2 on a Pi
+#            Zero 2 W or an A314), so not repeated here.
+# Storage type is deliberately NOT used: a USB bridge hides whether it is an
+# SSD or a card, and guessing "SSD" on a card makes a Pi slower, not faster.
+# Explicit settings (--jobs, *_JOBS, JOBS) always win - see rp_jobs.
+#
+# RP_TEST_CORES / RP_TEST_MEM_KB stand in for the hardware in the tests.
+rp_cpu_cores() {
+    local c=""
+    [ -n "${RP_TEST_CORES:-}" ] && { printf '%s' "$RP_TEST_CORES"; return 0; }
+    command -v nproc >/dev/null 2>&1 && c="$(nproc 2>/dev/null)"
+    [ -n "$c" ] || { command -v getconf >/dev/null 2>&1 && c="$(getconf _NPROCESSORS_ONLN 2>/dev/null)"; }
+    [ -n "$c" ] || { command -v sysctl >/dev/null 2>&1 && c="$(sysctl -n hw.ncpu 2>/dev/null)"; }
+    case "$c" in ''|*[!0-9]*|0) c=2 ;; esac
+    printf '%s' "$c"
+}
+rp_mem_kb() {   # total memory in KB, or nothing if it cannot be told
+    local b
+    [ -n "${RP_TEST_MEM_KB:-}" ] && { printf '%s' "$RP_TEST_MEM_KB"; return 0; }
+    if [ -r /proc/meminfo ]; then
+        awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null
+    elif command -v sysctl >/dev/null 2>&1; then
+        b="$(sysctl -n hw.memsize 2>/dev/null)"
+        [ -n "$b" ] && printf '%s' "$((b / 1024))"
+    fi
+}
+# rp_auto_jobs <extract|sort> [cores] [mem_kb]: prints the automatic choice.
+rp_auto_jobs() {
+    local stage="$1" cores="${2:-}" mem="${3:-}" n
+    [ -n "$cores" ] || cores="$(rp_cpu_cores)"
+    [ -n "$mem" ] || mem="$(rp_mem_kb)"
+    case "$stage" in
+        extract)
+            n="$cores"; [ "$n" -gt 8 ] && n=8
+            if [ -n "$mem" ] && [ "$mem" -gt 0 ]; then
+                if   [ "$mem" -lt 786432 ];  then [ "$n" -gt 1 ] && n=1
+                elif [ "$mem" -lt 1572864 ]; then [ "$n" -gt 2 ] && n=2; fi
+            fi ;;
+        sort)
+            n=$(( cores * 3 / 4 )); [ "$n" -lt 2 ] && n=2; [ "$n" -gt 16 ] && n=16
+            if [ -n "$mem" ] && [ "$mem" -gt 0 ] && [ "$mem" -lt 786432 ] && [ "$n" -gt 4 ]; then n=4; fi ;;
+        *) n="$cores" ;;
+    esac
+    [ "$n" -ge 1 ] 2>/dev/null || n=1
+    printf '%s' "$n"
+}
+
 rp_jobs() {   # rp_jobs <stage: extract|merge|sort> <what the stage worked out>
     local stage="$1" fallback="$2" want="" ref
     if [ -n "${RP_JOBS_OVERRIDE:-}" ]; then
@@ -1471,7 +1696,8 @@ rp_jobs() {   # rp_jobs <stage: extract|merge|sort> <what the stage worked out>
         if [ -z "$want" ] || [ "$want" = auto ]; then want="${RP_JOBS:-}"; fi
     fi
     case "$want" in
-        ''|auto) printf '%s' "$fallback"; return 0 ;;
+        ''|auto) rp_verbose "$stage: $fallback job(s) at once (automatic: $(rp_cpu_cores) cores, $(( $(rp_mem_kb || echo 0) / 1024 )) MB memory)" >&2
+                 printf '%s' "$fallback"; return 0 ;;
         *[!0-9]*) rp_warn "JOBS setting '$want' is not a whole number - using $fallback"
                   printf '%s' "$fallback"; return 0 ;;
         0)        printf '%s' "$fallback"; return 0 ;;
@@ -1557,6 +1783,275 @@ rp_show_failed() {
     return 0
 }
 
+# ------------------------------------------------------------ why queued ---
+# rp_why_queued <archive name or part of one>
+# Read-only. Everything the suite knows about one archive: which collections
+# have it waiting, why (when it was downloaded), how often it has failed to
+# extract, whether it was set aside as corrupt or retired by a newer version,
+# and which collections deliberately leave it out. Matching is by plain text,
+# case-insensitive, so "Zool" finds Zool_v1.3_AGA_1234.lha.
+rp_why_queued() {
+    local want="$1" q key hits n found=0 d f attempts excl tag names
+    [ -n "$want" ] || { rp_error "--why-queued needs an archive name (or part of one)"; return 4; }
+    printf 'Archive: %s\n' "$want"
+
+    printf '\nWaiting in a queue\n'
+    for q in "$RP_STATE_DIR"/queue/*.list; do
+        [ -f "$q" ] || continue
+        key="${q##*/}"; key="${key%.list}"
+        hits="$(grep -iF -- "$want" "$q" 2>/dev/null)"
+        [ -n "$hits" ] || continue
+        found=1
+        printf '%s\n' "$hits" | while IFS= read -r f; do printf '  %-18s %s\n' "$key" "$f"; done
+    done
+    [ "$found" -eq 1 ] || printf '  not queued for any collection\n'
+    if [ "$found" -eq 1 ]; then
+        printf '  A download is queued for every collection that should contain it, and\n'
+        printf '  leaves each queue only once that collection has actually absorbed it -\n'
+        printf '  so a queued archive is one that is new, or that a run did not finish.\n'
+    fi
+
+    # Collections that leave it out on purpose (e.g. AGA releases in ECS).
+    # Judged on the archive names actually found, not on what was typed:
+    # "zool" says nothing about AGA, Zool_v1.3_AGA_1234.lha does.
+    names="$( { cat "$RP_STATE_DIR"/queue/*.list 2>/dev/null
+                for f in WHDLoad HD_Loaders JST; do
+                    [ -d "$RP_DOWNLOAD_ROOT/$f" ] && find "$RP_DOWNLOAD_ROOT/$f" -type f 2>/dev/null
+                done; } | grep -iF -- "$want" | sed 's|.*/||' | sort -u | tr '[:lower:]' '[:upper:]')"
+    for d in $(printf '%s' "$RP_VARIANTS" | tr ',' ' '); do
+        excl="$(rp_exclude_tags_for "$d")"
+        [ -n "$excl" ] && [ -n "$names" ] || continue
+        for tag in $(printf '%s' "$excl" | tr ',' ' '); do
+            tag="$(printf '%s' "$tag" | tr '[:lower:]' '[:upper:]')"
+            if printf '%s\n' "$names" | grep -q -e "_${tag}_" -e "_${tag}\." -e "^${tag}_"; then
+                printf '  retro_%s leaves out %s releases on purpose (EXCLUDE_TAGS_%s), so it never queues this.\n' \
+                    "$(rp_variant_suffix "$d")" "$tag" "$(printf '%s' "$d" | tr '[:lower:]-' '[:upper:]_')"
+            fi
+        done
+    done
+
+    printf '\nDownloaded\n'
+    n=0
+    if [ -s "$RP_LOG_ROOT/update.log" ]; then
+        grep -iF -- "$want" "$RP_LOG_ROOT/update.log" 2>/dev/null | tail -5 | while IFS= read -r f; do
+            printf '  %s\n' "$f"
+        done
+        n="$(grep -ciF -- "$want" "$RP_LOG_ROOT/update.log" 2>/dev/null || true)"
+    fi
+    [ "${n:-0}" -gt 0 ] || printf '  no record in update.log (downloaded before the log began, or not at all)\n'
+    for d in WHDLoad HD_Loaders JST; do
+        [ -d "$RP_DOWNLOAD_ROOT/$d" ] || continue
+        find "$RP_DOWNLOAD_ROOT/$d" -type f -iname "*$want*" 2>/dev/null | head -5 | while IFS= read -r f; do
+            printf '  on disk: %s\n' "${f#"$RP_DOWNLOAD_ROOT"/}"
+        done
+    done
+
+    printf '\nExtraction attempts\n'
+    attempts=""
+    [ -s "$RP_STATE_DIR/extract_attempts.list" ] && \
+        attempts="$(grep -iF -- "$want" "$RP_STATE_DIR/extract_attempts.list" 2>/dev/null)"
+    if [ -n "$attempts" ]; then
+        printf '%s\n' "$attempts" | while IFS="$(printf '\t')" read -r n f; do
+            printf '  failed %s time(s): %s\n' "$n" "$f"
+        done
+        printf '  After %s failures an archive is moved to old/corrupt-<date>/ and a fresh\n' "$RP_MAX_EXTRACT_ATTEMPTS"
+        printf '  copy is downloaded. ./start.sh --retry-failed clears the count.\n'
+    else
+        printf '  none failed\n'
+    fi
+
+    printf '\nSet aside\n'
+    n=0
+    if [ -d "$RP_DOWNLOAD_ROOT/old" ]; then
+        find "$RP_DOWNLOAD_ROOT/old" -type f -iname "*$want*" 2>/dev/null | head -10 | while IFS= read -r f; do
+            f="${f#"$RP_DOWNLOAD_ROOT"/old/}"
+            case "$f" in
+                corrupt-*) printf '  corrupt, set aside on %s: %s\n' "$(printf '%s' "${f%%/*}" | sed 's/^corrupt-//')" "${f#*/}" ;;
+                *)         printf '  replaced by a newer version on %s: %s\n' "${f%%/*}" "${f#*/}" ;;
+            esac
+        done
+        n="$(find "$RP_DOWNLOAD_ROOT/old" -type f -iname "*$want*" 2>/dev/null | grep -c . || true)"
+    fi
+    [ "${n:-0}" -gt 0 ] || printf '  nothing matching in old/\n'
+    printf '\n(Read-only: nothing was changed.)\n'
+    return 0
+}
+
+# --------------------------------------------------------- support bundle ---
+# rp_redact: stdin -> stdout with every secret removed. The secrets are the
+# values of the settings that are private (the ntfy topic IS a password -
+# anyone who knows it can read the notifications), the home folder is
+# shortened to ~, and credentials inside URLs are blanked. Matching is plain
+# text (awk index), so nothing in a secret is treated as a pattern.
+rp_redact() {
+    RP_REDACT_LIST="$(printf '%s\n' "${RP_NTFY_TOPIC:-}" "${RP_NOTIFY_EMAIL:-}" \
+        "${RP_ARTWORK_FETCH_COMMAND:-}" | awk 'length($0) >= 3')" \
+    RP_REDACT_HOME="${HOME:-}" awk '
+        BEGIN { n = split(ENVIRON["RP_REDACT_LIST"], sec, "\n"); home = ENVIRON["RP_REDACT_HOME"] }
+        {
+            line = $0
+            for (k = 1; k <= n; k++) {
+                s = sec[k]; if (s == "") continue
+                while ((i = index(line, s)) > 0)
+                    line = substr(line, 1, i - 1) "<hidden>" substr(line, i + length(s))
+            }
+            if (length(home) > 1)
+                while ((i = index(line, home)) > 0)
+                    line = substr(line, 1, i - 1) "~" substr(line, i + length(home))
+            gsub(/:\/\/[^\/@ ]+@/, "://<hidden>@", line)
+            # Things that are private wherever they turn up, set or not:
+            # e-mail addresses, and token=/key=/password= style URL values.
+            gsub(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z][A-Za-z]+/, "<hidden e-mail>", line)
+            # token=..., key=..., password=... (any case): keep the name, hide
+            # the value. Matched on a lower-case copy so the positions line up;
+            # a value may not start with "<", so <hidden> is never re-matched.
+            while (1) {
+                lc = tolower(line)
+                if (!match(lc, /(token|key|apikey|api_key|access_token|auth|password|passwd|pass|secret|sig)=[^&; \t"<][^&; \t"]*/)) break
+                eq = index(substr(lc, RSTART, RLENGTH), "=")
+                line = substr(line, 1, RSTART + eq - 1) "<hidden>" substr(line, RSTART + RLENGTH)
+            }
+            print line
+        }'
+}
+
+# rp_support_bundle: a small archive of what someone helping you would ask
+# for, with nothing private in it. Read-only apart from writing the archive.
+#
+# IN it:     versions, OS and tool versions, retroplay.conf with private
+#            values hidden, --status, the doctor report, queue and manifest
+#            summaries, the lock record, the last run report, and the last
+#            500 lines of each of this tool's own logs.
+# NOT in it: any archive, game, artwork or collection file; anything outside
+#            this tool's folders; the ntfy topic, notification e-mail, the
+#            artwork search command, any setting whose name contains TOKEN,
+#            KEY, PASS, SECRET or AUTH, passwords in URLs, or your home
+#            folder's name (shown as ~).
+rp_support_bundle() {
+    local tmp out ts d f key
+    ts="$(date '+%Y%m%d-%H%M%S')"
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/whdsync_support.XXXXXX")" || { rp_error "could not make a temporary folder"; return 1; }
+    d="$tmp/whdsync-support-$ts"; mkdir -p "$d"
+
+    {
+        printf 'whdsync %s (suite %s)\n' "$RP_RELEASE" "$RP_SUITE_VERSION"
+        printf 'bash %s\n' "$BASH_VERSION"
+        uname -a 2>/dev/null
+        if [ -r /etc/os-release ]; then sed -n 's/^PRETTY_NAME=//p' /etc/os-release | tr -d '"'
+        elif command -v sw_vers >/dev/null 2>&1; then sw_vers 2>/dev/null; fi
+        [ -r /sys/firmware/devicetree/base/model ] && { tr -d '\0' < /sys/firmware/devicetree/base/model; echo; }
+        printf '\nTools\n'
+        for f in lha 7z unar unlzx wget curl python3 flock detox bash; do
+            if command -v "$f" >/dev/null 2>&1; then printf '  %-8s %s\n' "$f" "$(command -v "$f")"
+            else printf '  %-8s missing\n' "$f"; fi
+        done
+        printf '\nDisk\n'; df -Pk "$RP_OUTPUT_ROOT" 2>/dev/null | sed 's/^/  /'
+    } 2>&1 | rp_redact > "$d/system.txt"
+
+    if [ -f "$RP_CONF_FILE" ]; then
+        # An ALLOWLIST: a setting's value is shown only when it is one of the
+        # suite's own settings and is known to say nothing private (paths,
+        # numbers, yes/no choices, variant names). Everything else - the
+        # notification settings, the artwork search command, and any line
+        # the suite does not recognise at all - is shown as <hidden>. Hiding
+        # by name ("contains TOKEN or KEY") would miss a secret with an
+        # innocent-looking name.
+        awk -v safe=" VARIANTS OUTPUT_ROOT ART_ORDER DEMO_ART_ORDER FILESYSTEM USE_DETOX MIN_FREE_MB SPACE_FACTOR KEEP_NEW_BATCHES OLD_ARCHIVE_DAYS LOG_MAX_MB LOG_KEEP NOTIFY_ON_SUCCESS STRUCTURED_ART_SETS MAX_EXTRACT_ATTEMPTS DOWNLOAD_RETRIES GAPFILL_DAYS VERIFY_DOWNLOADS ARTWORK_SYNC ARTWORK_SOURCE_URL ARTWORK_ARCHIVE_DIR ARTWORK_STATE_ROOT ARTWORK_PACKS ARTWORK_OPTIONAL_PACKS ARTWORK_KEEP_BACKUPS ARTWORK_LOCAL_CHANGE_POLICY ARTWORK_VERIFY_DOWNLOADS ARTWORK_FAILURE_POLICY ARTWORK_CHECK_INTERVAL_HOURS ARTWORK_FETCH ARTWORK_FETCH_LIMIT ARTWORK_DIR BUILD_DIR DOWNLOAD_DIR LOG_DIR LOG_RETENTION_DAYS STATE_BACKUP_MAX_MB STATE_BACKUP PROGRESS_STYLE NICE JOBS EXTRACT_JOBS MERGE_JOBS SORT_JOBS UPDATE_CHECK UPDATE_CHECK_URL UPDATE_CHECK_INTERVAL_HOURS REPO_URL " '
+            /^[ \t]*#/ || !/=/ { print; next }
+            {
+                key = $0; sub(/^[ \t]*/, "", key); sub(/[ \t]*=.*/, "", key)
+                if (index(safe, " " key " ") || key ~ /^(ART_ORDER|EXCLUDE_TAGS)_[A-Z0-9_]+$/) { print; next }
+                val = $0; sub(/^[^=]*=[ \t]*/, "", val)
+                print key "=" ((val == "" || val == "\"\"" || val == "'"''"'") ? "\"\"" : "\"<hidden>\"")
+            }' "$RP_CONF_FILE" | rp_redact > "$d/retroplay.conf.txt"
+    else
+        printf 'no retroplay.conf - built-in defaults in use\n' > "$d/retroplay.conf.txt"
+    fi
+
+    { rp_print_status 2>&1; } | rp_redact > "$d/status.txt"
+    if [ -x "$SCRIPT_DIR/doctor.sh" ]; then
+        NO_COLOR=1 "$SCRIPT_DIR/doctor.sh" --color=never 2>&1 | rp_redact > "$d/doctor.txt"
+    fi
+
+    {
+        for f in "$RP_STATE_DIR"/queue/*.list; do
+            [ -f "$f" ] || continue
+            key="${f##*/}"; printf '%s: %s queued\n' "${key%.list}" "$(grep -c . "$f" 2>/dev/null || echo 0)"
+            head -20 "$f" | sed 's/^/  /'
+        done
+        printf '\nExtraction attempts\n'
+        [ -s "$RP_STATE_DIR/extract_attempts.list" ] && sed 's/^/  /' "$RP_STATE_DIR/extract_attempts.list"
+        printf '\nManifests\n'
+        for f in "$RP_STATE_DIR"/manifest/*; do
+            [ -f "$f" ] || continue
+            printf '== %s\n' "${f##*/}"; cat "$f"
+        done
+        printf '\nLock\n'
+        if [ -f "$RP_LOCK_FILE.info" ]; then cat "$RP_LOCK_FILE.info"; else printf '  none\n'; fi
+    } 2>&1 | rp_redact > "$d/state.txt"
+
+    mkdir -p "$d/logs"
+    for f in "$RP_LOG_ROOT"/*.log; do
+        [ -f "$f" ] || continue
+        tail -n 500 "$f" 2>/dev/null | rp_redact > "$d/logs/${f##*/}"
+    done
+    f="$(rp_newest_matching "$RP_REPORT_ROOT/[0-9]*.txt" || true)"
+    [ -n "$f" ] && rp_redact < "$f" > "$d/last_report.txt"
+
+    mkdir -p "$RP_LOG_ROOT" 2>/dev/null
+    out="$RP_LOG_ROOT/whdsync-support-$ts.tar.gz"
+    if ( cd "$tmp" && tar -czf "$out" "whdsync-support-$ts" ); then
+        rm -rf -- "$tmp"
+        rp_ok "support bundle written: $out"
+        rp_info "  In it: versions, OS and tools, your settings with private values hidden,"
+        rp_info "  status, the doctor report, queue and manifest summaries, and recent logs."
+        rp_info "  Not in it: any game, archive or artwork file, the ntfy topic, e-mail"
+        rp_info "  address, artwork search command, passwords, or your home folder's name."
+        rp_info "  Look inside before sending it:  tar -tzvf \"$out\""
+        return 0
+    fi
+    rm -rf -- "$tmp"
+    rp_error "could not write the support bundle to $out"
+    return 1
+}
+
+# Only mention saved backups in the run report once they reach this size.
+RP_BACKUP_NOTE_MB="${RP_BACKUP_NOTE_MB:-200}"
+
+# rp_clean_backups [--yes]: delete the saved state backups and previous
+# artwork versions, after showing what they are. Asks first on a terminal;
+# anywhere else it needs --yes, so nothing is ever deleted by a run that
+# nobody is watching. Taking the run lock means it cannot pull a backup out
+# from under a build that is restoring from it.
+rp_clean_backups() {
+    local yes="${1:-}" kb reply
+    kb="$(rp_du_kb "$RP_BACKUP_DIR" "$RP_STATE_DIR/artwork/backups")"
+    if [ "${kb:-0}" -eq 0 ]; then
+        rp_ok "there are no saved backups - nothing to delete"
+        return 0
+    fi
+    printf 'Saved backups use %s MB:\n' "$((kb / 1024))"
+    [ -d "$RP_BACKUP_DIR" ] && printf '  %s state backup(s)          %s/\n' \
+        "$(rp_count_matching "$RP_BACKUP_DIR/state-*.tgz")" "${RP_BACKUP_DIR##*/}"
+    [ -d "$RP_STATE_DIR/artwork/backups" ] && printf '  previous artwork versions   .retroplay/artwork/backups/\n'
+    printf 'Afterwards, ./start.sh --artwork-rollback has nothing to go back to.\n'
+    if [ "$yes" != "--yes" ]; then
+        if ! rp_is_interactive; then
+            rp_error "not deleting anything without a terminal to confirm on - add --yes to do it unattended"
+            return 4
+        fi
+        printf 'Delete them? [y/N] '
+        reply=""
+        read -r reply || reply=""
+        case "$reply" in [Yy]*) ;; *) echo "Kept."; return 0 ;; esac
+    fi
+    rp_lock_for_stage "start.sh --clean-backups"
+    rm -rf -- "$RP_BACKUP_DIR" "$RP_STATE_DIR/artwork/backups"
+    rp_lock_release
+    rp_ok "deleted - new backups are made from the next run on"
+    return 0
+}
+
 # Forget the attempt counts so set-aside archives are tried once more.
 rp_retry_failed() {
     if [ ! -s "$RP_STATE_DIR/extract_attempts.list" ]; then
@@ -1625,18 +2120,47 @@ rp_lock_holder() {
     tr '\n' ' ' < "$RP_LOCK_FILE.info" | sed 's/ $//'
 }
 rp_lock_write_info() {
-    printf 'pid=%s\nhost=%s\nstarted=%s\nrun_id=%s\ncommand=%s\n' \
-        "$$" "$RP_LOCK_HOST" "$(rp_ts)" "${RP_RUN_ID:-$$}" "$1" \
+    # suite_version says which scripts took the lock - useful when a stale
+    # lock is found after the scripts were updated underneath a dead run.
+    printf 'pid=%s\nhost=%s\nstarted=%s\nrun_id=%s\ncommand=%s\nsuite_version=%s\nrelease=%s\n' \
+        "$$" "$RP_LOCK_HOST" "$(rp_ts)" "${RP_RUN_ID:-$$}" "$1" "$RP_SUITE_VERSION" "$RP_RELEASE" \
         | rp_atomic_write "$RP_LOCK_FILE.info"
 }
 
 # True when the lock folder was left behind by a run that no longer exists ON
 # THIS MACHINE. A lock written by another machine (a shared drive) is never
 # assumed stale, however old it is.
+# rp_lock_owner_alive <pid> [recorded command]
+# True while the run that took the lock could still be running.
+#
+# kill -0 alone answers "does SOME process have this number", and after a
+# reboot PIDs are handed out again from the bottom: a lock left by a crashed
+# run could name a PID that now belongs to sshd, and would then never be
+# recognised as stale. So when the lock recorded what was running
+# ("all.sh --cron"), the live process must also be running that script.
+#
+# Every doubt resolves to "alive": no ps, ps failing, nothing recorded. A
+# lock wrongly kept costs one --unlock-stale; a lock wrongly broken lets two
+# builds write to the same collection.
+rp_lock_owner_alive() {
+    local pid="$1" cmd="${2:-}" script live
+    [ -n "$pid" ] || return 0
+    kill -0 "$pid" 2>/dev/null || return 1               # nothing by that number
+    script="${cmd%% *}"; script="${script##*/}"          # "all.sh --cron" -> all.sh
+    [ -n "$script" ] || return 0
+    live="$(ps -ww -p "$pid" -o command= 2>/dev/null)" || return 0
+    [ -n "$live" ] || return 0
+    case "$live" in
+        *"$script"*) return 0 ;;
+        *) return 1 ;;                                    # the number was reused
+    esac
+}
+
 rp_lock_is_stale() {
     local lpid lhost
     lpid="$(rp_lock_field pid)"; lhost="$(rp_lock_field host)"
-    [ "$lhost" = "$RP_LOCK_HOST" ] && [ -n "$lpid" ] && ! kill -0 "$lpid" 2>/dev/null
+    [ "$lhost" = "$RP_LOCK_HOST" ] && [ -n "$lpid" ] && \
+        ! rp_lock_owner_alive "$lpid" "$(rp_lock_field command)"
 }
 
 # rp_lock_take "<command line>"  - 0 = taken (or not needed), 1 = someone else
@@ -1650,26 +2174,48 @@ rp_lock_take() {
         "$fb" -n 9 || return 1
         RP_LOCK_HELD=1; rp_lock_write_info "$1"; return 0
     fi
+    # Without flock: mkdir is the lock, because it is atomic - exactly one
+    # caller can create the folder. Breaking a STALE one needs the same care.
+    # "rm -rf then mkdir" let two runs that both judged it stale each remove
+    # the other's fresh lock and each go ahead. Instead the stale folder is
+    # RENAMED to a name only this run uses (a rename, like mkdir, succeeds for
+    # one caller only); whoever wins that rename may then mkdir. If the pid in
+    # the record changed in the meantime, someone else got there first and
+    # this run backs off.
     if ! mkdir "$RP_LOCK_FILE.d" 2>/dev/null; then
-        if rp_lock_is_stale; then
-            rp_info "Removing a stale lock left by a run that no longer exists ($(rp_lock_holder))"
-            rm -rf "$RP_LOCK_FILE.d"
-            mkdir "$RP_LOCK_FILE.d" 2>/dev/null || return 1
-        else
+        local stale_pid
+        stale_pid="$(rp_lock_field pid)"
+        rp_lock_is_stale || return 1
+        mv "$RP_LOCK_FILE.d" "$RP_LOCK_FILE.d.stale.$$" 2>/dev/null || return 1
+        if [ "$(rp_lock_field pid)" != "$stale_pid" ]; then
+            # A new holder wrote its record after we read the old one: the
+            # folder we just moved was theirs. Put it back and stand aside.
+            mv "$RP_LOCK_FILE.d.stale.$$" "$RP_LOCK_FILE.d" 2>/dev/null || true
             return 1
         fi
+        rm -rf "$RP_LOCK_FILE.d.stale.$$"
+        rp_info "Removed a stale lock left by a run that no longer exists (pid $stale_pid)"
+        mkdir "$RP_LOCK_FILE.d" 2>/dev/null || return 1
     fi
     RP_LOCK_HELD=2; rp_lock_write_info "$1"; return 0
 }
 
 # Only ever removes a lock this process took.
+# rp_lock_release: the record is removed WHILE the lock is still held, and
+# only then is the lock itself let go. The other order - drop the lock, then
+# tidy the record - let a new run take the lock and write its own record in
+# between, and the old run would then delete the NEW run's record (the pid
+# check could read the old pid an instant before the new one landed).
 rp_lock_release() {
     case "$RP_LOCK_HELD" in
-        1) exec 9>&- 2>/dev/null ;;
-        2) rm -rf "$RP_LOCK_FILE.d" ;;
+        1|2) ;;
         *) return 0 ;;
     esac
     [ "$(rp_lock_field pid)" = "$$" ] && rm -f "$RP_LOCK_FILE.info"
+    case "$RP_LOCK_HELD" in
+        1) exec 9>&- 2>/dev/null ;;
+        2) rm -rf "$RP_LOCK_FILE.d" ;;
+    esac
     RP_LOCK_HELD=0
     return 0
 }
@@ -1698,6 +2244,20 @@ rp_previous_path() { printf '%s/.previous_%s\n' "$(dirname "$1")" "$(basename "$
 # previous collection until the new one is in place. The old code removed the
 # collection first and then spent minutes copying and merging artwork into the
 # gap, so an interruption left nothing there at all.
+#
+# Why this is not rp_replace_tree: a COLLECTION keeps no backup copy - a
+# second 9 GB tree per variant would double the space the build needs - while
+# an artwork pack does. The swap itself has the same guarantee:
+#   .new_<name>      the complete staged build (built beside the live one, so
+#                    the swap is a rename, never a copy)
+#   .previous_<name> the old collection, for the moment between two renames
+# and rp_recover_swap, which all.sh runs for every collection before it does
+# anything else, settles any interruption:
+#   cut before the first rename   -> live untouched, the staged build removed
+#   cut between the two renames   -> the previous collection is put back
+#   cut before the old is deleted -> the new one is live, the old one removed
+# In no case is there a moment with neither a complete old nor a complete new
+# collection on the drive.
 rp_swap_collection() {
     local live="$1" new old
     new="$(rp_staged_path "$live")"; old="$(rp_previous_path "$live")"
@@ -1761,10 +2321,62 @@ rp_same_filesystem() {
 # Step 4 failing does NOT fail the replacement: the new collection is already
 # live and correct. The previous one is left under its .previous name with a
 # warning, because deleting it silently is the one thing we must not do.
+# rp_recover_replacements <root>
+# Finishes, or undoes, any rp_replace_tree that was cut in half under <root>.
+# Its two in-flight names carry the PID of the run that made them:
+#   <live>.previous.<pid>  the collection/pack being retired
+#   <live>.incoming.<pid>  the replacement being staged
+# Ownership is proved by that PID: nothing is touched while it is still
+# running (and a reused PID reads as "still running", the safe direction).
+# For a run that is gone:
+#   * <live> missing and a .previous exists -> the previous is put back,
+#     because a usable old copy beats nothing;
+#   * a .incoming left over                 -> removed; it was never complete
+#     enough to be swapped in.
+#   * <live> present and a .previous left   -> left alone and reported: the
+#     swap finished but its old copy was never retired, and deleting someone's
+#     previous collection is not something to do unasked.
+# Only these exact name shapes are considered, at most three levels down.
+#
+# rp_recover_replacements <root> [depth] [retire]
+#   depth   how far down to look (3 for the artwork packs; game folders sit at
+#           WHDLoad/Games/A/<game>, so collections pass 5)
+#   retire  "retire" deletes a left-over .previous when the new copy is in
+#           place. Right for game folders - the archive is the real source and
+#           the old game is never wanted back - but not for artwork, where
+#           the old copy may be someone's edits.
+rp_recover_replacements() {
+    local root="$1" depth="${2:-3}" retire="${3:-}" d base pid live
+    [ -d "$root" ] || return 0
+    # Folders (a pack or a game being swapped) and the single files that
+    # rp_replace_and_copy stages as .<name>.incoming.<pid>.
+    find "$root" -maxdepth "$depth" \( -type d -o -type f \) \( -name '*.previous.[0-9]*' -o -name '*.incoming.[0-9]*' \) 2>/dev/null |
+    while IFS= read -r d; do
+        base="${d##*/}"; pid="${base##*.}"
+        case "$pid" in ''|*[!0-9]*) continue ;; esac
+        kill -0 "$pid" 2>/dev/null && continue          # that run is still going
+        case "$base" in
+            *.incoming.*)
+                rm -rf -- "$d" ;;
+            *.previous.*)
+                live="${d%.previous.*}"
+                if [ ! -e "$live" ]; then
+                    mv -- "$d" "$live" && rp_warn "an interrupted replacement of ${live##*/} was undone - the previous version is back in place"
+                elif [ "$retire" = "retire" ]; then
+                    rm -rf -- "$d"
+                else
+                    rp_warn "${d##*/} is left over from an interrupted replacement of ${live##*/}; the new one is in place - delete the old copy when you are happy"
+                fi ;;
+        esac
+    done
+    return 0
+}
+
 rp_replace_tree() {
     local cand="$1" live="$2" backup="$3" inc prev same_cand
     [ -e "$cand" ] || return 1
     mkdir -p "$(dirname "$live")" || return 1
+    rp_recover_replacements "$(dirname "$live")"
 
     # ---- 1. stage the candidate beside the live folder ----
     inc="$live.incoming.$$"
@@ -1799,13 +2411,30 @@ rp_replace_tree() {
     fi
 
     # ---- 4. retire the previous collection ----
+    # The new backup is put fully in place under a temporary name first, and
+    # only then does it replace an older backup at the same path. Removing
+    # the old backup first meant a failed move or copy left no rollback copy
+    # at all - neither the old one nor the new one.
     if [ -n "$prev" ] && [ -e "$prev" ]; then
         if mkdir -p "$(dirname "$backup")" 2>/dev/null; then
-            rm -rf -- "$backup"
+            local bk_tmp="$backup.incoming.$$" bk_ok=0
+            rm -rf -- "$bk_tmp"
             if rp_same_filesystem "$prev" "$backup"; then
-                mv -- "$prev" "$backup" 2>/dev/null || true
+                mv -- "$prev" "$bk_tmp" 2>/dev/null && bk_ok=1
             else
-                cp -a "$prev" "$backup" 2>/dev/null && rm -rf -- "$prev"
+                cp -a "$prev" "$bk_tmp" 2>/dev/null && bk_ok=1
+            fi
+            if [ "$bk_ok" -eq 1 ]; then
+                rm -rf -- "$backup"
+                if mv -- "$bk_tmp" "$backup" 2>/dev/null; then
+                    [ -e "$prev" ] && rm -rf -- "$prev"
+                else
+                    # Could not take the old backup's place: keep the copy we
+                    # made under its temporary name rather than lose it.
+                    [ -e "$prev" ] || mv -- "$bk_tmp" "$prev" 2>/dev/null || true
+                fi
+            else
+                rm -rf -- "$bk_tmp"
             fi
         fi
         if [ -e "$prev" ]; then

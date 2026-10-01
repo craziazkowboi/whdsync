@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.09.29   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.10.01.2   (every script in the set must carry the same stamp)
 # Remember where the user ran this from, before any cd: retroplay.conf is
 # looked for there first (see lib.sh).
 RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
@@ -478,8 +478,22 @@ cleanup_extract() {
         [ -n "${ERROR_LOG:-}" ] && cat "$tmpdir"/dir_*.log 2>/dev/null >> "$ERROR_LOG"
         rm -rf -- "$tmpdir"
     fi
+    # This run's per-archive unpacking folders (see extract_contained). Only
+    # ones carrying this run's pid in their name; another run's are not ours.
+    [ -d "${DEST:-}" ] && find "$DEST" -maxdepth 5 -type d -name ".whdsync_x.$$.*" -prune \
+        -exec rm -rf {} + 2>/dev/null
     exit "$st"
 }
+# Unpacking folders left by an extract.sh that was killed outright: removed
+# once the pid in their name belongs to no running process.
+if [ -d "${DEST:-}" ]; then
+    find "$DEST" -maxdepth 5 -type d -name '.whdsync_x.*' -prune 2>/dev/null |
+    while IFS= read -r _x; do
+        _p="${_x##*/.whdsync_x.}"; _p="${_p%%.*}"
+        case "$_p" in ''|*[!0-9]*) continue ;; esac
+        kill -0 "$_p" 2>/dev/null || rm -rf -- "$_x"
+    done
+fi
 # Run by hand? Then this is the run, and it takes the same lock all.sh
 # uses, so it cannot work on a collection a nightly build is midway through.
 rp_lock_for_stage "extract.sh ${RP_ORIG_ARGS:-}"
@@ -522,46 +536,17 @@ done < <(cut -f2 "$RESOLVE_MAP" | sort -u)
 total_dirs=${#dirs[@]}
 echo -e "${NC}Found ${#archives[@]} archives in $total_dirs directories.${NC}"
 
-CORES=""
-if command -v getconf >/dev/null 2>&1; then
-    CORES=$(getconf _NPROCESSORS_ONLN 2>/dev/null)
+# How many archives at once: CPU cores, capped by memory so a 512 MB Pi Zero
+# 2 W is not handed to the out-of-memory killer - which ends a job silently,
+# leaving every later archive in its directory unextracted and unlogged. The
+# rule lives in lib.sh (rp_auto_jobs) so it is the same everywhere and tested.
+CORES="$(rp_auto_jobs extract)"
+_raw_cores="$(rp_cpu_cores)"; [ "$_raw_cores" -gt 8 ] && _raw_cores=8
+_mem_kb="$(rp_mem_kb)"
+if [ "$CORES" -lt "$_raw_cores" ] && [ -n "$_mem_kb" ]; then
+    echo "Detected ~$((_mem_kb / 1024))MB RAM - capping parallel extraction to $CORES job(s) to reduce the risk of out-of-memory kills."
 fi
-if [ -z "$CORES" ] && command -v sysctl >/dev/null 2>&1; then
-    CORES=$(sysctl -n hw.ncpu 2>/dev/null)
-fi
-CORES=${CORES:-3}
-[ "$CORES" -gt 8 ] && CORES=8
-
-# Cap parallelism based on available memory, not just CPU core count.
-# Running several simultaneous decompression processes on a memory-limited
-# device (e.g. a Raspberry Pi Zero 2W's 512MB) risks the kernel's OOM killer
-# silently terminating a background job outright. A plain `wait` at the end
-# of the run can't tell that apart from a clean finish - the job just
-# vanishes mid-batch, and every archive after that point in its directory
-# is left unextracted with no entry anywhere in the error log.
-mem_kb=""
-if [ -r /proc/meminfo ]; then
-    mem_kb=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null)
-elif command -v sysctl >/dev/null 2>&1; then
-    mem_bytes=$(sysctl -n hw.memsize 2>/dev/null)
-    if [ -n "$mem_bytes" ]; then
-        mem_kb=$((mem_bytes / 1024))
-    fi
-fi
-
-if [ -n "$mem_kb" ] && [ "$mem_kb" -gt 0 ]; then
-    if [ "$mem_kb" -lt 786432 ]; then
-        mem_cap=1     # under ~768MB (e.g. Pi Zero 2W's 512MB): serialize extraction
-    elif [ "$mem_kb" -lt 1572864 ]; then
-        mem_cap=2     # under ~1.5GB
-    else
-        mem_cap=8
-    fi
-    if [ "$CORES" -gt "$mem_cap" ]; then
-        echo "Detected ~$((mem_kb / 1024))MB RAM - capping parallel extraction to $mem_cap job(s) to reduce the risk of out-of-memory kills."
-        CORES="$mem_cap"
-    fi
-fi
+unset _raw_cores _mem_kb
 
 max_parallel="$(rp_jobs extract "$CORES")"
 echo "Detected $CORES CPU core(s); using $max_parallel parallel extraction job(s)."
@@ -647,6 +632,59 @@ extract_archive() {
     return $((1 - success))
 }
 NICE_PREFIX="$(rp_nice_prefix)"
+
+# --------------------------------------------------- contained extraction ---
+# The archives come from a remote server (over plain FTP), so an archive that
+# names a member ../../x, or a link pointing out of the folder, must not be
+# able to write anywhere but where it is meant to. The extraction tree lives
+# inside the output folder, next to the finished collections, so "a few
+# levels up" is exactly where the damage would be.
+#
+# Each archive is therefore unpacked on its own, into
+#     <letter folder>/.whdsync_x.<run pid>.XXXXXX/j/j/j/x
+# and only then moved into the letter folder:
+#   * anything that appears in the .whdsync_x folder OUTSIDE x climbed out
+#     with ../ - the archive is refused and counted as failed (it is retried
+#     and, after the usual attempts, set aside);
+#   * a symlink inside x that points outside x is removed - extraction tools
+#     on a Unix system have no business creating one from an Amiga archive;
+#   * the content is then moved into place - a rename, as it is the same
+#     folder - or merged into an existing folder exactly as the tools would.
+# Absolute member paths are not tested for here: lha (lhasa), unar and 7z all
+# turn /x into x when extracting, and the tree is checked as a whole
+# afterwards (rp_layout_problems in all.sh).
+extract_contained() {   # <archive> <dest letter folder> <ext>  -> 0 ok, 1 failed, 3 refused
+    local arc="$1" dest="$2" ext="$3" xdir stage rc esc e name
+    xdir="$(mktemp -d "$dest/.whdsync_x.$EXTRACT_RUN_PID.XXXXXX")" || return 1
+    stage="$xdir/j/j/j/x"
+    mkdir -p "$stage" || { rm -rf -- "$xdir"; return 1; }
+    if [ -n "$TIMEOUT_CMD" ]; then
+        # shellcheck disable=SC2086
+        $NICE_PREFIX $TIMEOUT_CMD bash -c 'extract_archive "$1" "$2" "$3"' _ "$arc" "$stage" "$ext"
+        rc=$?
+    else
+        extract_archive "$arc" "$stage" "$ext"
+        rc=$?
+    fi
+    if [ "$rc" -ne 0 ]; then rm -rf -- "$xdir"; return "$rc"; fi
+    esc="$(find "$xdir" -mindepth 1 ! -path "$xdir/j" ! -path "$xdir/j/j" ! -path "$xdir/j/j/j" \
+             ! -path "$stage" ! -path "$stage/*" -print 2>/dev/null | head -1)"
+    if [ -n "$esc" ]; then rm -rf -- "$xdir"; return 3; fi
+    rp_prune_escaping_symlinks "$stage" >/dev/null 2>&1
+    for e in "$stage"/* "$stage"/.[!.]*; do
+        [ -e "$e" ] || [ -L "$e" ] || continue
+        name="${e##*/}"
+        if [ -d "$e" ] && [ -d "$dest/$name" ]; then
+            cp -a "$e/." "$dest/$name/" || { rm -rf -- "$xdir"; return 1; }
+        else
+            mv -f -- "$e" "$dest/$name" 2>/dev/null || { rm -rf -- "$dest/$name"; mv -f -- "$e" "$dest/$name"; } \
+                || { rm -rf -- "$xdir"; return 1; }
+        fi
+    done
+    rm -rf -- "$xdir"
+    return 0
+}
+EXTRACT_RUN_PID=$$
 export -f extract_archive
 # extract_archive runs inside `timeout bash -c ...` when timeout exists - a
 # FRESH bash, which inherits exported variables only. Without these the
@@ -706,17 +744,13 @@ for srcdir in "${dirs[@]}"; do
             # (plus ionice on Linux) under cron, so a nightly extraction on a
             # Pi leaves the machine usable. Deliberately unquoted: it is a
             # command prefix, not a filename.
-            if [ -n "$TIMEOUT_CMD" ]; then
-                # shellcheck disable=SC2086
-                $NICE_PREFIX $TIMEOUT_CMD bash -c 'extract_archive "$1" "$2" "$3"' _ "$abs_archive" "$abs_destdir" "$ext"
-                extract_rc=$?
-            else
-                extract_archive "$abs_archive" "$abs_destdir" "$ext"
-                extract_rc=$?
-            fi
+            extract_contained "$abs_archive" "$abs_destdir" "$ext"
+            extract_rc=$?
 
             if [ "$extract_rc" -ne 0 ]; then
-                if [ "$extract_rc" -eq 124 ]; then
+                if [ "$extract_rc" -eq 3 ]; then
+                    printf 'FAILED: %s (format: %s) - REFUSED: it has entries that climb out of their folder (../)\n' "$abs_archive" "$ext" >>"$dir_log"
+                elif [ "$extract_rc" -eq 124 ]; then
                     printf 'FAILED: %s (format: %s) - TIMED OUT after %ss\n' "$abs_archive" "$ext" "$TIMEOUT_SECS" >>"$dir_log"
                 else
                     printf 'FAILED: %s (format: %s)\n' "$abs_archive" "$ext" >>"$dir_log"

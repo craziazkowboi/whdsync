@@ -28,11 +28,18 @@
  *      If your real invocation needs different argument order/quoting,
  *      edit BuildAndRunCommand() - that's the only place it matters.
  *
- *   2. PI_RETRO_SOURCE - the Amiga-visible path to the Pi's "retro"
- *      directory (e.g. wherever A314's shared filesystem mounts it, such
- *      as "PI0:retro"). This is used as the source for step 2 above. I do
- *      not know your A314 setup's actual volume/mount name, so this is a
- *      placeholder - edit it to match.
+ *   2. PI_BUILD_SOURCE - the Amiga-visible path to the Pi's "build"
+ *      folder, the one that holds retro_aga, retro_ecs, retro_rtg,
+ *      retro_aga_laced and retro_ecs_laced (e.g. wherever A314's shared
+ *      filesystem mounts it, such as "PI0:whdsync/build"). The collection
+ *      copied in step 2 is the one for the variant ticked in the window:
+ *      <PI_BUILD_SOURCE>/retro_<variant>. This used to be PI_RETRO_SOURCE,
+ *      pointing at a single "retro" folder that the scripts stopped
+ *      producing when they moved to one collection per variant.
+ *
+ *   Both are plain #defines a few lines below the #includes. The window
+ *   prints both values in its log when it opens, so a wrong one is visible
+ *   before anything runs.
  *
  * BUILDING:
  *   With vbcc (m68k-amigaos target):
@@ -44,7 +51,7 @@
  *   no extra install).
  *
  * NOT YET WIRED UP / KNOWN GAPS:
- *   - PI_EXEC_PREFIX and PI_RETRO_SOURCE (see above) - the two load-bearing
+ *   - PI_EXEC_PREFIX and PI_BUILD_SOURCE (see above) - the two load-bearing
  *     unknowns about your specific A314 setup.
  *   - The pipe-based output capture and the recursive copy/compare logic
  *     use standard, well-documented AmigaDOS techniques (PIPE: device,
@@ -53,8 +60,16 @@
  *     it as a strong starting point, not a guarantee.
  *   - "Illegal filename character" is checked as ':', '/', and control
  *     characters (the ones AmigaDOS filesystems genuinely can't store in a
- *     filename). It does not re-check the length limits sort.sh already
- *     enforces on the Pi side.
+ *     filename), plus '"' and '*', which AmigaDOS cannot pass safely inside
+ *     a quoted argument to Copy. It does not re-check the length limits
+ *     sort.sh already enforces on the Pi side.
+ *
+ * STRING SAFETY:
+ *   Every command line and path is built with AppendStr()/CopyStr(), which
+ *   never write past the end of a buffer and report when something did not
+ *   fit. A command or path that does not fit is refused and logged - never
+ *   run or copied truncated, because a truncated path names a different
+ *   file.
  *   - Window layout uses fixed coordinates sized for an 800x600-ish
  *     screen; adjust WIN_WIDTH/WIN_HEIGHT and the per-gadget ng_TopEdge
  *     values if you're on a smaller display (e.g. NTSC 640x400).
@@ -82,12 +97,22 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* ------------------------------------------------------------------ */
-/* THE TWO THINGS TO EDIT: how a shell command reaches the Pi, and     */
-/* where the Pi's retro/ directory is visible from the Amiga side.    */
-/* ------------------------------------------------------------------ */
+/* ################################################################## */
+/* ##                                                              ## */
+/* ##   EDIT THESE TWO LINES FOR YOUR A314 SET-UP BEFORE BUILDING    ## */
+/* ##                                                              ## */
+/* ##   PI_EXEC_PREFIX   what you type on the Amiga to run a command ## */
+/* ##                    on the Pi, followed by a space ("pi ")      ## */
+/* ##   PI_BUILD_SOURCE  the Pi's whdsync build/ folder as the Amiga ## */
+/* ##                    sees it (holds retro_aga, retro_ecs, ...)   ## */
+/* ##                                                              ## */
+/* ##   The window prints both when it opens, so a wrong one shows   ## */
+/* ##   up before anything is run.                                   ## */
+/* ##                                                              ## */
+/* ################################################################## */
 #define PI_EXEC_PREFIX   "pi "
-#define PI_RETRO_SOURCE  "PI0:retro"
+#define PI_BUILD_SOURCE  "PI0:whdsync/build"
+/* ################################################################## */
 
 #define WIN_WIDTH  620
 #define WIN_HEIGHT 440
@@ -112,13 +137,15 @@ void           *vi = NULL;
 /* Gadget IDs */
 enum {
     GID_ACT_AUTO, GID_ACT_UPDATE, GID_ACT_EXTRACT, GID_ACT_MERGE,
-    GID_ACT_SORT, GID_ACT_QUICK,
+    GID_ACT_SORT, GID_ACT_QUICK, GID_ACT_STATUS, GID_ACT_DOCTOR,
 
-    GID_SET_ECS, GID_SET_AGA, GID_SET_RTG, GID_SET_ECSLO, GID_SET_AGALO,
+    GID_SET_ECS, GID_SET_AGA, GID_SET_RTG, GID_SET_ECSLACED, GID_SET_AGALACED,
 
     GID_FS_FFS, GID_FS_PFS,
 
     GID_NO_DETOX, GID_DEBUG, GID_MERGE_AMIGA,
+
+    GID_REBUILD, GID_SKIP_UPDATE, GID_REFRESH_ART, GID_VERBOSE,
 
     GID_DEST_STR, GID_ART_STR, GID_DEMOART_STR, GID_SET_STR,
 
@@ -131,9 +158,10 @@ enum {
 
 /* One-of-a-group checkbox IDs, used to enforce mutual exclusivity */
 static const int actionGroup[] = { GID_ACT_AUTO, GID_ACT_UPDATE, GID_ACT_EXTRACT,
-                                    GID_ACT_MERGE, GID_ACT_SORT, GID_ACT_QUICK, -1 };
+                                    GID_ACT_MERGE, GID_ACT_SORT, GID_ACT_QUICK,
+                                    GID_ACT_STATUS, GID_ACT_DOCTOR, -1 };
 static const int setGroup[]    = { GID_SET_ECS, GID_SET_AGA, GID_SET_RTG,
-                                    GID_SET_ECSLO, GID_SET_AGALO, -1 };
+                                    GID_SET_ECSLACED, GID_SET_AGALACED, -1 };
 static const int fsGroup[]     = { GID_FS_FFS, GID_FS_PFS, -1 };
 
 char destBuf[128]    = "";
@@ -144,6 +172,9 @@ char setBuf[64]      = "";
 /* Persisted across runs via CONFIG_FILE */
 char archiveDestBuf[PATH_BUF_SIZE] = "";
 char whdloadDestBuf[PATH_BUF_SIZE] = "";
+
+/* Defined further down; AppendLog needs CopyStr before its definition. */
+BOOL CopyStr(char *dst, const char *src, int dstSize);
 
 struct List logList;
 int logCount = 0;
@@ -161,7 +192,7 @@ void AppendLog(char *text)
 
     copy = (char *)AllocVec(strlen(text) + 1, MEMF_CLEAR);
     if (!copy) return;
-    strcpy(copy, text);
+    CopyStr(copy, text, strlen(text) + 1);
 
     n = (struct Node *)AllocVec(sizeof(struct Node), MEMF_CLEAR);
     if (!n) { FreeVec(copy); return; }
@@ -215,16 +246,55 @@ void StripNewline(char *s)
     while (len > 0 && (s[len-1] == '\n' || s[len-1] == '\r')) s[--len] = 0;
 }
 
-/* Joins a directory and a name, only inserting "/" when the directory
-   isn't a bare volume/assign root (which already ends in ":"). */
-void JoinPath(char *dir, char *name, char *out, int outSize)
+/* CopyStr: strlcpy-style copy that always terminates. Returns TRUE when
+   the whole of src fitted. (Amiga compilers do not all ship strlcpy.) */
+BOOL CopyStr(char *dst, const char *src, int dstSize)
 {
-    int len = strlen(dir);
+    int n;
+    if (dstSize <= 0) return FALSE;
+    for (n = 0; src[n] && n < dstSize - 1; n++) dst[n] = src[n];
+    dst[n] = 0;
+    return src[n] == 0;
+}
+
+/* AppendStr: strlcat-style append that always terminates. Returns TRUE when
+   the whole of src fitted; on FALSE the buffer holds a truncated result
+   that callers must not use. */
+BOOL AppendStr(char *dst, const char *src, int dstSize)
+{
+    int len = strlen(dst);
+    if (len >= dstSize) return FALSE;
+    return CopyStr(dst + len, src, dstSize - len);
+}
+
+/* Joins a directory and a name, only inserting "/" when the directory
+   isn't a bare volume/assign root (which already ends in ":").
+   Returns FALSE when the result would not fit - the caller must then skip
+   that entry: a truncated path names a different file. */
+BOOL JoinPath(char *dir, char *name, char *out, int outSize)
+{
+    int len = strlen(dir), n;
     if (len > 0 && dir[len - 1] == ':') {
-        snprintf(out, outSize, "%s%s", dir, name);
+        n = snprintf(out, outSize, "%s%s", dir, name);
     } else {
-        snprintf(out, outSize, "%s/%s", dir, name);
+        n = snprintf(out, outSize, "%s/%s", dir, name);
     }
+    return n >= 0 && n < outSize;
+}
+
+/* Characters a text field may not contain. The value travels through an
+   AmigaDOS command line and then a shell on the Pi; a quote, '*' (the
+   AmigaDOS escape character) or any shell metacharacter would change what
+   is run there. None of them belongs in a path, an art order or a set
+   name, so they are refused rather than escaped. */
+BOOL IsSafeFieldText(const char *s)
+{
+    const char *bad = "\"'`$\\*;&|<>(){}!\n\r";
+    int i;
+    for (i = 0; s[i]; i++) {
+        if ((unsigned char)s[i] < 32 || strchr(bad, s[i])) return FALSE;
+    }
+    return TRUE;
 }
 
 /* ------------------------------------------------------------------ */
@@ -244,11 +314,11 @@ void LoadConfig(void)
 
     if (FGets(fh, line, sizeof(line))) {
         StripNewline(line);
-        strncpy(archiveDestBuf, line, sizeof(archiveDestBuf) - 1);
+        CopyStr(archiveDestBuf, line, sizeof(archiveDestBuf));
     }
     if (FGets(fh, line, sizeof(line))) {
         StripNewline(line);
-        strncpy(whdloadDestBuf, line, sizeof(whdloadDestBuf) - 1);
+        CopyStr(whdloadDestBuf, line, sizeof(whdloadDestBuf));
     }
     Close(fh);
 }
@@ -293,9 +363,11 @@ BOOL PickDrawer(char *title, char *initial, char *outBuf, int outBufSize)
             ASLFR_RejectIcons,   TRUE,
             TAG_END))
     {
-        strncpy(outBuf, fr->fr_Drawer, outBufSize - 1);
-        outBuf[outBufSize - 1] = 0;
-        ok = TRUE;
+        if (CopyStr(outBuf, fr->fr_Drawer, outBufSize)) {
+            ok = TRUE;
+        } else {
+            AppendLog("ERROR: that folder's path is too long to use here.");
+        }
     }
 
     FreeAslRequest(fr);
@@ -311,7 +383,9 @@ BOOL HasIllegalChars(char *name)
     int i;
     for (i = 0; name[i]; i++) {
         unsigned char c = (unsigned char)name[i];
-        if (c == ':' || c == '/' || c < 32) return TRUE;
+        /* '"' and '*' are legal in some Amiga filenames but cannot be put
+           inside the quoted Copy argument below without changing it. */
+        if (c == ':' || c == '/' || c == '"' || c == '*' || c < 32) return TRUE;
     }
     return FALSE;
 }
@@ -363,9 +437,11 @@ BOOL IsNewer(struct DateStamp *a, struct DateStamp *b)
 
 BOOL CopyOneFile(char *src, char *dst)
 {
-    char cmd[600];
+    char cmd[2 * PATH_BUF_SIZE + 32];
     LONG rc;
-    snprintf(cmd, sizeof(cmd), "Copy CLONE \"%s\" \"%s\"", src, dst);
+    int n;
+    n = snprintf(cmd, sizeof(cmd), "Copy CLONE \"%s\" \"%s\"", src, dst);
+    if (n < 0 || n >= (int)sizeof(cmd)) return FALSE;   /* never run a cut-off command */
     rc = SystemTagList(cmd, NULL);
     return (rc == 0);
 }
@@ -431,14 +507,15 @@ void MergeTreeRecursive(char *srcDir, char *dstDir)
     }
 
     while (ExNext(lock, fib)) {
-        if (HasIllegalChars(fib->fib_FileName)) {
-            JoinPath(srcDir, fib->fib_FileName, srcPath, sizeof(srcPath));
-            LogSkip(srcPath, "illegal character in filename");
+        if (!JoinPath(srcDir, fib->fib_FileName, srcPath, sizeof(srcPath)) ||
+            !JoinPath(dstDir, fib->fib_FileName, dstPath, sizeof(dstPath))) {
+            LogSkip(fib->fib_FileName, "path too long");
             continue;
         }
-
-        JoinPath(srcDir, fib->fib_FileName, srcPath, sizeof(srcPath));
-        JoinPath(dstDir, fib->fib_FileName, dstPath, sizeof(dstPath));
+        if (HasIllegalChars(fib->fib_FileName)) {
+            LogSkip(srcPath, "character that cannot be copied safely");
+            continue;
+        }
 
         if (fib->fib_DirEntryType > 0) {
             /* Directory: make sure it exists on the destination side, then recurse */
@@ -458,8 +535,46 @@ void MergeTreeRecursive(char *srcDir, char *dstDir)
 /* "Merge with Amiga on completion" - the whole flow                    */
 /* ------------------------------------------------------------------ */
 
+/* The Pi's collection folder for the variant ticked in the window, e.g.
+   retro_aga_laced - the same names all.sh gives them. FALSE when no
+   variant is ticked (the Pi may hold several collections, and guessing
+   which one to copy is how the wrong one ends up on the Amiga). */
+BOOL CollectionName(char *out, int outSize)
+{
+    char name[80];
+    int i;
+    if (setBuf[0]) {
+        /* --set NAME builds retro_<name, lower case, - as _> */
+        if (!CopyStr(name, "retro_", sizeof(name)) || !AppendStr(name, setBuf, sizeof(name)))
+            return FALSE;
+        for (i = 6; name[i]; i++) {
+            if (name[i] >= 'A' && name[i] <= 'Z') name[i] = name[i] - 'A' + 'a';
+            if (name[i] == '-') name[i] = '_';
+        }
+        return CopyStr(out, name, outSize);
+    }
+    if (IsChecked(GID_SET_ECS))      return CopyStr(out, "retro_ecs", outSize);
+    if (IsChecked(GID_SET_AGA))      return CopyStr(out, "retro_aga", outSize);
+    if (IsChecked(GID_SET_RTG))      return CopyStr(out, "retro_rtg", outSize);
+    if (IsChecked(GID_SET_ECSLACED)) return CopyStr(out, "retro_ecs_laced", outSize);
+    if (IsChecked(GID_SET_AGALACED)) return CopyStr(out, "retro_aga_laced", outSize);
+    return FALSE;
+}
+
 void DoAmigaMerge(void)
 {
+    char coll[80], source[PATH_BUF_SIZE];
+
+    if (!CollectionName(coll, sizeof(coll))) {
+        AppendLog("Merge with Amiga needs one variant ticked (ECS, AGA, RTG, ECS laced,");
+        AppendLog("AGA laced) or a set name, so it knows which collection to copy.");
+        return;
+    }
+    if (!JoinPath(PI_BUILD_SOURCE, coll, source, sizeof(source))) {
+        AppendLog("ERROR: PI_BUILD_SOURCE plus the collection name is too long.");
+        return;
+    }
+
     OpenCopyLog();
 
     AppendLog("=== Merge with Amiga: choose archive destination ===");
@@ -471,8 +586,9 @@ void DoAmigaMerge(void)
     }
     AppendLog(archiveDestBuf);
 
-    AppendLog("=== Copying retro/ from the Pi into the archive destination ===");
-    MergeTreeRecursive(PI_RETRO_SOURCE, archiveDestBuf);
+    AppendLog("=== Copying the collection from the Pi into the archive destination ===");
+    AppendLog(source);
+    MergeTreeRecursive(source, archiveDestBuf);
 
     AppendLog("=== Merge with Amiga: choose your WHDLoad directory ===");
     if (!PickDrawer("Select your WHDLoad directory", whdloadDestBuf,
@@ -502,53 +618,81 @@ void RunCommandCapture(char *cmdline);
 
 void BuildAndRunCommand(void)
 {
-    char cmd[512];
-    char argbuf[512];
+    char cmd[640];
+    char argbuf[600];
+    BOOL fits = TRUE;
 
-    strcpy(argbuf, "start.sh");
+    /* Every piece goes through AppendStr, and "fits" collects whether all
+       of them did. The four text fields together can exceed the old fixed
+       512-byte buffer, which the old unbounded appends ran straight past. */
+#define ADD(str) (fits = AppendStr(argbuf, (str), sizeof(argbuf)) && fits)
 
-    if (IsChecked(GID_ACT_AUTO))    strcat(argbuf, " --auto");
-    if (IsChecked(GID_ACT_UPDATE))  strcat(argbuf, " --update");
-    if (IsChecked(GID_ACT_EXTRACT)) strcat(argbuf, " --extract");
-    if (IsChecked(GID_ACT_MERGE))   strcat(argbuf, " --merge");
-    if (IsChecked(GID_ACT_SORT))    strcat(argbuf, " --sort");
-    if (IsChecked(GID_ACT_QUICK))   strcat(argbuf, " --quick");
+    argbuf[0] = 0;
+    ADD("start.sh");
+
+    if (IsChecked(GID_ACT_AUTO))    ADD(" --auto");
+    if (IsChecked(GID_ACT_UPDATE))  ADD(" --update");
+    if (IsChecked(GID_ACT_EXTRACT)) ADD(" --extract");
+    if (IsChecked(GID_ACT_MERGE))   ADD(" --merge");
+    if (IsChecked(GID_ACT_SORT))    ADD(" --sort");
+    if (IsChecked(GID_ACT_QUICK))   ADD(" --quick");
+    if (IsChecked(GID_ACT_STATUS))  ADD(" --status");
+    if (IsChecked(GID_ACT_DOCTOR))  ADD(" --doctor");
+    if (IsChecked(GID_REBUILD))     ADD(" --rebuild");
+    if (IsChecked(GID_SKIP_UPDATE)) ADD(" --skip-update");
+    if (IsChecked(GID_REFRESH_ART)) ADD(" --refresh-artwork");
+    if (IsChecked(GID_VERBOSE))     ADD(" --verbose");
 
     /* Read the current text of the string gadgets */
     {
         struct StringInfo *si;
         si = (struct StringInfo *)gad[GID_DEST_STR]->SpecialInfo;
-        strncpy(destBuf, si->Buffer, sizeof(destBuf) - 1);
+        CopyStr(destBuf, (char *)si->Buffer, sizeof(destBuf));
         si = (struct StringInfo *)gad[GID_ART_STR]->SpecialInfo;
-        strncpy(artBuf, si->Buffer, sizeof(artBuf) - 1);
+        CopyStr(artBuf, (char *)si->Buffer, sizeof(artBuf));
         si = (struct StringInfo *)gad[GID_DEMOART_STR]->SpecialInfo;
-        strncpy(demoArtBuf, si->Buffer, sizeof(demoArtBuf) - 1);
+        CopyStr(demoArtBuf, (char *)si->Buffer, sizeof(demoArtBuf));
         si = (struct StringInfo *)gad[GID_SET_STR]->SpecialInfo;
-        strncpy(setBuf, si->Buffer, sizeof(setBuf) - 1);
+        CopyStr(setBuf, (char *)si->Buffer, sizeof(setBuf));
+    }
+
+    if (!IsSafeFieldText(destBuf) || !IsSafeFieldText(artBuf) ||
+        !IsSafeFieldText(demoArtBuf) || !IsSafeFieldText(setBuf)) {
+        AppendLog("ERROR: a text field contains a quote or one of  ` $ \\ * ; & | < > ( ) { } !");
+        AppendLog("Those would change the command run on the Pi. Nothing was run.");
+        return;
     }
 
     /* A typed-in --set name takes priority over the checkbox shortcuts */
     if (setBuf[0]) {
-        strcat(argbuf, " --set ");
-        strcat(argbuf, setBuf);
-    } else if (IsChecked(GID_SET_ECS))   strcat(argbuf, " --ecs");
-    else if (IsChecked(GID_SET_AGA))     strcat(argbuf, " --aga");
-    else if (IsChecked(GID_SET_RTG))     strcat(argbuf, " --rtg");
-    else if (IsChecked(GID_SET_ECSLO))   strcat(argbuf, " --ecs-lo");
-    else if (IsChecked(GID_SET_AGALO))   strcat(argbuf, " --aga-lo");
+        ADD(" --set ");
+        ADD(setBuf);
+    } else if (IsChecked(GID_SET_ECS))      ADD(" --ecs");
+    else if (IsChecked(GID_SET_AGA))        ADD(" --aga");
+    else if (IsChecked(GID_SET_RTG))        ADD(" --rtg");
+    else if (IsChecked(GID_SET_ECSLACED))   ADD(" --ecs-laced");
+    else if (IsChecked(GID_SET_AGALACED))   ADD(" --aga-laced");
 
-    if (IsChecked(GID_FS_FFS)) strcat(argbuf, " --ffs");
-    if (IsChecked(GID_FS_PFS)) strcat(argbuf, " --pfs");
+    if (IsChecked(GID_FS_FFS)) ADD(" --ffs");
+    if (IsChecked(GID_FS_PFS)) ADD(" --pfs");
 
-    if (IsChecked(GID_NO_DETOX)) strcat(argbuf, " --no-detox");
-    if (IsChecked(GID_DEBUG))    strcat(argbuf, " --debug");
+    if (IsChecked(GID_NO_DETOX)) ADD(" --no-detox");
+    if (IsChecked(GID_DEBUG))    ADD(" --debug");
 
-    if (destBuf[0])    { strcat(argbuf, " --dest \""); strcat(argbuf, destBuf); strcat(argbuf, "\""); }
-    if (artBuf[0])     { strcat(argbuf, " --art \""); strcat(argbuf, artBuf); strcat(argbuf, "\""); }
-    if (demoArtBuf[0]) { strcat(argbuf, " --demo-art \""); strcat(argbuf, demoArtBuf); strcat(argbuf, "\""); }
+    if (destBuf[0])    { ADD(" --dest \""); ADD(destBuf); ADD("\""); }
+    if (artBuf[0])     { ADD(" --art \""); ADD(artBuf); ADD("\""); }
+    if (demoArtBuf[0]) { ADD(" --demo-art \""); ADD(demoArtBuf); ADD("\""); }
 
-    strcpy(cmd, PI_EXEC_PREFIX);
-    strcat(cmd, argbuf);
+    cmd[0] = 0;
+    fits = AppendStr(cmd, PI_EXEC_PREFIX, sizeof(cmd)) && fits;
+    fits = AppendStr(cmd, argbuf, sizeof(cmd)) && fits;
+#undef ADD
+
+    if (!fits) {
+        AppendLog("ERROR: the command line is too long - shorten a text field.");
+        AppendLog("Nothing was run (a cut-off command would do something else).");
+        return;
+    }
 
     AppendLog("--------------------------------------------------");
     AppendLog(cmd);
@@ -556,7 +700,8 @@ void BuildAndRunCommand(void)
 
     RunCommandCapture(cmd);
 
-    if (IsChecked(GID_MERGE_AMIGA)) {
+    /* Status and Check set-up only report; there is nothing new to copy. */
+    if (IsChecked(GID_MERGE_AMIGA) && !IsChecked(GID_ACT_STATUS) && !IsChecked(GID_ACT_DOCTOR)) {
         DoAmigaMerge();
     }
 }
@@ -586,11 +731,15 @@ void RunCommandCapture(char *cmdline)
         return;
     }
 
-    rc = SystemTagList(cmdline, (struct TagItem *)(struct TagItem[]) {
-        { SYS_Output, (ULONG)writefh },
-        { SYS_Asynch, TRUE },
-        { TAG_END, 0 }
-    });
+    {
+        /* A plain array rather than a C99 compound literal, so the SAS/C
+           build line in the header comment actually works. */
+        struct TagItem sysTags[3];
+        sysTags[0].ti_Tag = SYS_Output; sysTags[0].ti_Data = (ULONG)writefh;
+        sysTags[1].ti_Tag = SYS_Asynch; sysTags[1].ti_Data = TRUE;
+        sysTags[2].ti_Tag = TAG_END;    sysTags[2].ti_Data = 0;
+        rc = SystemTagList(cmdline, sysTags);
+    }
 
     /* SYS_Asynch hands ownership of writefh to the child; don't close it
        here. Read lines from our end until EOF (child closes its end). */
@@ -673,7 +822,11 @@ BOOL SetupGUI(void)
     gad[GID_ACT_EXTRACT] = prev = MakeCheckbox(&ng, prev, GID_ACT_EXTRACT, "Extract only", y);     y += 18;
     gad[GID_ACT_MERGE]   = prev = MakeCheckbox(&ng, prev, GID_ACT_MERGE,   "Merge only", y);       y += 18;
     gad[GID_ACT_SORT]    = prev = MakeCheckbox(&ng, prev, GID_ACT_SORT,    "Sort only", y);        y += 18;
-    gad[GID_ACT_QUICK]   = prev = MakeCheckbox(&ng, prev, GID_ACT_QUICK,   "Quick (new files)", y);
+    gad[GID_ACT_QUICK]   = prev = MakeCheckbox(&ng, prev, GID_ACT_QUICK,   "Quick (new files)", y);  y += 18;
+    /* Read-only: what state everything is in, and what is wrong with the
+       set-up. Neither changes anything on the Pi. */
+    gad[GID_ACT_STATUS]  = prev = MakeCheckbox(&ng, prev, GID_ACT_STATUS,  "Status", y);            y += 18;
+    gad[GID_ACT_DOCTOR]  = prev = MakeCheckbox(&ng, prev, GID_ACT_DOCTOR,  "Check set-up", y);
 
     /* --- Column 2: artwork set --- */
     ng.ng_LeftEdge = col2x;
@@ -685,10 +838,17 @@ BOOL SetupGUI(void)
     gad[GID_SET_AGA] = prev = CreateGadgetA(CHECKBOX_KIND, prev, &ng, NULL); y += 18;
     ng.ng_TopEdge = y; ng.ng_GadgetText = "RTG"; ng.ng_GadgetID = GID_SET_RTG;
     gad[GID_SET_RTG] = prev = CreateGadgetA(CHECKBOX_KIND, prev, &ng, NULL); y += 18;
-    ng.ng_TopEdge = y; ng.ng_GadgetText = "ECS-Lo"; ng.ng_GadgetID = GID_SET_ECSLO;
-    gad[GID_SET_ECSLO] = prev = CreateGadgetA(CHECKBOX_KIND, prev, &ng, NULL); y += 18;
-    ng.ng_TopEdge = y; ng.ng_GadgetText = "AGA-Lo"; ng.ng_GadgetID = GID_SET_AGALO;
-    gad[GID_SET_AGALO] = prev = CreateGadgetA(CHECKBOX_KIND, prev, &ng, NULL);
+    /* The laced collections. These used to be "ECS-Lo"/"AGA-Lo" sending
+       --ecs-lo/--aga-lo, which start.sh has never accepted: plain ECS and
+       AGA already ARE the LoRes artwork. */
+    ng.ng_TopEdge = y; ng.ng_GadgetText = "ECS laced"; ng.ng_GadgetID = GID_SET_ECSLACED;
+    gad[GID_SET_ECSLACED] = prev = CreateGadgetA(CHECKBOX_KIND, prev, &ng, NULL); y += 18;
+    ng.ng_TopEdge = y; ng.ng_GadgetText = "AGA laced"; ng.ng_GadgetID = GID_SET_AGALACED;
+    gad[GID_SET_AGALACED] = prev = CreateGadgetA(CHECKBOX_KIND, prev, &ng, NULL); y += 18;
+    ng.ng_TopEdge = y; ng.ng_GadgetText = "Rebuild"; ng.ng_GadgetID = GID_REBUILD;
+    gad[GID_REBUILD] = prev = CreateGadgetA(CHECKBOX_KIND, prev, &ng, NULL); y += 18;
+    ng.ng_TopEdge = y; ng.ng_GadgetText = "Skip update"; ng.ng_GadgetID = GID_SKIP_UPDATE;
+    gad[GID_SKIP_UPDATE] = prev = CreateGadgetA(CHECKBOX_KIND, prev, &ng, NULL);
 
     /* --- Column 3: filesystem + toggles --- */
     ng.ng_LeftEdge = col3x;
@@ -704,10 +864,14 @@ BOOL SetupGUI(void)
     ng.ng_TopEdge = y; ng.ng_GadgetText = "Merge with Amiga on completion"; ng.ng_GadgetID = GID_MERGE_AMIGA;
     ng.ng_Width = 260;
     gad[GID_MERGE_AMIGA] = prev = CreateGadgetA(CHECKBOX_KIND, prev, &ng, NULL);
-    ng.ng_Width = 140;
+    ng.ng_Width = 140; y += 18;
+    ng.ng_TopEdge = y; ng.ng_GadgetText = "Refresh artwork"; ng.ng_GadgetID = GID_REFRESH_ART;
+    gad[GID_REFRESH_ART] = prev = CreateGadgetA(CHECKBOX_KIND, prev, &ng, NULL); y += 18;
+    ng.ng_TopEdge = y; ng.ng_GadgetText = "Verbose output"; ng.ng_GadgetID = GID_VERBOSE;
+    gad[GID_VERBOSE] = prev = CreateGadgetA(CHECKBOX_KIND, prev, &ng, NULL);
 
-    /* --- Text fields --- */
-    y = 150;
+    /* --- Text fields --- (below the third row of checkboxes) */
+    y = 176;
     gad[GID_DEST_STR]    = prev = MakeString(&ng, prev, GID_DEST_STR,    "Dest path (--dest)",        col1x, y, 280); 
     gad[GID_SET_STR]     = prev = MakeString(&ng, prev, GID_SET_STR,     "Custom set name (--set)",   col3x, y, 150);
     y += 34;
@@ -728,10 +892,17 @@ BOOL SetupGUI(void)
     NewList(&logList);
     ng.ng_LeftEdge = col1x; ng.ng_TopEdge = y; ng.ng_Width = WIN_WIDTH - 40; ng.ng_Height = WIN_HEIGHT - y - 20;
     ng.ng_GadgetText = "Output"; ng.ng_GadgetID = GID_LOG_LIST; ng.ng_Flags = PLACETEXT_ABOVE;
-    gad[GID_LOG_LIST] = prev = CreateGadgetA(LISTVIEW_KIND, prev, &ng,
-        GTLV_Labels, (ULONG)&logList,
-        GTLV_ShowSelected, NULL,
-        TAG_END);
+    {
+        /* CreateGadgetA takes a POINTER to a tag array. This used to pass the
+           tags inline, as if it were the varargs CreateGadget(), so the first
+           tag value was read as the tag-list address - on a real Amiga the
+           output list either never appeared or took the machine down. */
+        struct TagItem lvTags[3];
+        lvTags[0].ti_Tag = GTLV_Labels;       lvTags[0].ti_Data = (ULONG)&logList;
+        lvTags[1].ti_Tag = GTLV_ShowSelected; lvTags[1].ti_Data = 0;
+        lvTags[2].ti_Tag = TAG_END;           lvTags[2].ti_Data = 0;
+        gad[GID_LOG_LIST] = prev = CreateGadgetA(LISTVIEW_KIND, prev, &ng, lvTags);
+    }
 
     if (!prev) return FALSE;
 
@@ -743,6 +914,10 @@ BOOL SetupGUI(void)
         WA_CloseGadget, TRUE, WA_DepthGadget, TRUE, WA_DragBar, TRUE,
         WA_IDCMP, IDCMP_GADGETUP | IDCMP_CLOSEWINDOW | IDCMP_REFRESHWINDOW,
         WA_PubScreen, (ULONG)scr,
+        /* On a screen smaller than the window (a 640x256 PAL Workbench),
+           Intuition moves and shrinks it to fit instead of refusing to open
+           it - the log list at the bottom is what gets cut short. */
+        WA_AutoAdjust, TRUE,
         TAG_END);
 
     if (!win) return FALSE;
@@ -785,6 +960,11 @@ int main(void)
         return 20;
     }
 
+    /* Say where commands go and where collections are copied from, so a
+       wrong setting is visible before anything is run. */
+    AppendLog("Pi command prefix (PI_EXEC_PREFIX): \"" PI_EXEC_PREFIX "\"");
+    AppendLog("Pi build folder  (PI_BUILD_SOURCE): " PI_BUILD_SOURCE);
+    AppendLog("If either is wrong, edit the two #defines at the top of the source.");
     AppendLog("Ready. Choose options and press Execute.");
 
     while (!done) {
@@ -806,10 +986,11 @@ int main(void)
                     switch (g->GadgetID) {
                         case GID_ACT_AUTO: case GID_ACT_UPDATE: case GID_ACT_EXTRACT:
                         case GID_ACT_MERGE: case GID_ACT_SORT: case GID_ACT_QUICK:
+                        case GID_ACT_STATUS: case GID_ACT_DOCTOR:
                             EnforceGroup(actionGroup, g->GadgetID);
                             break;
                         case GID_SET_ECS: case GID_SET_AGA: case GID_SET_RTG:
-                        case GID_SET_ECSLO: case GID_SET_AGALO:
+                        case GID_SET_ECSLACED: case GID_SET_AGALACED:
                             EnforceGroup(setGroup, g->GadgetID);
                             break;
                         case GID_FS_FFS: case GID_FS_PFS:

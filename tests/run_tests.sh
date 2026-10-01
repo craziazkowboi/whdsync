@@ -75,6 +75,10 @@ pat="$(cat "$(dirname "$0")/fail_pattern" 2>/dev/null)"
 [ -n "$pat" ] && case "$stem" in *"$pat"*) exit 1;; esac
 slow="$(cat "$(dirname "$0")/slow_pattern" 2>/dev/null)"
 [ -n "$slow" ] && case "$stem" in *"$slow"*) sleep 8;; esac
+# A hostile archive: one member climbs four folders up (../../../../), the
+# way a tampered download could try to write beside the collections.
+evil="$(cat "$(dirname "$0")/evil_pattern" 2>/dev/null)"
+[ -n "$evil" ] && case "$stem" in *"$evil"*) echo pwned > "../../../../ESCAPED_$stem" ;; esac
 echo "$stem" >> "$(dirname "$0")/extract_calls"
 IFS=_ read -r -a f <<< "$stem"; name=""; ver=""
 for t in "${f[@]}"; do case "$t" in v[0-9]*) ver="$t";; *) name="${name:+${name}_}$t";; esac; done
@@ -660,7 +664,12 @@ check "missing tools installed with one apt-get call, and recorded for uninstall
 check "unlzx downloaded, compiled, installed and recorded" \
   '[ "$("$IB/unlzx")" = "unlzx test build" ] && grep -q "source-build:$IB/unlzx" "$S/.retroplay_installed_deps.log"'
 check "the missing locale was enabled" 'grep -qx "en_US ISO-8859-1" "$SM/locale.gen"'
-check "retroplay.conf created with the default variants" 'grep -qx "VARIANTS=\"aga ecs rtg\"" "$S/retroplay.conf"'
+check "retroplay.conf created with the default variants (the same five all.sh builds)" \
+  'grep -qx "VARIANTS=\"aga ecs rtg aga-laced ecs-laced\"" "$S/retroplay.conf"'
+check "...and the artwork packs those variants need" \
+  'grep -qx "ARTWORK_PACKS=\"AGA ECS RTG AGA_Laced ECS_Laced\"" "$S/retroplay.conf"'
+check "setup says what five collections cost before it asks" \
+  'grep -q "five times the" "$ROOT/setup.sh"'
 calls_before="$(wc -l < "$SM/apt_calls")"
 setup_run setup2
 check "running it again changes nothing (no new installs)" '[ "$(wc -l < "$SM/apt_calls")" -eq "$calls_before" ] && grep -q "retroplay.conf already exists" "$T/setup2.log"'
@@ -740,7 +749,9 @@ rm -f "$ROOT/.retroplay/artwork_last_check"; : > "$ROOT/logs/all_cron.log"
 run cronart ./all.sh --cron --skip-update --variants aga; st=$?
 check "the cron run completes - one lock, no deadlock" '[ "$st" -eq 0 ] || [ "$st" -eq 2 ]'
 check "artwork is checked before the collection pipeline" \
-  '[ "$(grep -n "\[Artwork\]" "$ROOT/logs/all_cron.log" | head -1 | cut -d: -f1)" -lt "$(grep -n "Plan" "$ROOT/logs/all_cron.log" | head -1 | cut -d: -f1)" ]'
+  'a="$(grep -n "  Artwork: " "$ROOT/logs/all_cron.log" | head -1 | cut -d: -f1)"
+   p="$(grep -n "\] Plan" "$ROOT/logs/all_cron.log" | head -1 | cut -d: -f1)"
+   [ -n "$a" ] && [ -n "$p" ] && [ "$a" -lt "$p" ]'
 rm -f "$ROOT/.retroplay/artwork_last_check"
 printf 'CORRUPT\nIGame_Screens_AGA_LoRes.lha\nbroken\n' > "$ARTSRC/IGame_Screens_AGA_LoRes.lha"
 acfg ARTWORK_FAILURE_POLICY '"warn-and-continue"'
@@ -1190,7 +1201,13 @@ check "the built-in defaults are Screens,Covers,Titles and RTG Covers,Screens,Ti
 run cfgwarn ./doctor.sh
 check "--status shows which settings file is in use" 'run st ./start.sh --status; grep -q "Settings:" "$T/st.log"'
 check "every script prints its version and release at the start" \
-  'grep -q "release 0.4" "$T/st.log" || ./all.sh --status 2>&1 | grep -q "release 0.4"'
+  'rel="$(sed -n "s/^RP_RELEASE=\"\([^\"]*\)\".*/\1/p" "$ROOT/lib.sh")"; [ -n "$rel" ] &&
+   { grep -q "release $rel" "$T/st.log" || ./all.sh --status 2>&1 | grep -q "release $rel"; }'
+# The release is read from lib.sh rather than written into the test, so the
+# next version bump cannot leave a test quietly pinned to the old number.
+check "the release number is the one the changelog is about" \
+  'rel="$(sed -n "s/^RP_RELEASE=\"\([^\"]*\)\".*/\1/p" "$ROOT/lib.sh")";
+   head -5 "$REPO/CHANGELOG.md" | grep -q "^## $rel "'
 
 section "46. Missing artwork is spotted for every pack, and fetched first"
 ART2="$T/artmissing"; setup mkdir -p "$ART2"
@@ -1544,8 +1561,11 @@ rm -rf "$LK.d" "$LK.info"
 run unlocknone ./start.sh --unlock-stale
 check "with no lock in place it says so and changes nothing" \
   'grep -qi "no lock" "$T/unlocknone.log" && [ ! -e "$LK.d" ]'
-# A lock folder whose owner is alive: never removed.
-( sleep 6 ) & live=$!
+# A lock folder whose owner is alive: never removed. The stand-in run must
+# look like one - a process running all.sh - because a PID that is alive but
+# running something else is (correctly) taken for a recycled number.
+bash -c 'exec -a all.sh sleep 6' & live=$!
+sleep 0.3
 mkdir -p "$LK.d"
 printf 'pid=%s\nhost=%s\nstarted=now\nrun_id=t\ncommand=all.sh --sync\n' "$live" "$(hostname 2>/dev/null || uname -n)" > "$LK.info"
 run unlocklive ./start.sh --unlock-stale; st=$?
@@ -1633,9 +1653,21 @@ check "the batch says in plain words that it is not a collection" \
 check "the collection itself was not changed" '[ ! -d "$ROOT/build/retro_aga/WHDLoad/Games/P/Preview" ]'
 check "the archive stays queued, so an ordinary run still installs it" \
   'grep -q "Preview_v1.0.lha" "$ROOT/.retroplay/queue/retro_aga.list"'
+check "the batch carries the machine-readable preview marker" \
+  'grep -q "^preview=1" "${latestp}.preview_marker"'
+check "a preview does not stamp the untouched collection's manifest as a preview" \
+  '! grep -q "^kind=preview" "$ROOT/.retroplay/manifest/retro_aga" 2>/dev/null'
 run prevthen ./start.sh --sync --aga; st=$?
 check "...and the next ordinary run does install it" \
   '{ [ "$st" -eq 0 ] || [ "$st" -eq 2 ]; } && [ -d "$ROOT/build/retro_aga/WHDLoad/Games/P/Preview" ]'
+# The next run's "remove batches with the wrong layout" sweep used to take the
+# preview's own PREVIEW_ONLY.txt for debris and delete the whole batch.
+check "...and it leaves the preview batch alone, readme and all" \
+  '[ -d "${latestp}WHDLoad/Games/P/Preview" ] && [ -f "${latestp}PREVIEW_ONLY.txt" ] &&
+   ! grep -q "Removed .*wrong folder layout" "$T/prevthen.log"'
+check "a PREVIEW_ONLY.txt without the marker is still reported as out of place" \
+  '( d="$T/fakeprev"; mkdir -p "$d/WHDLoad"; : > "$d/PREVIEW_ONLY.txt";
+     [ "$(cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; rp_layout_problems \"$d\"")" = "PREVIEW_ONLY.txt" ] )'
 run quickdep ./quick.sh --help
 check "quick.sh still works and points at the new name" \
   'grep -q -- "--preview-new" "$T/quickdep.log"'
@@ -2306,6 +2338,326 @@ check "...and writes that into retroerror.log, not just the screen" \
   'sed -n "/^stage_failed()/,/^}/p" "$ROOT/all.sh" | grep -q "retroerror.log"'
 check "no stage still fails with a bare message" \
   '! grep -q "fail \"sorting failed\"" "$ROOT/all.sh"'
+
+
+section "91. Release 0.5 is what every script reports"
+check "lib.sh says release 0.5" 'grep -q "^RP_RELEASE=\"0.5\"" "$ROOT/lib.sh"'
+check "every script carries lib.sh's suite stamp" \
+  'v="$(sed -n "s/^RP_SUITE_VERSION=\"\([^\"]*\)\"/\1/p" "$ROOT/lib.sh")";
+   [ -n "$v" ] && [ -z "$(grep -L "^# retroplay-suite: $v " "$ROOT"/*.sh | grep -v "/lib.sh$")" ]'
+run relver ./start.sh --version
+check "--version reports it" 'grep -q "^whdsync 0.5 " "$T/relver.log"'
+
+section "92. NOCOLOR is honoured like NO_COLOR, and --color=always still wins"
+cl() { ( cd "$ROOT" && env "$@" RP_FORCE_TTY=1 bash -c 'SCRIPT_DIR=.; . ./lib.sh; rp_colour_on && echo on || echo off' ) 2>/dev/null; }
+check "NOCOLOR=1 turns colour off on a terminal"    '[ "$(cl NOCOLOR=1)" = off ]'
+check "NOCOLOR with any value does too"             '[ "$(cl NOCOLOR=yes)" = off ]'
+check "--color=always overrides NOCOLOR (as no-color.org says a flag should)" \
+  '[ "$(cl NOCOLOR=1 RP_COLOR=always)" = on ]'
+check "--color=never beats a terminal"              '[ "$(cl RP_COLOR=never)" = off ]'
+
+section "93. The lock record says which scripts took it"
+( cd "$ROOT" && bash -c 'SCRIPT_DIR=.; . ./lib.sh; rp_load_config; RP_RUN_ID=t93; rp_lock_write_info "all.sh --cron"' ) 2>/dev/null
+check "suite_version and release are recorded" \
+  'grep -q "^suite_version=" "$ROOT/.all.lock.info" && grep -q "^release=0.5" "$ROOT/.all.lock.info"'
+sed -i.bak 's/^pid=.*/pid=999999/' "$ROOT/.all.lock.info" && rm -f "$ROOT/.all.lock.info.bak"
+run unl ./start.sh --unlock-stale
+check "--unlock-stale shows it, one fact per line" \
+  'grep -q "Scripts:  .*(release 0.5)" "$T/unl.log" && grep -q "PID:      999999" "$T/unl.log"'
+check "...and removes a lock whose run is gone" '[ ! -f "$ROOT/.all.lock.info" ]'
+
+section "94. Read-only commands work even when the archive tools are missing"
+# --doctor exists to explain how to install missing tools; it used to refuse
+# to run because they were missing. Same for --status, --plan, --why-*.
+NOTOOLS="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$MOCK" | paste -sd: -)"
+for c in --status --doctor "--why-build aga" --show-failed "--why-queued Alpha"; do
+  ( cd "$ROOT" && PATH="$NOTOOLS" ./start.sh $c ) < /dev/null > "$T/notools.log" 2>&1
+  check "start.sh $c is not blocked by the archive-tool check" '! grep -q "Still missing" "$T/notools.log"'
+done
+# lib.sh adds back the PATH an earlier interactive run remembered (so cron
+# can find tools), and earlier sections here remembered one that holds the
+# mock tools. Set it aside for this one check so the tools really are gone.
+mv "$ROOT/.retroplay/user_path" "$T/user_path.save" 2>/dev/null
+( cd "$ROOT" && PATH="$NOTOOLS" ./start.sh --sync --aga ) < /dev/null > "$T/notools_sync.log" 2>&1; st=$?
+mv "$T/user_path.save" "$ROOT/.retroplay/user_path" 2>/dev/null
+if ! PATH="$NOTOOLS" command -v lha >/dev/null 2>&1; then
+  check "...while a real build still stops for a missing tool" '[ "$st" -eq 4 ] && grep -q "Still missing" "$T/notools_sync.log"'
+fi
+
+section "95. --help anywhere on the line is help, never a run"
+: > "$MOCK/wget_calls"; : > "$MOCK/extract_calls"
+run hlp1 ./aga.sh --rebuild --help
+check "./aga.sh --rebuild --help shows help" 'grep -q "Usage: aga.sh" "$T/hlp1.log"'
+check "...and builds nothing" '[ ! -s "$MOCK/wget_calls" ] && [ ! -s "$MOCK/extract_calls" ]'
+run hlp2 ./start.sh --sync --help
+check "./start.sh --sync --help shows help and builds nothing" \
+  'grep -q "^Everyday" "$T/hlp2.log" && [ ! -s "$MOCK/extract_calls" ]'
+run hlp3 ./start.sh --help advanced
+check "--help advanced still takes its topic" '[ "$(grep -c . "$T/hlp3.log")" -gt 50 ]'
+
+section "96. --why-queued explains one archive and changes nothing"
+printf 'WHDLoad/Games/Z/Zool_v1.3_AGA_1234.lha\n' >> "$ROOT/.retroplay/queue/retro_aga.list"
+before="$(cd "$ROOT/.retroplay" && find . -type f -exec cksum {} + 2>/dev/null | sort)"
+run wq ./start.sh --why-queued zool
+after="$(cd "$ROOT/.retroplay" && find . -type f -exec cksum {} + 2>/dev/null | sort)"
+check "it finds the archive in the AGA queue" 'grep -q "retro_aga .*Zool_v1.3_AGA_1234.lha" "$T/wq.log"'
+check "it says why ECS never queues an AGA release" 'grep -q "retro_ecs leaves out AGA releases" "$T/wq.log"'
+check "nothing in the state folder changed" '[ "$before" = "$after" ]'
+grep -vF "Zool_v1.3_AGA_1234.lha" "$ROOT/.retroplay/queue/retro_aga.list" > "$T/q.tmp"; cat "$T/q.tmp" > "$ROOT/.retroplay/queue/retro_aga.list"
+run wq2 ./start.sh --why-queued NoSuchGame
+check "an unknown archive is reported plainly" 'grep -q "not queued for any collection" "$T/wq2.log"'
+
+section "97. The support bundle holds nothing private"
+cp "$ROOT/retroplay.conf" "$T/conf.save"
+cat >> "$ROOT/retroplay.conf" << 'SBEOF'
+NTFY_TOPIC="sb-topic-77315"
+NOTIFY_EMAIL="someone@example.com"
+ARTWORK_FETCH_COMMAND="python3 /opt/find.py --key sk-SECRET-42"
+NTFY_SERVER="https://me:pa55word@ntfy.example.com"
+SBEOF
+mkdir -p "$ROOT/logs"
+printf '2026-10-01 notify to sb-topic-77315 failed from %s/x\n' "$HOME" >> "$ROOT/logs/update.log"
+run sb ./start.sh --support-bundle; st=$?
+bundle="$(ls -1 "$ROOT"/logs/whdsync-support-*.tar.gz 2>/dev/null | tail -1)"
+rm -rf "$T/sbx"; mkdir -p "$T/sbx"; [ -n "$bundle" ] && tar -xzf "$bundle" -C "$T/sbx"
+check "a bundle is written" '[ "$st" -eq 0 ] && [ -n "$bundle" ]'
+check "it has the status, the doctor report and the settings" \
+  'ls "$T"/sbx/*/status.txt "$T"/sbx/*/doctor.txt "$T"/sbx/*/retroplay.conf.txt >/dev/null 2>&1'
+for secret in sb-topic-77315 someone@example.com sk-SECRET-42 /opt/find.py pa55word "$HOME/"; do
+  check "it does not contain: $secret" '! grep -rqF -- "$secret" "$T/sbx"'
+done
+check "private settings are shown as hidden, not dropped" 'grep -q "^NTFY_TOPIC=\"<hidden>\"" "$T"/sbx/*/retroplay.conf.txt'
+check "no game, archive or artwork file is in it" \
+  '! tar -tzf "$bundle" | grep -qiE "\.(lha|lzx|zip|iff|info|slave)$"'
+cp "$T/conf.save" "$ROOT/retroplay.conf"; rm -f "$ROOT"/logs/whdsync-support-*.tar.gz
+
+section "98. Deleting backups is its own command, never a question at the end of a build"
+check "all.sh no longer asks" '! grep -q "Delete them?" "$ROOT/all.sh"'
+BK="$ROOT/.retroplay_backups"      # RP_BACKUP_DIR: $RP_BASE_DIR/.retroplay_backups
+mkdir -p "$BK"; head -c 4096 /dev/zero > "$BK/state-20260101-000000.tgz"
+run cb1 ./start.sh --clean-backups; st=$?
+check "unattended and without --yes it refuses and deletes nothing" '[ "$st" -ne 0 ] && [ -f "$BK/state-20260101-000000.tgz" ]'
+run cb2 ./start.sh --clean-backups --yes; st=$?
+check "with --yes it deletes them" '[ "$st" -eq 0 ] && [ ! -e "$BK/state-20260101-000000.tgz" ]'
+
+section "99. Manifests are versioned and travel with the collection"
+run mf ./all.sh --rebuild --variants aga
+check "the state manifest has a schema version" 'grep -q "^manifest_version=1" "$ROOT/.retroplay/manifest/retro_aga"'
+check "the collection carries its own copy" 'grep -q "^variant=retro_aga" "$ROOT/build/retro_aga/.whdsync_manifest.conf"'
+check "...which does not upset the layout rule" '[ -z "$(cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; rp_layout_problems \"$ROOT/build/retro_aga\"")" ]'
+
+section "100. An interrupted pack swap is finished or undone, never left half-done"
+RA="$T/recov/artwork/iGame_AGA/laced"; rm -rf "$T/recov"
+mkdir -p "$RA/Covers.previous.999991/Games" "$RA/Covers.incoming.999991"; echo old > "$RA/Covers.previous.999991/Games/x"
+( cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; rp_recover_replacements '$T/recov/artwork'" ) >/dev/null 2>&1
+check "with the live pack gone, the previous one is put back" '[ "$(cat "$RA/Covers/Games/x" 2>/dev/null)" = old ]'
+check "...and the half-staged one is removed" '[ ! -e "$RA/Covers.incoming.999991" ]'
+mkdir -p "$RA/Screens" "$RA/Screens.previous.999992"; echo old > "$RA/Screens.previous.999992/f"
+( cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; rp_recover_replacements '$T/recov/artwork'" ) >/dev/null 2>&1
+check "with the new pack in place, the old copy is kept, not deleted" '[ -f "$RA/Screens.previous.999992/f" ]'
+mkdir -p "$RA/Titles.incoming.$$"
+( cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; rp_recover_replacements '$T/recov/artwork'" ) >/dev/null 2>&1
+check "a run that is still going is left alone" '[ -d "$RA/Titles.incoming.$$" ]'
+check "artwork_sync.sh takes the one run lock, not a private one" \
+  'grep -q "rp_lock_for_stage \"artwork_sync.sh" "$ROOT/artwork_sync.sh" &&
+   ! sed -e "s/[[:space:]]#.*$//" -e "s/^[[:space:]]*#.*$//" "$ROOT/artwork_sync.sh" | grep -q "artwork.lock"'
+if [ -n "$FLOCK" ]; then
+    rm -rf "$ROOT/.all.lock.d" "$ROOT/.all.lock.info"
+    ( exec 9>"$ROOT/.all.lock"; "$FLOCK" 9; sleep 300 ) & holder=$!
+    sleep 1
+    run artlock ./artwork_sync.sh --sync; st=$?
+    check "a hand-run artwork sync is refused while a build holds the lock" '[ "$st" -eq 4 ] && grep -q "already running" "$T/artlock.log"'
+    kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+fi
+
+section "101. Five phases, and where the build time went"
+run ph ./all.sh --rebuild --variants aga
+for n in "1/5] Preflight" "2/5] Updates" "3/5] Plan" "4/5] Build" "5/5] Finalise"; do
+  check "the run announces [$n" 'grep -qF "[$n" "$T/ph.log"'
+done
+check "artwork is part of Updates, not a phase of its own" '! grep -q "\[Artwork\] checking" "$T/ph.log"'
+check "the report says how long extract, sort, merge and install took" \
+  'grep -q "Inside the build" "$T/ph.log" && grep -q "artwork merge" "$T/ph.log"'
+check "no bare ===== banners are left in all.sh" '! grep -q "echo \"===== " "$ROOT/all.sh"'
+
+section "102. The A314 GUI builds its command line safely"
+GUI="$REPO/a314_retroplay_gui.c"
+check "no strcpy or strcat into fixed buffers remain" '! grep -nE "(^|[^A-Za-z_])str(cpy|cat)\(" "$GUI"'
+check "it sends the laced options start.sh actually has, not --ecs-lo/--aga-lo" \
+  'grep -q -- "--aga-laced" "$GUI" && ! grep -q -- "-lo\"" "$GUI"'
+check "it copies from the per-variant build folder, not the retired retro/" \
+  'grep -q "PI_BUILD_SOURCE" "$GUI" && ! grep -q "PI_RETRO_SOURCE  \"" "$GUI"'
+check "no C99 compound literal (the SAS/C build line must work)" '! grep -q "(struct TagItem\[\])" "$GUI"'
+if command -v cc >/dev/null 2>&1; then
+  { echo '#include <stdio.h>'; echo '#include <string.h>'; echo 'typedef short BOOL;'; echo '#define TRUE 1'; echo '#define FALSE 0'
+    sed -n '/^BOOL CopyStr(char \*dst, const char \*src, int dstSize)$/,/^}/p' "$GUI"
+    sed -n '/^BOOL AppendStr(/,/^}/p;/^BOOL JoinPath(/,/^}/p;/^BOOL IsSafeFieldText(/,/^}/p' "$GUI"
+    cat << 'CEOF'
+int main(void){ char b[8]; char big[64]; int bad=0;
+  if (!CopyStr(b,"abc",sizeof b) || strcmp(b,"abc")) bad++;
+  if (CopyStr(b,"abcdefghij",sizeof b) || strlen(b)!=7) bad++;
+  strcpy(b,"ab"); if (AppendStr(b,"cdefghij",sizeof b) || strlen(b)!=7) bad++;
+  if (!JoinPath("DH0:","G",big,sizeof big) || strcmp(big,"DH0:G")) bad++;
+  if (JoinPath("DH0:a/long/path/here","Name",b,sizeof b)) bad++;
+  if (!IsSafeFieldText("Work:WHDLoad/Games") || IsSafeFieldText("a\"b") || IsSafeFieldText("$(x)") || IsSafeFieldText("a*b")) bad++;
+  return bad; }
+CEOF
+  } > "$T/gui_helpers.c"
+  if cc -std=c99 -o "$T/gui_helpers" "$T/gui_helpers.c" 2>"$T/gui_cc.log"; then
+    check "its bounded string helpers never overrun and refuse unsafe text" '"$T/gui_helpers"'
+  else
+    check "its string helpers compile" 'false'
+  fi
+else
+  echo "  (skipped the GUI helper run: no C compiler)"
+fi
+
+section "103. setup.sh fetches the artwork the chosen variants use, and only that"
+check "the packs are derived from the variants, not copied from the example" \
+  'grep -q "aga-laced) packs=\"\$packs AGA_Laced\"" "$ROOT/setup.sh"'
+
+
+section "104. An archive cannot write outside the folder it is unpacked into"
+echo "Evil" > "$MOCK/evil_pattern"
+server_add WHDLoad/Games/E/EvilGame_v1.0.lha
+run evil ./all.sh --variants aga; st=$?
+rm -f "$MOCK/evil_pattern"
+check "the hostile archive is refused, with the reason" \
+  'grep -rq "REFUSED: it has entries that climb out" "$ROOT/logs" "$T/evil.log" 2>/dev/null'
+check "nothing it tried to write exists anywhere" \
+  '[ -z "$(find "$ROOT" "$T" -name "ESCAPED_*" 2>/dev/null | head -1)" ]'
+check "no unpacking folders are left behind" \
+  '[ -z "$(find "$ROOT" -name ".whdsync_x.*" 2>/dev/null | head -1)" ]'
+check "the rest of the run still finished (it is one failed archive, not a stop)" \
+  '[ "$st" -eq 0 ] || [ "$st" -eq 5 ]'
+check "the game it carried is not in the collection" '[ -z "$(game retro_aga EvilGame)" ]'
+check "an ordinary archive in the same run still installs" '[ -n "$(game retro_aga Alpha)" ]'
+
+section "105. Installing an update never leaves a game half-copied"
+check "games are swapped in by rename, not deleted and re-copied" \
+  'sed -n "/^rp_replace_and_copy()/,/^}/p" "$ROOT/lib.sh" | grep -q "incoming" &&
+   ! sed -n "/^rp_replace_and_copy()/,/^}/p" "$ROOT/lib.sh" | grep -q "cp -a \"\$src/.\" \"\$dest/\""'
+RC="$T/rac"; rm -rf "$RC"
+mkg() { mkdir -p "$1/WHDLoad/Games/$2/$3"; echo "$4" > "$1/WHDLoad/Games/$2/$3/game.slave"; echo i > "$1/WHDLoad/Games/$2/$3.info"; }
+mkg "$RC/live" A Alpha old; echo x > "$RC/live/WHDLoad/Games/A/Alpha/oldonly"; mkg "$RC/live" B Beta keep
+mkg "$RC/batch" A Alpha new; mkg "$RC/batch" G Gamma new
+( cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; rp_replace_and_copy '$RC/batch' '$RC/live'" ) >/dev/null 2>&1; st=$?
+check "an update installs the new version, whole" \
+  '[ "$st" -eq 0 ] && [ "$(cat "$RC/live/WHDLoad/Games/A/Alpha/game.slave")" = new ] && [ ! -e "$RC/live/WHDLoad/Games/A/Alpha/oldonly" ]'
+check "new and untouched games are as they should be" \
+  '[ -f "$RC/live/WHDLoad/Games/G/Gamma/game.slave" ] && [ "$(cat "$RC/live/WHDLoad/Games/B/Beta/game.slave")" = keep ]'
+check "the batch is left intact for new_<variant>" '[ "$(cat "$RC/batch/WHDLoad/Games/A/Alpha/game.slave")" = new ]'
+# Interrupted between "old -> .previous" and "new -> live":
+G="$RC/live/WHDLoad/Games/A"; mv "$G/Alpha" "$G/Alpha.previous.999991"
+mkdir -p "$G/Alpha.incoming.999991"; echo half > "$G/Alpha.incoming.999991/game.slave"
+mkdir -p "$RC/state/installing"; : > "$RC/state/installing/retro_x"
+( cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; RP_STATE_DIR='$RC/state'; rp_recover_collection retro_x '$RC/live'" ) >/dev/null 2>&1
+check "cut mid-swap: the next run puts the whole previous game back" '[ "$(cat "$G/Alpha/game.slave")" = new ]'
+check "...and removes the half-copied one" '[ ! -e "$G/Alpha.incoming.999991" ]'
+check "...and clears its marker" '[ ! -e "$RC/state/installing/retro_x" ]'
+check "the marker is written before games are swapped in and removed after" \
+  'grep -q "installing/\$key" "$ROOT/all.sh" && grep -q "rp_recover_collection" "$ROOT/all.sh"'
+
+section "106. Locks: record removed before release, stale locks broken safely, reused PIDs seen"
+check "the record is removed while the lock is still held" \
+  'sed -n "/^rp_lock_release()/,/^}/p" "$ROOT/lib.sh" | awk "/rm -f \"\\\$RP_LOCK_FILE.info\"/{r=NR} /exec 9>&-/{c=NR} END{exit !(r && c && r < c)}"'
+check "a stale mkdir lock is broken by an atomic rename, not rm-then-mkdir" \
+  'sed -n "/^rp_lock_take()/,/^}/p" "$ROOT/lib.sh" | grep -q "mv \"\$RP_LOCK_FILE.d\" \"\$RP_LOCK_FILE.d.stale"'
+sleep 300 & other=$!
+check "a PID now running something else does not keep a lock alive" \
+  '! ( cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; rp_lock_owner_alive $other \"all.sh --cron\"" )'
+check "...but with nothing recorded about the command, it is assumed alive" \
+  '( cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; rp_lock_owner_alive $other \"\"" )'
+kill "$other" 2>/dev/null; wait "$other" 2>/dev/null
+# Many runs at once on the mkdir fallback: exactly one may ever hold it.
+LKT="$T/lockrace"; rm -rf "$LKT"; mkdir -p "$LKT"
+for n in 1 2 3 4 5 6 7 8; do
+  ( cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; RP_LOCK_FILE='$LKT/.all.lock'; rp_flock_bin() { return 1; };
+      if rp_lock_take \"race $n\"; then echo held >> '$LKT/holders'; sleep 2; rp_lock_release; fi" ) >/dev/null 2>&1 &
+done
+wait
+check "eight runs racing for the mkdir lock: exactly one got it" '[ "$(grep -c held "$LKT/holders" 2>/dev/null)" = 1 ]'
+check "...and it left nothing behind" '[ ! -e "$LKT/.all.lock.d" ] && [ ! -e "$LKT/.all.lock.info" ]'
+
+section "107. Artwork archives: precise checks, and nothing escapes while unpacking"
+check "a name with two dots is not refused any more" '! grep -q "name .\*\.\.\*." "$ROOT/artwork_sync.sh"'
+check "links are still refused" 'grep -q -- "-type l -o .( -type f -links +1" "$ROOT/artwork_sync.sh"'
+check "packs are unpacked several levels deep and checked for escapes" \
+  'grep -q "stage=\"\$MY_WORK/j/j/j/x\"" "$ROOT/artwork_sync.sh" && grep -q "climb out of the folder" "$ROOT/artwork_sync.sh"'
+check "the existing backup is only replaced once the new one is in place" \
+  'sed -n "/^rp_replace_tree()/,/^}/p" "$ROOT/lib.sh" | grep -q "bk_tmp=\"\$backup.incoming"'
+
+section "108. The licence is MIT, everywhere it is stated"
+check "LICENSE is MIT" 'head -1 "$REPO/LICENSE" | grep -q "^MIT License"'
+check "no script or document claims another licence" \
+  '! grep -rIl -i "creative commons\|BY.NC" "$REPO"/*.sh "$REPO"/*.md "$REPO"/*.c "$REPO"/*.py 2>/dev/null | grep -v CHANGELOG.md'
+check "start.sh points at it" 'grep -q "^# License: MIT - see LICENSE" "$REPO/start.sh"'
+
+
+section "109. The collection swap survives being cut at every point"
+SW="$T/swap/build"; rm -rf "$T/swap"
+sw() { ( cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; $*" ) >/dev/null 2>&1; }
+# cut before the first rename: live untouched, staged build discarded
+mkdir -p "$SW/retro_aga" "$SW/.new_retro_aga"; echo old > "$SW/retro_aga/f"; echo new > "$SW/.new_retro_aga/f"
+sw "rp_recover_swap '$SW/retro_aga'"
+check "cut before the swap: the collection is untouched" '[ "$(cat "$SW/retro_aga/f")" = old ] && [ ! -e "$SW/.new_retro_aga" ]'
+# cut between the two renames: previous collection back
+rm -rf "$SW"; mkdir -p "$SW/.previous_retro_aga" "$SW/.new_retro_aga"; echo old > "$SW/.previous_retro_aga/f"
+sw "rp_recover_swap '$SW/retro_aga'"
+check "cut between the renames: the previous collection is put back" '[ "$(cat "$SW/retro_aga/f")" = old ]'
+# cut before the old one was deleted: new stays
+rm -rf "$SW"; mkdir -p "$SW/retro_aga" "$SW/.previous_retro_aga"; echo new > "$SW/retro_aga/f"; echo old > "$SW/.previous_retro_aga/f"
+sw "rp_recover_swap '$SW/retro_aga'"
+check "cut after the swap: the new collection stays, the old is cleared" '[ "$(cat "$SW/retro_aga/f")" = new ] && [ ! -e "$SW/.previous_retro_aga" ]'
+# and the swap itself
+rm -rf "$SW"; mkdir -p "$SW/retro_aga" "$SW/.new_retro_aga"; echo old > "$SW/retro_aga/f"; echo new > "$SW/.new_retro_aga/f"
+sw "rp_swap_collection '$SW/retro_aga'"
+check "an ordinary swap leaves exactly the new collection" \
+  '[ "$(cat "$SW/retro_aga/f")" = new ] && [ ! -e "$SW/.new_retro_aga" ] && [ ! -e "$SW/.previous_retro_aga" ]'
+check "recovery runs for every collection before anything else" \
+  '[ "$(grep -n "rp_recover_swap \"\${V_DEST" "$ROOT/all.sh" | cut -d: -f1)" -lt "$(grep -n "^# 2. Decide what each variant needs" "$ROOT/all.sh" | cut -d: -f1)" ]'
+
+section "110. Build time is only reported for a build that began"
+check "build_seconds needs the build to have started" 'grep -q "BUILD_TIMER_STARTED\" -eq 1 \] && stage_end build_seconds" "$ROOT/all.sh"'
+run nothingnew ./all.sh --skip-update --variants aga; st=$?
+if [ "$st" -eq 2 ]; then
+  check "a nothing-to-do run has no build time in its report" '! grep -q "^  build " "$T/nothingnew.log"'
+fi
+
+section "111. Automatic job counts: one rule, the same numbers, testable"
+aj() { ( cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; rp_auto_jobs $*" ) 2>/dev/null; }
+check "Pi Zero 2 W (4 cores, 512 MB): one extraction at a time" '[ "$(aj extract 4 524288)" = 1 ]'
+check "1 GB: at most two"                                      '[ "$(aj extract 4 1048576)" = 2 ]'
+check "plenty of memory: one per core"                         '[ "$(aj extract 4 4194304)" = 4 ]'
+check "never more than 8 extractions, whatever the cores"      '[ "$(aj extract 32 33554432)" = 8 ]'
+check "sort: three quarters of the cores, at least 2"          '[ "$(aj sort 1 4194304)" = 2 ] && [ "$(aj sort 8 4194304)" = 6 ]'
+check "sort: at most 4 under 768 MB"                           '[ "$(aj sort 16 524288)" = 4 ]'
+check "never below 1, even with nothing to go on"              '[ "$(aj extract 0 0)" -ge 1 ]'
+check "an explicit setting still wins over auto" \
+  '[ "$(cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; RP_EXTRACT_JOBS=3; rp_jobs extract 1" 2>/dev/null)" = 3 ]'
+check "extract.sh and sort.sh use the shared rule" \
+  'grep -q "rp_auto_jobs extract" "$ROOT/extract.sh" && grep -q "rp_auto_jobs sort" "$ROOT/sort.sh"'
+
+section "112. The support bundle hides by default, not by guessing names"
+printf 'VARIANTS="aga"\nNTFY_TOPIC="t-9917"\nWEIRDLY_NAMED="s3cr3t-v4lue"\n' > "$T/sbconf.conf"
+( cd "$ROOT" && cp retroplay.conf "$T/conf.save2" && cp "$T/sbconf.conf" retroplay.conf ) 
+run sb2 ./start.sh --support-bundle
+b2="$(ls -1 "$ROOT"/logs/whdsync-support-*.tar.gz 2>/dev/null | tail -1)"
+rm -rf "$T/sb2x"; mkdir -p "$T/sb2x"; [ -n "$b2" ] && tar -xzf "$b2" -C "$T/sb2x"
+check "a setting it does not know is hidden even with an innocent name" '! grep -rq "s3cr3t-v4lue" "$T/sb2x"'
+check "settings that say nothing private are still shown" 'grep -q "^VARIANTS=\"aga\"" "$T"/sb2x/*/retroplay.conf.txt'
+cp "$T/conf.save2" "$ROOT/retroplay.conf"; rm -f "$ROOT"/logs/whdsync-support-*.tar.gz
+printf '%s\n' "x?Token=abc123&p=1" "mail me@example.org" | ( cd "$ROOT" && bash -c 'SCRIPT_DIR=.; . ./lib.sh; RP_NTFY_TOPIC=""; rp_redact' ) > "$T/red.txt" 2>/dev/null
+check "token=/key= style values are hidden anywhere" '! grep -q abc123 "$T/red.txt" && grep -q "Token=<hidden>" "$T/red.txt"'
+check "e-mail addresses are hidden anywhere" '! grep -q "me@example.org" "$T/red.txt"'
+
+section "113. The A314 GUI only sends options start.sh accepts"
+for o in $(grep -o 'ADD(" --[a-z-]*' "$REPO/a314_retroplay_gui.c" | sed 's/ADD(" //' | sort -u); do
+  check "start.sh accepts $o" "grep -qE -- '(^ *|\\|)$o(\\)|\\|)' \"\$ROOT/start.sh\""
+done
+check "the window fits itself to a small screen" 'grep -q "WA_AutoAdjust, TRUE" "$REPO/a314_retroplay_gui.c"'
+check "Status and Check set-up never trigger the copy to the Amiga" \
+  'grep -q "!IsChecked(GID_ACT_STATUS) && !IsChecked(GID_ACT_DOCTOR)" "$REPO/a314_retroplay_gui.c"'
 
 # ================================================================ summary ===
 echo

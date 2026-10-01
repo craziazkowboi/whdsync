@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.09.29   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.10.01.2   (every script in the set must carry the same stamp)
 # Remember where the user ran this from, before any cd: retroplay.conf is
 # looked for there first (see lib.sh).
 RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
@@ -15,8 +15,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # prepended - passing it through produced "start.sh --sync --rtg --help",
 # which described a build nobody asked for. (RTG has no laced counterpart:
 # the RTG packs are a single set.)
-case "${1:-}" in
-    -h|--help)
+# Anywhere in the arguments, not only first: "./rtg.sh --rebuild --help" used
+# to hand --help to start.sh after --sync, which could start a rebuild.
+_help=0
+for _a in ${1+"$@"}; do case "$_a" in -h|--help) _help=1 ;; esac; done
+case "$_help" in
+    1)
         echo "Usage: $(basename "$0") [start.sh options]"
         echo
         echo "Builds or updates the RTG collection (build/retro_rtg)."
