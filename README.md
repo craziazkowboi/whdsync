@@ -14,7 +14,7 @@ downloads/            →  extract  →  artwork  →  sort  →  build/retro_ag
 
 - **Runs on** a Raspberry Pi (including a Pi Zero 2 W) or a Mac. Linux and macOS, nothing else needed.
 - **Safe by design.** It never deletes a collection until its replacement is ready, never overwrites artwork you changed yourself, and stops rather than guessing.
-- **Tested.** 651 automated tests plus 231 option checks, run offline on every change. GitHub Actions runs them on Ubuntu and on macOS (bash 3.2), with ShellCheck.
+- **Tested.** 684 automated tests plus 231 option checks, run offline on every change. GitHub Actions runs them on Ubuntu and on macOS (bash 3.2), with ShellCheck.
 
 ---
 
@@ -328,7 +328,7 @@ It checks the whole setup and, for anything wrong, tells you the command that fi
 
 | Message | What it means |
 |---|---|
-| "the output folder isn't available (drive not mounted?)" | Your USB drive isn't mounted. Nothing was changed — plug it in and run again |
+| "the output folder did not pass its check" | The lines above it say what was found. Usually the USB drive isn't mounted: the "It is on …, mounted at …" line shows which disk that folder is really on. Nothing was changed — mount the drive and run again. If the marker file was deleted, or another copy of the scripts replaced it, and your collections are in the folder, the run repairs that itself and carries on |
 | "some archives couldn't be extracted" (exit 5) | A damaged download. Everything else was installed; it retries by itself, and after three attempts fetches a fresh copy |
 | "network or server problem" (exit 3) | The server was unreachable. It tries again next run |
 | "scripts are not from the same version" | Some files weren't updated. Copy the whole set across |

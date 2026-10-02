@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.10.01.2   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.10.03.1   (every script in the set must carry the same stamp)
 # Remember where the user ran this from, before any cd: retroplay.conf is
 # looked for there first (see lib.sh).
 RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
@@ -1233,10 +1233,10 @@ done
 
 shopt -u nullglob
 
-# Ensure final progress bar at 100% (in case last step missed the modulus)
-if (( total_targets > 0 )); then
+# Draw the finished bar only if the loop did not already (it does whenever it
+# counts the last game; drawing it again printed the 100% line twice).
+if (( total_targets > 0 && processed != total_targets )); then
     progress_bar "$total_targets" "$total_targets" "$BAR_WIDTH"
-    printf "\n"
 fi
 
 printf "\n"

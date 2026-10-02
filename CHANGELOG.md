@@ -2,6 +2,66 @@
 
 ## 0.5 - 2026-10-01 (laced variants, the Pi "hang", the macOS sort failure, and the paths that pointed at the old layout)
 
+### macOS: "sort.sh stopped at line 979", printed 85 times, during a run that finished (2026-10-03)
+- **A false alarm, and only on macOS.** A full `./all.sh` on a Mac printed
+  `ERROR: sort.sh stopped at line 979: this command failed with exit 1:
+  return 1` once for every filename the Amiga-filename check flagged (85 of
+  them), and copied the same lines into `retroerror.log`. Nothing had
+  stopped: the sort finished, all five collections were built, and the
+  result was "Finished successfully".
+  The cause was the helper added last time to explain a failed sort. It runs
+  whenever a command fails, and macOS's bash (3.2) also runs it inside a
+  `$(...)` that an `if` is testing - newer bash on Linux and the Pi does not.
+  The filename check answers "this name has a problem" with status 1, by
+  design, so on macOS every flagged name looked like a failure.
+  The helper now only speaks when the shell it is in is really about to stop
+  (errexit is on at that moment), which is true on every bash; the
+  filename-check workers also switch it off outright. A sort that really
+  does stop is still reported with its line and command, and a background
+  step that dies now says it was a background step.
+- **The 85 warnings themselves are real** and separate: "Found 85
+  filename(s) with Amiga compliance issues" with the list in
+  `logs/amiga_filename_issues.log` (copied into `retroerror.log`). They were
+  there before; the false alarm just buried them.
+- **`update.sh` printed its log path twice over**
+  (`See /…/logs//…/logs/update.log for details`). It prints the path once.
+- **Summary table out of line for the laced collections.** The name column
+  was 14 wide and `retro_aga_laced` is 15. It is now as wide as the longest
+  name in the run; a last row with no line ending is no longer dropped.
+- **"Adding artwork 100%" appeared twice** at the end of each merge on a
+  terminal. The finished bar is drawn once.
+- Suite stamp `2026.10.03.1`. Still release 0.5.
+
+### Pi 400: the nightly run refused with "missing its marker file ... probably not mounted" while the drive was mounted (2026-10-03)
+- **The check trusted one small file more than the collections themselves.**
+  The output folder gets a marker file (`.retroplay_output`) the first time
+  it is used, and its ID is remembered in `.retroplay/output_root_id`; a
+  later run refused unless the two matched, and blamed an unmounted drive
+  whatever the real reason was. Two ordinary things break that match with
+  the drive sitting there mounted:
+  - the marker file is deleted (tidying or wiping the drive);
+  - a second copy of the scripts is pointed at the same folder (a new
+    download unpacked beside the old one and run by hand). On its first run
+    it **replaced** the marker with its own ID, which locked out the first
+    copy - usually the one cron runs.
+- **Now it goes by where the collections are.** If the marker does not match
+  but there are collections in the folder (one this copy has built, or any
+  `retro_*` folder under `build/`, which also covers a first build that was
+  interrupted), it is the right drive: the record is repaired (the marker put back, or the one
+  that is there taken up), one line says so, and the run carries on.
+- **A folder that already has a marker keeps it.** A copy of the scripts
+  using a folder for the first time takes up the existing marker instead of
+  replacing it, so two copies can no longer lock each other out.
+- **It still refuses when it should** - an empty mount point, or a different
+  drive mounted in its place - and now says what it actually found rather
+  than guessing: whether there is no marker or a different one, whether the
+  folder is empty, and `It is on /dev/…, mounted at …`, which shows at a
+  glance whether that path is the USB drive or the SD card. A marker that
+  exists but cannot be read is reported as a permissions problem (a
+  scheduled run can be a different user from the one who ran it by hand).
+- The closing error is now "the output folder did not pass its check
+  (details above)" instead of "(drive not mounted?)".
+
 ### Last checks before release
 - **Licence: MIT, stated once and consistently.** `LICENSE` said MIT while
   `start.sh`'s header said Creative Commons BY-NC 4.0 (and a different
@@ -54,7 +114,7 @@
   of two copies; the numbers are exactly the ones used before (checked across
   48 machine sizes), and `--verbose` says what was chosen and why.
 - A run building four or more collections says what that multiplies.
-- The suite stamp is `2026.10.01.2`, so these files cannot be mixed with the
+- The suite stamp was `2026.10.01.2` (now `2026.10.03.1`, see above), so these files cannot be mixed with the
   earlier 0.5 download without the run refusing.
 
 ### A314 GUI, last checks
@@ -384,7 +444,7 @@ folder tree first.
   and verified by hand and by test; CI is still the authority on the rest.
 
 ### Tests
-651 automated tests (was 386) and 231 option checks (was 205). Every fix above
+684 automated tests (was 386) and 231 option checks (was 205). Every fix above
 has a test that fails without it.
 
 ## 0.4 - 2026-09-29 (hardening pass: strict mode, temp files, child processes)

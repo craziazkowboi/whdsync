@@ -2320,14 +2320,20 @@ check "an ordinary sort does not trip the new error trap" \
 # A stage that really does fail must say which, how, and where to look.
 # sort.sh's own handler, lifted out and run against a command that fails.
 mkdir -p "$T/failsort"
-( cd "$ROOT" && bash -c "
-    set -euo pipefail
-    RP_LOG_ROOT='$T/failsort/logs'
-    $(sed -n '/^sort_stopped()/,/^}/p' "$ROOT/sort.sh")
-    set -E
-    trap 'sort_stopped \"\$?\" \"\$LINENO\" \"\$BASH_COMMAND\"' ERR
-    ls /definitely/not/here >/dev/null
-" ) > "$T/failsort/out.log" 2>&1
+# trap_harness <file> - the first lines of a script that uses sort.sh's own
+# handler and its own trap line, lifted out of sort.sh as they stand.
+trap_harness() {
+    {
+        echo 'set -euo pipefail'
+        echo "RP_LOG_ROOT='$T/failsort/logs'"
+        sed -n '/^sort_stopped()/,/^}/p' "$ROOT/sort.sh"
+        echo 'set -E'
+        grep '^trap .sort_stopped' "$ROOT/sort.sh"
+    } > "$1"
+}
+trap_harness "$T/failsort/real.sh"
+echo 'ls /definitely/not/here >/dev/null' >> "$T/failsort/real.sh"
+( cd "$ROOT" && bash "$T/failsort/real.sh" ) > "$T/failsort/out.log" 2>&1
 check "a silent errexit now names the command that failed" \
   'grep -q "this command failed with exit" "$T/failsort/out.log" && grep -q "/definitely/not/here" "$T/failsort/out.log"'
 check "...and records it in logs/sort.log for retroerror.log" \
@@ -2658,6 +2664,147 @@ done
 check "the window fits itself to a small screen" 'grep -q "WA_AutoAdjust, TRUE" "$REPO/a314_retroplay_gui.c"'
 check "Status and Check set-up never trigger the copy to the Amiga" \
   'grep -q "!IsChecked(GID_ACT_STATUS) && !IsChecked(GID_ACT_DOCTOR)" "$REPO/a314_retroplay_gui.c"'
+
+section "114. The \"sort.sh stopped\" message is only shown when sort.sh stopped"
+# macOS (bash 3.2) printed "ERROR: sort.sh stopped at line ..." once for every
+# filename the check flagged, while the sort carried on and finished. bash 3.2
+# runs the error trap inside a $(...) even when an `if` is testing it. The
+# same thing happens on every bash when the status is collected by hand with
+# errexit off, which is what this reproduces.
+trap_harness "$T/failsort/quiet.sh"
+cat >> "$T/failsort/quiet.sh" << 'EOF'
+f() { echo "a problem with this name"; return 1; }
+( set +e; r=$(f); st=$?; echo "worker saw $st" )
+( set +e; f >/dev/null; echo "worker carried on" )
+if r=$(f); then :; else echo "if saw $?"; fi
+r=$(f) || true
+echo "reached the end"
+EOF
+rm -rf "$T/failsort/logs"
+( cd "$ROOT" && bash "$T/failsort/quiet.sh" ) > "$T/failsort/quiet.log" 2>&1; st=$?
+check "a check that returns 'problem found' is not announced as a stop" \
+  '[ "$st" -eq 0 ] && grep -q "reached the end" "$T/failsort/quiet.log" && ! grep -q "stopped at line" "$T/failsort/quiet.log"'
+check "...the statuses still get through to the code that collects them" \
+  'grep -q "worker saw 1" "$T/failsort/quiet.log" && grep -q "if saw 1" "$T/failsort/quiet.log"'
+check "...and nothing is written to sort.log for retroerror.log to count" \
+  '[ ! -s "$T/failsort/logs/sort.log" ]'
+trap_harness "$T/failsort/bg.sh"
+cat >> "$T/failsort/bg.sh" << 'EOF'
+( ls /no/such/place/at/all >/dev/null 2>&1; echo "not reached" ) &
+wait $! || true
+echo "main carried on"
+EOF
+( cd "$ROOT" && bash "$T/failsort/bg.sh" ) > "$T/failsort/bg.log" 2>&1
+check "a background step that really dies says so, and says it was a background step" \
+  'grep -q "a background step of sort.sh stopped at line" "$T/failsort/bg.log" && ! grep -q "not reached" "$T/failsort/bg.log" && grep -q "main carried on" "$T/failsort/bg.log"'
+check "the filename-check workers switch the trap off as well" \
+  'sed -n "/compliance_progress_files+=/,/set +e/p" "$ROOT/sort.sh" | grep -q "trap - ERR"'
+# The real thing: names that fail the check (one that can be fixed, one that
+# cannot) go through sort.sh's parallel workers.
+BN="$T/badnames"; mkdir -p "$BN/Games/A/Alpha"
+: > "$BN/Games/A/Alpha.info"; : > "$BN/Games/A/Alpha/fine.txt"; : > "$BN/Games/A/Alpha/bad:name.txt"
+: > "$BN/Games/A/Alpha/$(printf 'x%.0s' 1 2 3 4 5 6 7 8 9 10 11 12)$(printf 'y%.0s' $(seq 1 110)).dat"
+( cd "$ROOT" && RP_CHILD=1 bash ./sort.sh --dest "$BN" --skip-variant-sort --called-from-all ) > "$T/badnames.log" 2>&1; st=$?
+check "sort.sh finishes normally when names fail the check" \
+  '[ "$st" -eq 0 ] && grep -q "Sort operation complete" "$T/badnames.log"'
+check "...reporting them as a warning, with the count" \
+  'grep -q "Found 1 filename(s) with Amiga compliance issues" "$T/badnames.log" && grep -q "Fixed 1 file(s)" "$T/badnames.log"'
+check "...and never as an error that it stopped" \
+  '! grep -q "stopped at line" "$T/badnames.log" && ! grep -q "stopped at line" "$ROOT/logs/sort.log" 2>/dev/null'
+check "the list of names is still written for the user" \
+  'grep -q "bad:name.txt" "$ROOT/logs/amiga_filename_issues.log"'
+rm -f "$ROOT/logs/amiga_filename_issues.log" "$ROOT/logs/sort.log"
+
+section "115. Small things from a real macOS run"
+check "update.sh names its log once, not folder + full path" \
+  'grep -q "^echo \"See \$logfile for details\"" "$ROOT/update.sh" && ! grep -q "logpath/\$logfile" "$ROOT/update.sh"'
+check "...and what it prints is a file that exists" \
+  'f="$(sed -n "s/^See \(.*\) for details$/\1/p" "$T"/*.log 2>/dev/null | tail -1)"; [ -n "$f" ] && [ "${f#/}" != "$f" ] && case "$f" in *//*) false ;; *) true ;; esac'
+# The summary table: every row must put its numbers in the same columns,
+# whatever the longest collection name is.
+rep="$(ls -1 "$ROOT"/reports/*.txt 2>/dev/null | grep -v _no_artwork | tail -1)"
+check "the run report has a collection table" '[ -n "$rep" ] && grep -q "^  Collection" "$rep"'
+check "the table's name column is sized to the longest name" \
+  'grep -q "namew=" "$ROOT/all.sh" && ! grep -q "%-14s %6s" "$ROOT/all.sh"'
+printf 'retro_aga|5548|9817|0:02:46|Screens|built\nretro_aga_laced|5548|9842|0:03:01|Screens|built\n' > "$T/rows.txt"
+sed -n '/^ *namew=/,/^                done$/p' "$ROOT/all.sh" > "$T/table.sh"
+( VARIANT_ROWS="$(cat "$T/rows.txt")"; . "$T/table.sh" ) > "$T/table.txt" 2>&1
+check "a 15-character name no longer pushes its row out of line" \
+  '[ "$(awk "{ print index(\$0, \"5548\") }" "$T/table.txt" | grep -v "^0$" | sort -u | wc -l | tr -d " ")" = "1" ] && [ "$(grep -c 5548 "$T/table.txt")" = "2" ]'
+check "the finished artwork bar is drawn once" \
+  'grep -q "processed != total_targets" "$ROOT/merge.sh"'
+
+section "116. The output-drive check goes by where the collections are, not only by a marker file"
+# A Pi 400's nightly run refused with "missing its marker file ... probably
+# not mounted" while the drive was mounted and full of collections.
+USB2="$T/usb2"; setup mkdir -p "$USB2"
+cp "$ROOT/retroplay.conf" "$T/conf.bak116"; echo "OUTPUT_ROOT=\"$USB2\"" >> "$ROOT/retroplay.conf"
+run od1 ./all.sh --skip-update --variants aga; st=$?
+check "set-up: a collection is built on the drive and the drive is marked" \
+  '[ "$st" -eq 0 ] && [ -s "$USB2/.retroplay_output" ] && [ -d "$USB2/build/retro_aga/WHDLoad" ]'
+mk1="$(cat "$USB2/.retroplay_output")"
+# 1. The marker file is deleted (tidying up the drive); the collections are there.
+rm -f "$USB2/.retroplay_output"
+run od2 ./all.sh --skip-update --variants aga; st=$?
+check "marker deleted, collections present: the run goes ahead" '[ "$st" -eq 0 ] || [ "$st" -eq 2 ]'
+check "...the marker is put back as it was, and the run says so" \
+  '[ "$(cat "$USB2/.retroplay_output" 2>/dev/null)" = "$mk1" ] && grep -q "marker file was missing" "$T/od2.log"'
+# 2. Another copy of the scripts replaced the marker with its own (what
+#    earlier versions did on their first run against a folder already in use).
+echo "1700000000-999-1" > "$USB2/.retroplay_output"
+run od3 ./all.sh --skip-update --variants aga; st=$?
+check "marker replaced by another copy: the run goes ahead" '[ "$st" -eq 0 ] || [ "$st" -eq 2 ]'
+check "...this copy takes up the marker that is there instead of fighting over it" \
+  '[ "$(cat "$USB2/.retroplay_output")" = "1700000000-999-1" ] && grep -q "|1700000000-999-1$" "$ROOT/.retroplay/output_root_id" && grep -q "another copy of the scripts" "$T/od3.log"'
+run od3b ./all.sh --skip-update --variants aga; st=$?
+check "...and the next run is quiet about it" \
+  '{ [ "$st" -eq 0 ] || [ "$st" -eq 2 ]; } && ! grep -q "output folder.s marker" "$T/od3b.log"'
+# 3. A copy of the scripts using this folder for the first time must not
+#    replace the marker - that is what locked the other copy out.
+rm -f "$ROOT/.retroplay/output_root_id"
+run od4 ./all.sh --skip-update --variants aga; st=$?
+check "first use of a folder that already has a marker: the marker is kept" \
+  '{ [ "$st" -eq 0 ] || [ "$st" -eq 2 ]; } && [ "$(cat "$USB2/.retroplay_output")" = "1700000000-999-1" ] && grep -q "|1700000000-999-1$" "$ROOT/.retroplay/output_root_id"'
+# 4. Still refused when it really is not the drive: an empty mount point...
+mv "$USB2" "$T/usb2_unplugged"; mkdir -p "$USB2"
+run od5 ./all.sh --skip-update --variants aga; st=$?
+check "empty mount point: still refused, nothing written to it" \
+  '[ "$st" -eq 4 ] && [ -z "$(ls -A "$USB2")" ] && grep -q "not mounted" "$T/od5.log"'
+check "...and the message says which filesystem that folder is really on" \
+  'grep -q "^It is on .*, mounted at /" "$T/od5.log"'
+check "...and no longer claims a marker is 'missing' when the folder is just empty" \
+  'grep -q "has no marker file" "$T/od5.log" && grep -q "The folder is empty" "$T/od5.log"'
+run od5d ./all.sh --skip-update --variants aga --dry-run; st=$?
+check "a dry run refuses the empty mount point too, and writes nothing" '[ "$st" -eq 4 ] && [ -z "$(ls -A "$USB2")" ]'
+# ...and a different drive mounted in its place (its own marker, none of our collections).
+echo "1600000000-1-1" > "$USB2/.retroplay_output"; mkdir -p "$USB2/holiday_photos"
+run od6 ./all.sh --skip-update --variants aga; st=$?
+check "a different drive at the same mount point: refused, and described as that" \
+  '[ "$st" -eq 4 ] && grep -q "from a different drive or a different copy" "$T/od6.log" && [ ! -e "$USB2/build" ] && [ "$(cat "$USB2/.retroplay_output")" = "1600000000-1-1" ]'
+check "...with the way out spelled out" 'grep -q "delete .*output_root_id and run again" "$T/od6.log"'
+rm -rf "$USB2"; mv "$T/usb2_unplugged" "$USB2"
+# A first build that never finished has no build marker yet, but its folder
+# is on the drive - that is still the drive.
+mkdir -p "$T/complete.keep"; mv "$ROOT"/.retroplay/complete/* "$T/complete.keep/" 2>/dev/null
+rm -f "$USB2/.retroplay_output"
+run od6b ./all.sh --skip-update --variants aga --dry-run; st=$?
+check "no finished build recorded, but retro_* is on the drive: accepted" \
+  '[ "$st" -ne 4 ] && ! grep -q "has no marker file" "$T/od6b.log"'
+check "...and a dry run still writes nothing" '[ ! -e "$USB2/.retroplay_output" ]'
+mv "$T/complete.keep"/* "$ROOT/.retroplay/complete/" 2>/dev/null
+echo "1700000000-999-1" > "$USB2/.retroplay_output"
+# 5. A marker that is there but cannot be read (root reads any file, so a
+#    folder stands in for "unreadable").
+mv "$USB2/.retroplay_output" "$T/marker.keep"; mkdir "$USB2/.retroplay_output"
+run od7 ./all.sh --skip-update --variants aga; st=$?
+check "an unreadable marker is reported as a permissions problem, not as an unplugged drive" \
+  '[ "$st" -eq 4 ] && grep -q "can.t be read by" "$T/od7.log" && ! grep -q "what a mount point looks like\|the drive is not mounted there" "$T/od7.log"'
+rmdir "$USB2/.retroplay_output"; mv "$T/marker.keep" "$USB2/.retroplay_output"
+run od8 ./all.sh --skip-update --variants aga; st=$?
+check "drive back as it was: runs normally" '[ "$st" -eq 0 ] || [ "$st" -eq 2 ]'
+run od9 ./start.sh --status
+check "--status shows the output folder as available" 'grep -q "Output folder: $USB2" "$T/od9.log"'
+cp "$T/conf.bak116" "$ROOT/retroplay.conf"
 
 # ================================================================ summary ===
 echo

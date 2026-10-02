@@ -874,7 +874,7 @@ rp_layout_problems() {
 # can do real damage - e.g. an older extract.sh recreating
 # Users/<you>/Downloads/Amiga/... inside retro_* - so the set is checked as
 # a whole. Prints each script whose stamp doesn't match this lib.sh.
-RP_SUITE_VERSION="2026.10.01.2"
+RP_SUITE_VERSION="2026.10.03.1"
 RP_RELEASE="0.5"                  # the release these scripts belong to
 RP_SUITE_FILES="all.sh start.sh extract.sh merge.sh sort.sh update.sh quick.sh aga.sh ecs.sh rtg.sh doctor.sh install_cron.sh uninstall_deps.sh setup.sh artwork_sync.sh artwork_fetch.sh"
 
@@ -1260,27 +1260,107 @@ RP_OUTPUT_MARKER=".retroplay_output"
 # missing or an empty mount point on the SD card - and a run would quietly
 # rebuild everything there, filling the card. So the output folder gets a
 # marker file with an ID the first time it's used, recorded in the state
-# folder (which lives with the scripts, not on that drive). Later runs
-# refuse unless the same marker is there.
-# rp_check_output_root [dry]  - "dry": check only, never create the marker.
+# folder (which lives with the scripts, not on that drive).
+#
+# The marker is only a means to that end. What the check has to establish is
+# "is this the place the collections are?", and a missing or different marker
+# does not by itself mean it is not: the file can be deleted while tidying
+# the drive, and a second copy of the scripts pointed at the same folder used
+# to overwrite it with its own ID - after which the first copy (typically the
+# one cron runs) refused every night with "probably not mounted" while the
+# drive sat there mounted. So:
+#   - the marker matches                     -> fine
+#   - no match, but there are collections in the folder
+#                                            -> it IS the drive: repair the
+#                                               record and carry on
+#   - no match and no collections            -> refuse, and say exactly what
+#                                               was found, not a guess
+#   - first use by this copy of the scripts  -> adopt a marker that is
+#                                               already there, never replace it
+# rp_check_output_root [dry]  - "dry": check only, never write anything.
+
+# Are there collections in the output folder? Either one this copy of the
+# scripts has finished (its build marker names a folder that exists), or any
+# retro_* folder under build/ - which also covers a first build that was
+# interrupted before it could be recorded. An unmounted mount point is an
+# empty folder and some other drive has no build/retro_*, so neither passes.
+rp_output_has_collections() {
+    local m dest
+    for m in "$RP_STATE_DIR"/complete/*; do
+        [ -f "$m" ] || continue
+        dest="$(cat "$m" 2>/dev/null)" || dest=""
+        case "$dest" in
+            "$RP_OUTPUT_ROOT"/*) [ -d "$dest" ] && return 0 ;;
+        esac
+    done
+    case "$RP_BUILD_ROOT" in
+        "$RP_OUTPUT_ROOT"/*)
+            for m in "$RP_BUILD_ROOT"/retro_* "$RP_BUILD_ROOT"/.new_retro_* "$RP_BUILD_ROOT"/.previous_retro_*; do
+                [ -d "$m" ] && return 0
+            done ;;
+    esac
+    return 1
+}
+
+# "on /dev/sda1, mounted at /srv/amigaretro" - which filesystem a folder is
+# really on. The quickest way to see that a "USB drive" path is in fact the
+# SD card, because nothing is mounted there.
+rp_where_is() {   # rp_where_is <folder>
+    df -P "$1" 2>/dev/null | awk 'NR == 2 { mp = $6; for (i = 7; i <= NF; i++) mp = mp " " $i
+                                          printf "on %s, mounted at %s", $1, mp }'
+}
+
 rp_check_output_root() {
-    local root="$RP_OUTPUT_ROOT" idf="$RP_STATE_DIR/output_root_id" want id
+    local root="$RP_OUTPUT_ROOT" idf="$RP_STATE_DIR/output_root_id" want id="" mark where
+    mark="$root/$RP_OUTPUT_MARKER"
     if [ ! -d "$root" ]; then
         echo "The output folder $root doesn't exist. If it's on a USB drive, check the drive is connected and mounted." >&2
         return 1
     fi
-    want="$(cat "$idf" 2>/dev/null)" || want=""
-    if [ -n "$want" ] && [ "${want%%|*}" = "$root" ]; then
-        id="$(cat "$root/$RP_OUTPUT_MARKER" 2>/dev/null)" || id=""
-        [ "$id" = "${want#*|}" ] && return 0
-        echo "The output folder $root is missing its marker file ($RP_OUTPUT_MARKER), so it isn't the drive this collection was built on." >&2
-        echo "If it's a USB drive, it's probably not mounted - nothing was changed. (To really start over on a new drive, delete $idf.)" >&2
+    if [ -e "$mark" ] && ! id="$(cat "$mark" 2>/dev/null)"; then
+        echo "The output folder's marker file $mark is there but can't be read by $(id -un 2>/dev/null || echo this user) - check its permissions (a scheduled run may be a different user from the one who ran it by hand)." >&2
         return 1
     fi
+    want="$(cat "$idf" 2>/dev/null)" || want=""
+    if [ -n "$want" ] && [ "${want%%|*}" = "$root" ]; then
+        [ -n "$id" ] && [ "$id" = "${want#*|}" ] && return 0
+        if rp_output_has_collections; then
+            # The collections are here, so this is the drive. Put the record right.
+            [ "${1:-}" = "dry" ] && return 0
+            if [ -n "$id" ]; then
+                rp_state_init
+                printf '%s|%s\n' "$root" "$id" | rp_atomic_write "$idf"
+                rp_info "      (the output folder's marker was replaced by another copy of the scripts; the collections are there, so this copy now uses that marker)"
+            elif printf '%s\n' "${want#*|}" | rp_atomic_write "$mark" 2>/dev/null; then
+                rp_info "      (the output folder's marker file was missing; the collections are there, so it has been put back)"
+            else
+                echo "Can't write to the output folder $root." >&2
+                return 1
+            fi
+            return 0
+        fi
+        where="$(rp_where_is "$root")"
+        if [ -z "$id" ]; then
+            echo "The output folder $root has no marker file ($RP_OUTPUT_MARKER) and no collections in it (no retro_* folder under ${RP_BUILD_ROOT#"$root"/}/)." >&2
+        else
+            echo "The output folder $root has a marker file ($RP_OUTPUT_MARKER) from a different drive or a different copy of the scripts, and no collections in it (no retro_* folder under ${RP_BUILD_ROOT#"$root"/}/)." >&2
+        fi
+        [ -n "$where" ] && echo "It is $where." >&2
+        if [ -z "$(ls -A "$root" 2>/dev/null)" ]; then
+            echo "The folder is empty, which is what a mount point looks like when its drive is not mounted - nothing was changed." >&2
+        else
+            echo "Nothing was changed. If the line above does not name your drive, the drive is not mounted there." >&2
+        fi
+        echo "(If this is the right place and you want to build in it from scratch, delete $idf and run again.)" >&2
+        return 1
+    fi
+    # First use by this copy of the scripts (or OUTPUT_ROOT was changed).
     [ "${1:-}" = "dry" ] && return 0
-    id="$(date '+%s')-$$-${RANDOM:-0}"
-    printf '%s\n' "$id" | rp_atomic_write "$root/$RP_OUTPUT_MARKER" 2>/dev/null || {
-        echo "Can't write to the output folder $root." >&2; return 1; }
+    if [ -z "$id" ]; then
+        id="$(date '+%s')-$$-${RANDOM:-0}"
+        printf '%s\n' "$id" | rp_atomic_write "$mark" 2>/dev/null || {
+            echo "Can't write to the output folder $root." >&2; return 1; }
+    fi
     rp_state_init
     printf '%s|%s\n' "$root" "$id" | rp_atomic_write "$idf"
 }

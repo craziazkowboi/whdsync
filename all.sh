@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.10.01.2   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.10.03.1   (every script in the set must carry the same stamp)
 # Remember where the user ran this from, before any cd: retroplay.conf is
 # looked for there first (see lib.sh).
 RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
@@ -408,7 +408,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
 fi
 
 finish() {
-    local st=$? errs=0 result body sname ssecs free_left
+    local st=$? errs=0 result body sname ssecs free_left namew
     # Only a build that actually began has a build time. finish() runs for
     # every exit, so without this a "nothing to do" run, or one stopped in
     # Preflight, reported its plan or preflight time as "build".
@@ -436,11 +436,14 @@ finish() {
             echo "Result:   $result"
             if [ -n "$VARIANT_ROWS" ]; then
                 echo
-                printf '  %-14s %6s %9s %9s  %-8s %s\n' "Collection" "Games" "Size(MB)" "Time" "Artwork" "Result"
-                printf '  %-14s %6s %9s %9s  %-8s %s\n' "--------------" "------" "--------" "--------" "--------" "-------"
-                printf '%s' "$VARIANT_ROWS" | while IFS='|' read -r k g m t a n; do
+                # The name column is as wide as the longest name in this run
+                # (retro_aga_laced is 15), so the columns stay lined up.
+                namew="$(printf '%s' "$VARIANT_ROWS" | awk -F'|' 'BEGIN { w = 10 } length($1) > w { w = length($1) } END { print w }')"
+                printf "  %-${namew}s %6s %9s %9s  %-8s %s\n" "Collection" "Games" "Size(MB)" "Time" "Artwork" "Result"
+                printf "  %-${namew}s %6s %9s %9s  %-8s %s\n" "$(printf "%${namew}s" '' | tr ' ' '-')" "------" "--------" "--------" "--------" "-------"
+                printf '%s' "$VARIANT_ROWS" | while IFS='|' read -r k g m t a n || [ -n "$k" ]; do
                     [ -n "$k" ] || continue
-                    printf '  %-14s %6s %9s %9s  %-8s %s\n' "$k" "$g" "$m" "$t" "$a" "$n"
+                    printf "  %-${namew}s %6s %9s %9s  %-8s %s\n" "$k" "$g" "$m" "$t" "$a" "$n"
                 done
                 echo
             fi
@@ -525,7 +528,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
     command -v unlzx >/dev/null 2>&1 || rp_warn "unlzx is not installed - .lzx archives will be skipped (./setup.sh installs it)"
     rp_require_bash4 || fail_with "$RP_EXIT_CONFIG" "cannot add artwork without bash 4 - nothing was downloaded or changed"
     rp_info '      checking the output folder is there...'
-    rp_check_output_root || fail_with "$RP_EXIT_CONFIG" "the output folder isn't available (drive not mounted?) - nothing was changed"
+    rp_check_output_root || fail_with "$RP_EXIT_CONFIG" "the output folder did not pass its check (details above) - nothing was changed"
     rp_info '      tidying the folder layout if needed...'
     rp_migrate_layout      # only once the output drive is known to be there
     rp_info '      tidying leftovers in .retroplay...'
@@ -537,7 +540,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
     rp_done "ready"
 else
     rp_step 1 "$TOTAL_STEPS" "Preflight - settings and tools (plan only)"
-    rp_check_output_root dry || rp_die "$RP_EXIT_CONFIG" "the output folder isn't available (drive not mounted?)"
+    rp_check_output_root dry || rp_die "$RP_EXIT_CONFIG" "the output folder did not pass its check (details above)"
 fi
 
 # ============================================================================

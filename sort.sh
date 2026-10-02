@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.10.01.2   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.10.03.1   (every script in the set must carry the same stamp)
 # Remember where the user ran this from, before any cd: retroplay.conf is
 # looked for there first (see lib.sh).
 RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
@@ -99,9 +99,29 @@ cleanup_sort() {
 # logs/sort.log (which the pipeline copies into retroerror.log), so a failed
 # sort is never again reported as nothing more than "sorting failed".
 # set -E carries the trap into functions, where most of the work happens.
-sort_stopped() {   # sort_stopped <exit status> <line> <command>
-    local msg
-    msg="sort.sh stopped at line $2: this command failed with exit $1:  $3"
+#
+# It also carries it into every subshell and every $(...), and that is where
+# this went wrong on macOS. bash 3.2 does not tell a $(...) that it is being
+# tested by an `if`, so there the trap fired for every command substitution
+# that returned non-zero ON PURPOSE - the filename check returns 1 for "this
+# name has a problem" - and each one was announced as "sort.sh stopped",
+# while sort.sh carried on perfectly well. Newer bash (Linux) does pass that
+# on, which is why it was never seen there.
+#
+# The rule that is true on every bash: a failed command only stops a shell
+# that has errexit switched on at that moment. So the handler is given the
+# shell's option flags ($-) and says nothing unless "e" is among them. bash
+# switches errexit off inside $(...), and the filename-check workers switch it
+# off themselves, so neither can raise a false alarm; a command that really
+# does end the script (or one of its background steps) is still reported.
+sort_stopped() {   # sort_stopped <exit status> <line> <command> <shell flags> <subshell depth>
+    case "${4-e}" in
+        *e*) ;;
+        *) return 0 ;;
+    esac
+    local msg who="sort.sh"
+    [ "${5:-0}" -gt 0 ] 2>/dev/null && who="a background step of sort.sh"
+    msg="$who stopped at line $2: this command failed with exit $1:  $3"
     printf '\nERROR: %s\n' "$msg" >&2
     if [ -n "${RP_LOG_ROOT:-}" ]; then
         mkdir -p "$RP_LOG_ROOT" 2>/dev/null
@@ -110,7 +130,7 @@ sort_stopped() {   # sort_stopped <exit status> <line> <command>
     return 0
 }
 set -E
-trap 'sort_stopped "$?" "$LINENO" "$BASH_COMMAND"' ERR
+trap 'sort_stopped "$?" "$LINENO" "$BASH_COMMAND" "$-" "${BASH_SUBSHELL:-0}"' ERR
 # Run by hand? Then this is the run, and it takes the same lock all.sh
 # uses, so it cannot work on a collection a nightly build is midway through.
 rp_lock_for_stage "sort.sh ${RP_ORIG_ARGS:-}"
@@ -950,6 +970,8 @@ if [ "$RUN_COMPLIANCE_CHECK" = true ]; then
             compliance_progress_files+=("$progress_file")
 
             (
+                trap - ERR   # this worker reports through its result
+                             # files; the "stopped" trap has no business here
                 set +e   # see the note above the main check inside this
                          # loop: this worker has its own explicit status
                          # handling throughout, so errexit (inherited from

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.10.01.2   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.10.03.1   (every script in the set must carry the same stamp)
 # Remember where the user ran this from, before any cd: retroplay.conf is
 # looked for there first (see lib.sh).
 RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
@@ -501,6 +501,6 @@ if [ "$pruned_count" -gt 0 ]; then
     echo "Superseded archives moved to old/: $pruned_count (see $logfile; kept for $RP_OLD_ARCHIVE_DAYS days)"
 fi
 printf "Elapsed time: %02d:%02d:%02d\n" "$hh" "$mm" "$ss"
-logpath="$(cd "$(dirname "$logfile")" && pwd)"
-echo "See $logpath/$logfile for details"
+# $logfile is already a full path; it used to be glued onto its own folder.
+echo "See $logfile for details"
 exit 0
