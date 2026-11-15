@@ -42,7 +42,7 @@ ROOT="$T/retroplay"; SERVER="$T/server"; MOCK="$T/mockbin"
 mkdir -p "$ROOT" "$SERVER" "$MOCK"
 export TMPDIR="$T/tmp"; mkdir -p "$TMPDIR"
 export RP_RETRY_WAIT=0          # no pauses between download retries in tests
-cp "$REPO"/*.sh "$REPO"/to_ilbm.py "$ROOT"/
+cp "$REPO"/*.sh "$REPO"/*.py "$ROOT"/
 chmod +x "$ROOT"/*.sh
 
 # ---------------------------------------------------------------- mocks ---
@@ -200,6 +200,7 @@ cat > "$ROOT/retroplay.conf" << 'EOF'
 NTFY_TOPIC=retroplay-test
 KEEP_NEW_BATCHES=3
 MIN_FREE_MB=1
+ARTWORK_SYNC="ask"
 EOF
 
 run() {   # run <logname> <command...>  (from ROOT; output to log; returns exit status)
@@ -251,7 +252,7 @@ g="$(game retro_aga Gamma_De)"
 check "German release sorted into Languages/ BEFORE merge, and still got artwork" \
   'case "$g" in */Languages/German/*) [ "$(art_in "${g#$ROOT/build/}")" = AGA-Gamma_De ];; *) false;; esac'
 check "all three builds marked complete" '[ -f "$ROOT/.retroplay/complete/retro_aga" ] && [ -f "$ROOT/.retroplay/complete/retro_ecs" ] && [ -f "$ROOT/.retroplay/complete/retro_rtg" ]'
-check "a run report was written" '[ -n "$(ls "$ROOT"/reports/*.txt 2>/dev/null)" ]'
+check "a run report was written, in logs/" '[ -n "$(ls "$ROOT"/logs/[0-9]*.txt 2>/dev/null)" ] && [ ! -e "$ROOT/reports" ]'
 
 section "2. Update: new version of a game + an HD_Loaders-only download"
 : > "$MOCK/extract_calls"
@@ -319,7 +320,7 @@ check "start.sh menu option 7 = rebuild without update" '[ "$st" -eq 0 ] && [ ! 
 
 section "8. --dry-run changes nothing"
 server_add WHDLoad/Games/D/Delta_v1.0.lha
-snap() { ( cd "$ROOT" && find . -path ./reports -prune -o -print | sort; cat .retroplay/queue/* 2>/dev/null ) | cksum; }
+snap() { ( cd "$ROOT" && find . -path ./logs -prune -o -print | sort; cat .retroplay/queue/* 2>/dev/null ) | cksum; }
 before="$(snap)"
 run dryrun ./all.sh --dry-run --skip-update; st=$?
 check "dry run exits 0 and shows the plan" '[ "$st" -eq 0 ] && grep -q "Plan" "$T/dryrun.log"'
@@ -617,7 +618,7 @@ check "the menu shows a status summary on top, and option 9 the full status" \
 section "28. setup.sh installs everything on a bare system, and is safe to repeat"
 S="$T/setupbox"; SM="$T/setupmock"; IB="$T/installed"; SB="$T/setupsys"
 setup mkdir -p "$S" "$SM" "$IB" "$SB" "$T/h"
-cp "$REPO"/*.sh "$REPO"/to_ilbm.py "$REPO"/retroplay.conf.example "$S"/ 2>/dev/null; chmod +x "$S"/*.sh
+cp "$REPO"/*.sh "$REPO"/*.py "$REPO"/retroplay.conf.example "$S"/ 2>/dev/null; chmod +x "$S"/*.sh
 for d in /usr/bin /bin; do for f in "$d"/*; do n="${f##*/}"
     case "$n" in lha|7z|7za|unar|lsar|unlzx|wget|curl|unzip|flock|detox|locale|locale-gen|crontab|apt-get|dpkg-query|sudo) continue ;; esac
     [ -e "$SB/$n" ] || ln -s "$f" "$SB/$n"; done; done
@@ -656,6 +657,7 @@ printf '# C.UTF-8 UTF-8\n# en_US ISO-8859-1\n# en_US.UTF-8 UTF-8\n' > "$SM/local
 setup_run() {
     ( cd "$S" && env -i HOME="$T/h" TMPDIR="$TMPDIR" PATH="$IB:$SM:$SB" RP_SETUP_OS=linux \
         RP_LOCALE_GEN_FILE="$SM/locale.gen" RP_INSTALL_BIN="$IB" RP_UNLZX_URL="http://mock/unlzx.c" \
+        RP_SETUP_FREE_MB=500000 \
         bash ./setup.sh --yes --no-cron ) < /dev/null > "$T/$1.log" 2>&1
 }
 setup_run setup1
@@ -766,37 +768,39 @@ check "artwork failure (fail): stops before touching the collection (exit 5)" \
 acfg ARTWORK_SYNC '"no"'
 
 
-section "32. Tidy folder layout, log retention and the scripts/ folder"
-check "everything lives in artwork/, build/, downloads/, logs/ and reports/" \
-  '[ -d "$ROOT/artwork" ] && [ -d "$ROOT/build/retro_aga" ] && [ -d "$ROOT/downloads/WHDLoad" ] && [ -f "$ROOT/logs/update.log" ] && [ -n "$(ls "$ROOT/reports" 2>/dev/null)" ]'
+section "32. Tidy folder layout, latest-only logs and the scripts/ folder"
+check "everything lives in artwork/, build/, downloads/ and logs/ (reports included)" \
+  '[ -d "$ROOT/artwork" ] && [ -d "$ROOT/build/retro_aga" ] && [ -d "$ROOT/downloads/WHDLoad" ] && [ -f "$ROOT/logs/update.log" ] && [ -n "$(ls "$ROOT"/logs/[0-9]*.txt 2>/dev/null)" ] && [ ! -e "$ROOT/reports" ]'
 check "nothing is left loose beside the scripts" \
   '[ ! -e "$ROOT/WHDLoad" ] && [ ! -e "$ROOT/retro_aga" ] && [ ! -e "$ROOT/update.log" ] && [ ! -e "$ROOT/iGame_AGA" ]'
 check "artwork archives are cached under downloads/artwork_archive" \
   '[ -d "$ROOT/downloads/artwork_archive" ] && [ -z "$(find "$ROOT/artwork" -name "*.lha" | head -1)" ]'
 # migration from the old flat layout
 OLD="$T/oldlayout"; setup mkdir -p "$OLD"
-cp "$REPO"/*.sh "$REPO"/to_ilbm.py "$REPO"/retroplay.conf.example "$OLD"/; chmod +x "$OLD"/*.sh
+cp "$REPO"/*.sh "$REPO"/*.py "$REPO"/retroplay.conf.example "$OLD"/; chmod +x "$OLD"/*.sh
 setup mkdir -p "$OLD/iGame_AGA/Covers" "$OLD/TinyLauncher" "$OLD/WHDLoad/Games/A" "$OLD/retro_aga/WHDLoad" "$OLD/new_aga" "$OLD/artwork_archive"
 echo old > "$OLD/iGame_AGA/Covers/marker"; echo old > "$OLD/retro_aga/WHDLoad/marker"; : > "$OLD/update.log"
 ( cd "$OLD" && ./all.sh --skip-update --variants aga ) < /dev/null > "$T/migrate.log" 2>&1
 check "an old flat folder is tidied up automatically, keeping the contents" \
   '[ -f "$OLD/artwork/iGame_AGA/Covers/marker" ] && [ -f "$OLD/build/retro_aga/WHDLoad/marker" ] && [ -d "$OLD/downloads/WHDLoad/Games/A" ] && [ -d "$OLD/downloads/artwork_archive" ] && [ -f "$OLD/logs/update.log" ]'
 check "and it says so once" 'grep -q "Tidied the folder layout" "$T/migrate.log"'
-# log retention
-acfg LOG_RETENTION_DAYS 2
+# logs: cleared at the start of every run, whatever their age
 : > "$ROOT/logs/ancient.log"; touch -t 202001010000 "$ROOT/logs/ancient.log"
-: > "$ROOT/logs/today.log"
+: > "$ROOT/logs/today.log"; : > "$ROOT/logs/all_cron.log.1"; echo keep > "$ROOT/logs/last_run.log"
 run logprune ./all.sh --skip-update --variants aga
-check "logs older than LOG_RETENTION_DAYS are deleted, recent ones kept" \
-  '[ ! -e "$ROOT/logs/ancient.log" ] && [ -f "$ROOT/logs/today.log" ]'
+check "logs left by earlier runs are cleared, old or new" \
+  '[ ! -e "$ROOT/logs/ancient.log" ] && [ ! -e "$ROOT/logs/today.log" ] && [ ! -e "$ROOT/logs/all_cron.log.1" ]'
+check "...but the download log, the nightly log and the last hand-run log stay" \
+  '[ -f "$ROOT/logs/update.log" ] && [ -f "$ROOT/logs/all_cron.log" ] && [ "$(cat "$ROOT/logs/last_run.log")" = keep ]'
 acfg LOG_RETENTION_DAYS 0
-: > "$ROOT/logs/ancient2.log"; touch -t 202001010000 "$ROOT/logs/ancient2.log"
-run lognoprune ./all.sh --skip-update --variants aga
-check "LOG_RETENTION_DAYS=0 keeps logs for ever" '[ -f "$ROOT/logs/ancient2.log" ]'
-rm -f "$ROOT/logs/ancient2.log"; acfg LOG_RETENTION_DAYS 1
+run lognowarn ./all.sh --skip-update --variants aga
+check "LOG_RETENTION_DAYS from an older config is still accepted, without a warning" \
+  '! grep -qi "unknown setting" "$T/lognowarn.log"'
+grep -v '^LOG_RETENTION_DAYS=' "$ROOT/retroplay.conf" > "$ROOT/.c.tmp"; mv "$ROOT/.c.tmp" "$ROOT/retroplay.conf"
+rm -f "$ROOT/logs/last_run.log"
 # scripts/ subfolder
 SUB="$T/subfolder"; setup mkdir -p "$SUB/scripts"
-cp "$REPO"/*.sh "$REPO"/to_ilbm.py "$REPO"/retroplay.conf.example "$SUB/scripts"/; chmod +x "$SUB/scripts"/*.sh
+cp "$REPO"/*.sh "$REPO"/*.py "$REPO"/retroplay.conf.example "$SUB/scripts"/; chmod +x "$SUB/scripts"/*.sh
 setup mkdir -p "$SUB/downloads/WHDLoad/Games/A"
 ( cd "$SUB" && ./scripts/all.sh --skip-update --variants aga ) < /dev/null > "$T/subfolder.log" 2>&1
 check "the scripts also work from a scripts/ subfolder, using the folder above" \
@@ -1058,7 +1062,7 @@ run pfsmsg ./all.sh --skip-update --variants aga
 check "a PFS build ends with the setfnsize warning" \
   'grep -q "setfnsize <drive:> 107" "$T/pfsmsg.log" && grep -q "CAN CORRUPT THAT PARTITION" "$T/pfsmsg.log"'
 check "...and nothing else follows it (it is the last thing on screen)" \
-  '! tail -n +"$(grep -n "setfnsize <drive:> 107" "$T/pfsmsg.log" | cut -d: -f1)" "$T/pfsmsg.log" | grep -qE "Summary|saved as reports"'
+  '! tail -n +"$(grep -n "setfnsize <drive:> 107" "$T/pfsmsg.log" | cut -d: -f1)" "$T/pfsmsg.log" | grep -qE "Summary|saved as logs"'
 # and with a run that does print a summary
 echo stale > "$ROOT/build/retro_aga/WHDLoad/Games/A/Alpha/iGame.data"
 run pfsorder ./all.sh --skip-update --variants aga --refresh-artwork
@@ -1111,7 +1115,7 @@ if ! python3 -c 'import PIL' 2>/dev/null; then
     echo "  (skipped: python3-pil is not installed here)"
 else
     FA="$T/fetch"; setup mkdir -p "$FA/build/retro_aga/WHDLoad/Games/N/NoArtGame" "$FA/artwork/iGame_AGA/lores/Covers/Games/R/Ref"
-    cp "$ROOT"/*.sh "$REPO/to_ilbm.py" "$FA/"
+    cp "$ROOT"/*.sh "$REPO"/*.py "$FA/"
     touch "$FA/build/retro_aga/WHDLoad/Games/N/NoArtGame.info"
     # a reference iff, so what we add matches the artwork already in use
     python3 -c "from PIL import Image; Image.new('RGB',(320,128),(1,2,3)).save('$T/ref.png')"
@@ -1162,7 +1166,7 @@ fi
 
 section "44. Running the leaf scripts by hand finds the right collection"
 DC="$T/defaultdest"; setup mkdir -p "$DC"
-cp "$ROOT"/*.sh "$REPO/to_ilbm.py" "$DC/"
+cp "$ROOT"/*.sh "$REPO"/*.py "$DC/"
 setup mkdir -p "$DC/build/retro_aga/WHDLoad/Games/A/Alpha" "$DC/artwork/iGame_AGA/lores/Covers/Games/A/Alpha"
 touch "$DC/build/retro_aga/WHDLoad/Games/A/Alpha.info"; echo s > "$DC/build/retro_aga/WHDLoad/Games/A/Alpha/g.slave"
 echo art > "$DC/artwork/iGame_AGA/lores/Covers/Games/A/Alpha/iGame.iff"
@@ -1187,7 +1191,7 @@ check "nothing is created beside the scripts any more" '[ ! -e "$DC/retro" ] && 
 
 section "45. retroplay.conf is found where you run from, then above"
 CFG="$T/cfgsearch"; setup mkdir -p "$CFG/scripts"
-cp "$ROOT"/*.sh "$REPO/to_ilbm.py" "$CFG/scripts/"
+cp "$ROOT"/*.sh "$REPO"/*.py "$CFG/scripts/"
 conf_used() { ( cd "$CFG/scripts" && bash -c 'SCRIPT_DIR="'"$CFG/scripts"'"; RP_INVOKED_FROM="'"$CFG/scripts"'"; . ./lib.sh; rp_load_config; rp_conf_in_use; echo; echo "aga=$(rp_art_order_for aga) rtg=$(rp_art_order_for rtg)"' ); }
 printf 'ART_ORDER="Titles,Screens,Covers"\n' > "$CFG/scripts/retroplay.conf"
 check "a conf beside the scripts is used" 'conf_used | grep -q "scripts/retroplay.conf" && conf_used | grep -q "aga=Titles,Screens,Covers"'
@@ -1240,7 +1244,7 @@ check "the summary lists each collection with games, size, time and artwork" \
 check "...and the overall time is still shown" 'grep -q "Total time:" "$T/tbl.log"'
 # an interrupted setup starts clean next time
 SU="$T/setupagain"; setup mkdir -p "$SU"
-cp "$ROOT"/*.sh "$REPO/to_ilbm.py" "$REPO/retroplay.conf.example" "$SU/"
+cp "$ROOT"/*.sh "$REPO"/*.py "$REPO/retroplay.conf.example" "$SU/"
 printf 'wrote_conf\n' > "$SU/.retroplay_setup_state"        # as if interrupted
 printf 'VARIANTS="half written"\n' > "$SU/retroplay.conf"
 ( cd "$SU" && env PATH="$MOCK:$PATH" RP_SETUP_OS=linux ./setup.sh --yes --no-cron ) > "$T/setupagain.log" 2>&1
@@ -1272,7 +1276,7 @@ check "UPDATE_CHECK=no turns it off" \
   '[ -z "$(PATH="$UC/bin:$PATH" bash -c "SCRIPT_DIR=$ROOT; . $ROOT/lib.sh; rp_load_config >/dev/null 2>&1; RP_UPDATE_CHECK=no; RP_UPDATE_CHECK_URL=https://api/newer; rp_check_for_update force")" ]'
 
 AP="$T/artprio"; setup mkdir -p "$AP"
-cp "$ROOT"/*.sh "$REPO/to_ilbm.py" "$AP/"
+cp "$ROOT"/*.sh "$REPO"/*.py "$AP/"
 for f in lores laced; do for sec in Covers Screens Titles; do
     setup mkdir -p "$AP/artwork/iGame_AGA/$f/$sec/Games/S/Superfrog"
     echo "AGA-$f-$sec" > "$AP/artwork/iGame_AGA/$f/$sec/Games/S/Superfrog/iGame.iff"
@@ -1698,7 +1702,7 @@ check "the report says where the time went, stage by stage" \
   'grep -q "Time per stage" "$T/timed.log" && grep -qE "^  preflight +[0-9]+" "$T/timed.log" &&
    grep -qE "^  update +[0-9]+" "$T/timed.log" && grep -qE "^  build +[0-9]+" "$T/timed.log"'
 check "...and the saved report keeps them too" \
-  'grep -q "Time per stage" "$(ls -1 "$ROOT"/reports/*.txt | grep -v _no_artwork | sort | tail -1)"'
+  'grep -q "Time per stage" "$(ls -1 "$ROOT"/logs/[0-9]*.txt | grep -v _no_artwork | sort | tail -1)"'
 # JOBS: auto must keep exactly what each stage worked out for itself.
 run jobsauto ./extract.sh -u -d "$T/jobs_out" --debug
 auto_jobs="$(sed -n 's/.*using \([0-9]*\) parallel extraction job.*/\1/p' "$T/jobsauto.log" | head -1)"
@@ -1763,6 +1767,8 @@ check "...and still extracts" '[ -n "$(find "$T/locale_out" -name "*.info" 2>/de
 # rp_pick_locale itself
 check "rp_pick_locale returns one the machine has" \
   '[ -n "$(cd "$ROOT" && bash -c "SCRIPT_DIR=. . ./lib.sh; rp_pick_locale zz_ZZ.UTF-8 C.UTF-8 C.utf8 C")" ]'
+check "an empty candidate (LANG unset) is never taken for a locale" \
+  '[ -z "$(cd "$ROOT" && bash -c "SCRIPT_DIR=. . ./lib.sh; rp_pick_locale \"\" zz_ZZ.UTF-8" 2>/dev/null)" ]'
 check "...and nothing at all when none of them exist" \
   '[ -z "$(cd "$ROOT" && bash -c "SCRIPT_DIR=. . ./lib.sh; rp_pick_locale zz_ZZ.UTF-8 qq_QQ.ISO-8859-9" 2>/dev/null)" ] && [ -n "$(cd "$ROOT" && bash -c "SCRIPT_DIR=. . ./lib.sh; rp_pick_locale qq_QQ.X C.UTF-8" 2>/dev/null)" ]'
 
@@ -2190,7 +2196,7 @@ section "86. doctor.sh reports on the folders the suite actually uses"
 # A self-contained tree: a built collection, real downloads, laced artwork
 # installed the way artwork_sync.sh installs it (inside its pack, not beside it).
 DOC="$T/doc"; rm -rf "$DOC"; mkdir -p "$DOC"
-cp "$REPO"/*.sh "$REPO"/to_ilbm.py "$DOC"/ 2>/dev/null
+cp "$REPO"/*.sh "$REPO"/*.py "$DOC"/ 2>/dev/null
 chmod +x "$DOC"/*.sh
 mkdir -p "$DOC/build/retro_aga/WHDLoad/Games" \
          "$DOC/downloads/WHDLoad" "$DOC/downloads/old" \
@@ -2346,13 +2352,14 @@ check "no stage still fails with a bare message" \
   '! grep -q "fail \"sorting failed\"" "$ROOT/all.sh"'
 
 
-section "91. Release 0.5 is what every script reports"
-check "lib.sh says release 0.5" 'grep -q "^RP_RELEASE=\"0.5\"" "$ROOT/lib.sh"'
+section "91. One release number, and every script reports it"
+REL="$(sed -n 's/^RP_RELEASE="\([^"]*\)".*/\1/p' "$ROOT/lib.sh")"
+check "lib.sh names a release (digits and dots)" 'case "$REL" in ""|*[!0-9.]*) false ;; *) true ;; esac'
 check "every script carries lib.sh's suite stamp" \
   'v="$(sed -n "s/^RP_SUITE_VERSION=\"\([^\"]*\)\"/\1/p" "$ROOT/lib.sh")";
    [ -n "$v" ] && [ -z "$(grep -L "^# retroplay-suite: $v " "$ROOT"/*.sh | grep -v "/lib.sh$")" ]'
 run relver ./start.sh --version
-check "--version reports it" 'grep -q "^whdsync 0.5 " "$T/relver.log"'
+check "--version reports it" 'grep -q "^whdsync $REL " "$T/relver.log"'
 
 section "92. NOCOLOR is honoured like NO_COLOR, and --color=always still wins"
 cl() { ( cd "$ROOT" && env "$@" RP_FORCE_TTY=1 bash -c 'SCRIPT_DIR=.; . ./lib.sh; rp_colour_on && echo on || echo off' ) 2>/dev/null; }
@@ -2365,11 +2372,11 @@ check "--color=never beats a terminal"              '[ "$(cl RP_COLOR=never)" = 
 section "93. The lock record says which scripts took it"
 ( cd "$ROOT" && bash -c 'SCRIPT_DIR=.; . ./lib.sh; rp_load_config; RP_RUN_ID=t93; rp_lock_write_info "all.sh --cron"' ) 2>/dev/null
 check "suite_version and release are recorded" \
-  'grep -q "^suite_version=" "$ROOT/.all.lock.info" && grep -q "^release=0.5" "$ROOT/.all.lock.info"'
+  'grep -q "^suite_version=" "$ROOT/.all.lock.info" && grep -q "^release=$REL" "$ROOT/.all.lock.info"'
 sed -i.bak 's/^pid=.*/pid=999999/' "$ROOT/.all.lock.info" && rm -f "$ROOT/.all.lock.info.bak"
 run unl ./start.sh --unlock-stale
 check "--unlock-stale shows it, one fact per line" \
-  'grep -q "Scripts:  .*(release 0.5)" "$T/unl.log" && grep -q "PID:      999999" "$T/unl.log"'
+  'grep -q "Scripts:  .*(release $REL)" "$T/unl.log" && grep -q "PID:      999999" "$T/unl.log"'
 check "...and removes a lock whose run is gone" '[ ! -f "$ROOT/.all.lock.info" ]'
 
 section "94. Read-only commands work even when the archive tools are missing"
@@ -2721,8 +2728,10 @@ check "update.sh names its log once, not folder + full path" \
 check "...and what it prints is a file that exists" \
   'f="$(sed -n "s/^See \(.*\) for details$/\1/p" "$T"/*.log 2>/dev/null | tail -1)"; [ -n "$f" ] && [ "${f#/}" != "$f" ] && case "$f" in *//*) false ;; *) true ;; esac'
 # The summary table: every row must put its numbers in the same columns,
-# whatever the longest collection name is.
-rep="$(ls -1 "$ROOT"/reports/*.txt 2>/dev/null | grep -v _no_artwork | tail -1)"
+# whatever the longest collection name is. (Only the latest report is kept,
+# so make sure the latest one is from a run that built something.)
+run tblrep ./all.sh --skip-update --variants aga --force
+rep="$(ls -1 "$ROOT"/logs/[0-9]*.txt 2>/dev/null | grep -v _no_artwork | tail -1)"
 check "the run report has a collection table" '[ -n "$rep" ] && grep -q "^  Collection" "$rep"'
 check "the table's name column is sized to the longest name" \
   'grep -q "namew=" "$ROOT/all.sh" && ! grep -q "%-14s %6s" "$ROOT/all.sh"'
@@ -2805,6 +2814,253 @@ check "drive back as it was: runs normally" '[ "$st" -eq 0 ] || [ "$st" -eq 2 ]'
 run od9 ./start.sh --status
 check "--status shows the output folder as available" 'grep -q "Output folder: $USB2" "$T/od9.log"'
 cp "$T/conf.bak116" "$ROOT/retroplay.conf"
+
+section "117. Amiga-safe names: accents and AmigaDOS wildcards go, - and + stay"
+# amiga_names.py runs at the end of every run that changed something, over
+# each collection and each dated batch. It is used exactly as it ships.
+NG="$ROOT/build/retro_aga/WHDLoad/Games/N"
+NB="$ROOT/build/new_aga/2026-01-02_030405"          # a dated batch: its own name has hyphens
+an_fixture() {
+    setup mkdir -p "$NG/Zoë-Game+" "$NB/WHDLoad/Games/Q"
+    : > "$NG/Zoë-Game+.info"; : > "$NG/Zoë-Game+/dätä-1.bin"; : > "$NG/Zoë-Game+/what?.txt"
+    : > "$NG/Zoë-Game+/hash#tag"; : > "$NG/Zoë-Game+/plain-and+legal"; : > "$NB/WHDLoad/Games/Q/a?b"
+}
+an_fixture
+run an_plan ./all.sh --skip-update --variants aga --dry-run; st=$?
+check "--dry-run lists what the clean-up would change" \
+  '[ "$st" -eq 0 ] && grep -q "Amiga-safe names" "$T/an_plan.log" && grep -q "what?.txt" "$T/an_plan.log" && grep -qE "retro_aga +[0-9]+ name" "$T/an_plan.log"'
+check "...and changes nothing" '[ -e "$NG/Zoë-Game+/what?.txt" ] && [ -d "$NG/Zoë-Game+" ]'
+run an_plan2 ./all.sh --plan --skip-update --variants aga; st=$?
+check "all.sh accepts --plan as well as --dry-run" '[ "$st" -eq 0 ] && grep -q "Dry run only" "$T/an_plan2.log"'
+run an_off ./all.sh --skip-update --variants aga --force --no-amiga-names; st=$?
+check "--no-amiga-names skips it for one run" \
+  '[ "$st" -eq 0 ] && [ -e "$NG/Zoë-Game+/what?.txt" ] && ! grep -q "\[Amiga names\]" "$T/an_off.log"'
+acfg AMIGA_NAMES '"no"'
+run an_cfgoff ./all.sh --skip-update --variants aga --force
+check "AMIGA_NAMES=\"no\" turns it off for every run" '[ -e "$NG/Zoë-Game+/what?.txt" ]'
+run an_cfgon ./all.sh --skip-update --variants aga --force --amiga-names
+check "...and --amiga-names turns it back on for one" '[ -e "$NG/Zoe-Game+/what_.txt" ]'
+acfg AMIGA_NAMES '"yes"'
+check "accented letters lose their accents (ä -> ae, ë -> e)" \
+  '[ -d "$NG/Zoe-Game+" ] && [ -e "$NG/Zoe-Game+.info" ] && [ -e "$NG/Zoe-Game+/daetae-1.bin" ]'
+check "# and ? - AmigaDOS wildcards - become _" '[ -e "$NG/Zoe-Game+/what_.txt" ] && [ -e "$NG/Zoe-Game+/hash_tag" ]'
+check "- and + are legal on the Amiga and are left exactly as they are" '[ -e "$NG/Zoe-Game+/plain-and+legal" ]'
+check "a dated batch is cleaned inside, and its own name is never touched" \
+  '[ -e "$NB/WHDLoad/Games/Q/a_b" ] && [ -d "$NB" ] && [ ! -e "$ROOT/build/new_aga/2026_01_02_030405" ]'
+check "it is the first job of the Finalise phase, with a progress line for each pass" \
+  'grep -q "5/5\] Finalise - Amiga-safe names" "$T/an_cfgon.log" && grep -q "Checking names:" "$T/an_cfgon.log" && grep -q "Amiga-safe names: 100%" "$T/an_cfgon.log"'
+check "the run report counts what changed and says where the list is" \
+  'grep -qE "\[Amiga names\] [0-9]+ renamed \(list: logs/amiga_names.log\)" "$(ls -1 "$ROOT"/logs/[0-9]*.txt | grep -v _no_artwork | tail -1)"'
+check "every rename is listed in logs/amiga_names.log" \
+  'grep -q "^RENAMED: .*what?.txt. -> .what_.txt." "$ROOT/logs/amiga_names.log"'
+check "its time is reported as a stage of its own" 'grep -qE "^  amiga_names +[0-9]+" "$T/an_cfgon.log"'
+# nothing is ever overwritten
+: > "$NG/Zoe-Game+/x#y"; echo mine > "$NG/Zoe-Game+/x_y"
+run an_skip ./all.sh --skip-update --variants aga --force
+check "a name whose Amiga-safe form is taken is left alone, and nothing is overwritten" \
+  '[ -e "$NG/Zoe-Game+/x#y" ] && [ "$(cat "$NG/Zoe-Game+/x_y")" = mine ] && grep -q "left as they were" "$T/an_skip.log"'
+rm -f "$NG/Zoe-Game+/x#y"
+run an_clean ./all.sh --skip-update --variants aga --force
+check "with nothing to change it says so and renames nothing" \
+  'grep -q "every name is already Amiga-safe" "$T/an_clean.log" && [ ! -e "$ROOT/logs/amiga_names.log" ]'
+# quiet nights
+: > "$NG/Zoe-Game+/late?arrival"
+run an_quiet ./all.sh --skip-update --variants aga; st=$?
+check "a nothing-to-do run skips the clean-up once it has been done" '[ "$st" -eq 2 ] && [ -e "$NG/Zoe-Game+/late?arrival" ]'
+rm -f "$ROOT/.retroplay/amiga_names_last"
+run an_first ./all.sh --skip-update --variants aga; st=$?
+check "...but runs it the first time, so collections built before it existed get cleaned" \
+  '[ "$st" -eq 2 ] && [ -e "$NG/Zoe-Game+/late_arrival" ] && [ -s "$ROOT/.retroplay/amiga_names_last" ]'
+# it can never fail a run
+mv "$ROOT/amiga_names.py" "$T/amiga_names.py.keep"
+run an_missing ./all.sh --skip-update --variants aga --force; st=$?
+check "a missing amiga_names.py is reported and the run still succeeds" \
+  '[ "$st" -eq 0 ] && grep -q "amiga_names.py is missing" "$T/an_missing.log"'
+run an_doc ./doctor.sh
+check "...and doctor.sh says what is wrong and how to fix it" \
+  'grep -q "amiga_names.py is missing" "$T/an_doc.log" && grep -q "AMIGA_NAMES" "$T/an_doc.log"'
+mv "$T/amiga_names.py.keep" "$ROOT/amiga_names.py"
+run an_doc2 ./doctor.sh
+check "with it in place, doctor.sh reports the names step as ready" 'grep -q "Amiga-safe names clean-up: python3 and amiga_names.py" "$T/an_doc2.log"'
+check "--status says when the names were last checked" 'run_out ./start.sh --status | grep -q "Amiga names:   on - last checked"'
+# the script on its own: no --apply means nothing is renamed
+setup mkdir -p "$T/anpy/d"; : > "$T/anpy/d/é?"
+python3 "$ROOT/amiga_names.py" "$T/anpy" > "$T/anpy.log" 2>&1
+check "amiga_names.py without --apply only previews" 'grep -q "^PREVIEW" "$T/anpy.log" && [ -e "$T/anpy/d/é?" ]'
+rm -rf "$NG" "$NB"
+
+section "118. logs/ holds the latest of everything, and nothing else"
+run lg1 ./all.sh --skip-update --variants aga --force
+run lg2 ./all.sh --skip-update --variants aga --force
+check "only the latest run report is kept" \
+  '[ "$(ls -1 "$ROOT"/logs/[0-9]*.txt | grep -v _no_artwork | grep -c .)" -eq 1 ]'
+check "...and it is this run's" \
+  'grep -q "saved as logs/$(basename "$(ls -1 "$ROOT"/logs/[0-9]*.txt | grep -v _no_artwork)")" "$T/lg2.log"'
+check "no-artwork lists from earlier runs go with their report" \
+  '[ "$(ls -1 "$ROOT"/logs/*_no_artwork.txt 2>/dev/null | sed "s/_retro.*//" | sort -u | grep -c .)" -le 1 ]'
+# a reports/ folder from an earlier version is folded into logs/
+rm -f "$ROOT"/logs/[0-9]*.txt; setup mkdir -p "$ROOT/reports"
+echo older > "$ROOT/reports/2026-01-01_020000.txt"; echo newest > "$ROOT/reports/2026-01-02_020000.txt"
+echo list > "$ROOT/reports/2026-01-02_020000_retro_aga_no_artwork.txt"
+run lgfold ./all.sh --skip-update --variants aga; st=$?
+check "an old reports/ folder is folded into logs/ and removed" \
+  '[ "$st" -eq 2 ] && [ ! -e "$ROOT/reports" ] && [ "$(cat "$ROOT/logs/2026-01-02_020000.txt")" = newest ] && [ -f "$ROOT/logs/2026-01-02_020000_retro_aga_no_artwork.txt" ]'
+check "...keeping only its newest report" '[ ! -e "$ROOT/logs/2026-01-01_020000.txt" ]'
+check "a run with nothing to report leaves the previous report to be read" '[ -f "$ROOT/logs/2026-01-02_020000.txt" ]'
+run lgstatus ./start.sh --status
+check "--status points at the report in logs/" 'grep -q "Last report:   logs/" "$T/lgstatus.log"'
+# the nightly log holds the latest night only
+echo "OLD-NIGHT" > "$ROOT/logs/all_cron.log"
+run lgcron ./all.sh --cron --skip-update --variants aga --force
+check "all_cron.log holds only the most recent nightly run" \
+  '! grep -q "OLD-NIGHT" "$ROOT/logs/all_cron.log" && grep -q "all.sh --cron:" "$ROOT/logs/all_cron.log" && grep -q "Finalise" "$ROOT/logs/all_cron.log"'
+check "...and is not rotated into numbered copies any more" '[ -z "$(ls "$ROOT"/logs/all_cron.log.* 2>/dev/null)" ]'
+# a run started by hand at a terminal is copied to logs/last_run.log
+rm -f "$ROOT/logs/last_run.log"
+run lgpipe ./all.sh --skip-update --variants aga --force
+check "a redirected run is not recorded twice (whoever redirected it has it)" '[ ! -e "$ROOT/logs/last_run.log" ]'
+if command -v script >/dev/null 2>&1; then
+    on_tty() {   # on_tty <command line> - run it with a terminal for stdin and stdout
+        if script --version 2>&1 | grep -q util-linux; then script -q -e -c "$1" /dev/null
+        else script -q /dev/null "$BASH" -c "$1"; fi
+    }
+    ( cd "$ROOT" && on_tty "./all.sh --skip-update --variants aga --force" ) < /dev/null > "$T/lgtty.log" 2>&1; st=$?
+    check "a run started at a terminal is copied to logs/last_run.log" \
+      '[ "$st" -eq 0 ] && grep -q "Finalise" "$ROOT/logs/last_run.log" && grep -q "^all.sh --skip-update --variants aga --force" "$ROOT/logs/last_run.log"'
+    check "...as plain text: no escape codes, no carriage returns" \
+      '! grep -q "$(printf "\033")" "$ROOT/logs/last_run.log" && ! grep -q "$(printf "\r")" "$ROOT/logs/last_run.log"'
+    check "...with its result on the second line" 'sed -n 2p "$ROOT/logs/last_run.log" | grep -q "exit 0"'
+    check "...and nothing of the recording is left behind" '[ -z "$(ls -A "$ROOT/logs" | grep "^\.run_")" ]'
+    ( cd "$ROOT" && on_tty "./all.sh --variants nosuchvariant" ) < /dev/null > "$T/lgttybad.log" 2>&1; st=$?
+    check "the run's own exit status is passed back through the recording" '[ "$st" -eq 4 ]'
+    ( cd "$ROOT" && on_tty "./all.sh --status" ) < /dev/null > /dev/null 2>&1
+    check "--status and the other read-only commands are not recorded" '! grep -q "Amiga Retroplay status" "$ROOT/logs/last_run.log"'
+    acfg RUN_LOG '"no"'; rm -f "$ROOT/logs/last_run.log"
+    ( cd "$ROOT" && on_tty "./all.sh --skip-update --variants aga --force" ) < /dev/null > /dev/null 2>&1
+    check "RUN_LOG=\"no\" turns it off" '[ ! -e "$ROOT/logs/last_run.log" ]'
+    acfg RUN_LOG '"yes"'
+else
+    echo "  (skipped the terminal run: no 'script' command)"
+fi
+
+section "119. The folders to mirror come from retroplay.conf"
+md() { ( cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; RP_MIRROR_DIRS='$1'; rp_mirror_dirs ${2:-}" ) 2>/dev/null | tr '\n' '|'; }
+check "the default list is the five folders it always mirrored" \
+  '[ "$(cd "$ROOT" && bash -c "SCRIPT_DIR=.; RP_INVOKED_FROM=$T/styledir; . ./lib.sh; rp_load_config >/dev/null 2>&1; rp_mirror_dirs" | tr "\n" "|")" = "HD_Loaders/Games|JST/Games|WHDLoad/Magazines|WHDLoad/Demos|WHDLoad/Games|" ]'
+check "entries are comma separated, so a name may hold spaces" \
+  '[ "$(md "WHDLoad/Games , WHDLoad/Games/Beta & Unreleased")" = "WHDLoad/Games|WHDLoad/Games/Beta & Unreleased|" ]'
+check "anything outside WHDLoad/, HD_Loaders/ and JST/ is refused" \
+  '[ "$(md "../x, /etc, Photos/2024, WHDLoad, JST/Games")" = "JST/Games|" ] && [ "$(md "../x, /etc, Photos/2024, JST/Games" bad)" = "../x|/etc|Photos/2024|" ]'
+check "a duplicate is mirrored once" '[ "$(md "JST/Games, JST/Games/")" = "JST/Games|" ]'
+check "update.sh has no list of its own left" \
+  '! grep -qE "^ +\"(WHDLoad|HD_Loaders|JST)/[A-Za-z]+\"$" "$ROOT/update.sh" && grep -q "rp_mirror_dirs" "$ROOT/update.sh"'
+server_add WHDLoad/Games/M/Mirrored_v1.0.lha; server_add HD_Loaders/Games/N/NotMirrored_v1.0.lha
+acfg MIRROR_DIRS '"WHDLoad/Games, Photos/2024"'
+run mdupd ./update.sh; st=$?
+check "only the folders listed are mirrored" \
+  '[ "$st" -eq 0 ] && [ -f "$ROOT/downloads/WHDLoad/Games/M/Mirrored_v1.0.lha" ] && [ ! -e "$ROOT/downloads/HD_Loaders/Games/N/NotMirrored_v1.0.lha" ]'
+check "...and nothing is created for an entry that was refused" '[ ! -e "$ROOT/downloads/Photos" ] && [ ! -e "$ROOT/Photos" ]'
+run mdwarn ./doctor.sh
+check "a refused entry is named in a warning, not silently dropped" 'grep -q "MIRROR_DIRS: ignoring Photos/2024" "$T/mdwarn.log"'
+acfg MIRROR_DIRS '""'
+check "an empty list falls back to the default rather than mirroring nothing" \
+  '[ "$(cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; rp_load_config >/dev/null 2>&1; rp_mirror_dirs" | grep -c .)" -eq 5 ]'
+grep -v '^MIRROR_DIRS=' "$ROOT/retroplay.conf" > "$ROOT/.c.tmp"; mv "$ROOT/.c.tmp" "$ROOT/retroplay.conf"
+run mddoc ./doctor.sh
+check "doctor.sh shows which folders are mirrored" 'grep -q "mirroring (MIRROR_DIRS): HD_Loaders/Games, JST/Games" "$T/mddoc.log"'
+run mddrain ./all.sh --variants aga
+
+section "120. start.sh accepts any usable locale, and never stops for one"
+if [ "$(uname -s)" != "Darwin" ]; then
+    setup mkdir -p "$T/locgb" "$T/locnone"
+    printf '#!/bin/sh\n[ "$1" = "-a" ] && printf "C\\nPOSIX\\nen_GB.utf8\\nen_GB.iso88591\\n"\nexit 0\n' > "$T/locgb/locale"
+    printf '#!/bin/sh\n[ "$1" = "-a" ] && printf "C\\nPOSIX\\n"\nexit 0\n' > "$T/locnone/locale"
+    chmod +x "$T/locgb/locale" "$T/locnone/locale"
+    ( cd "$ROOT" && PATH="$T/locgb:$PATH" ./start.sh --sync --aga --skip-update ) < /dev/null > "$T/locgb.log" 2>&1; st=$?
+    check "en_GB locales are enough - it used to demand en_US by name and stop" \
+      '{ [ "$st" -eq 0 ] || [ "$st" -eq 2 ]; } && ! grep -qi "missing locales" "$T/locgb.log" && ! grep -q "locale is installed" "$T/locgb.log"'
+    ( cd "$ROOT" && PATH="$T/locnone:$PATH" ./start.sh --sync --aga --skip-update ) < /dev/null > "$T/locnone.log" 2>&1; st=$?
+    check "with no UTF-8 or Latin-1 locale at all it warns, with the fix, and carries on" \
+      '{ [ "$st" -eq 0 ] || [ "$st" -eq 2 ]; } && grep -q "no UTF-8 locale is installed" "$T/locnone.log" && grep -q "no ISO-8859-1 locale is installed" "$T/locnone.log" && grep -q "setup.sh" "$T/locnone.log"'
+else
+    echo "  (skipped: macOS needs no generated locales)"
+fi
+check "start.sh uses the same locale picker as extract.sh and doctor.sh" \
+  'grep -q "rp_pick_locale" "$ROOT/start.sh" && ! grep -q "latin1_locale=" "$ROOT/start.sh"'
+
+section "121. setup.sh sizes the first run, and knows about the names step"
+SZ="$T/sizing"; setup mkdir -p "$SZ"
+cp "$REPO"/*.sh "$REPO"/*.py "$REPO"/retroplay.conf.example "$SZ"/; chmod +x "$SZ"/*.sh
+sz() { ( cd "$SZ" && RP_SETUP_FREE_MB="$1" RP_SETUP_OS=linux ./setup.sh --dry-run --yes ) 2>&1; }
+check "plenty of room: all five collections, as before" 'sz 500000 | grep -q "VARIANTS=\"aga ecs rtg aga-laced ecs-laced\""'
+check "a medium drive: the three plain variants are suggested" \
+  'sz 60000 | grep -q "VARIANTS=\"aga ecs rtg\"," && sz 60000 | grep -q "Suggested for this drive: aga ecs rtg"'
+check "...with only the artwork those three use" 'sz 60000 | grep -q "ARTWORK_PACKS=\"AGA ECS RTG\""'
+check "a small card: one variant, and it says a bigger drive is the real fix" \
+  'sz 20000 | grep -q "VARIANTS=\"aga\"," && sz 20000 | grep -q "Even one collection may not fit"'
+check "it says how much room each choice needs" 'sz 60000 | grep -q "all five   about [0-9]* GB"'
+setup mkdir -p "$SZ/downloads/WHDLoad"; head -c 3000000 /dev/zero > "$SZ/downloads/WHDLoad/a.lha"
+check "once archives are downloaded, the sizes are measured, not estimated" 'sz 60000 | grep -q "measured from the archives already downloaded"'
+check "the dry run wrote nothing" '[ ! -e "$SZ/retroplay.conf" ]'
+check "setup checks python3 and amiga_names.py" 'sz 500000 | grep -q "amiga_names.py (Amiga-safe names" && grep -q "^python3|python3|python3" "$ROOT/setup.sh"'
+check "tidying into scripts/ takes every .py, not only to_ilbm.py" 'grep -q "\"\$SCRIPT_DIR\"/\*.py" "$ROOT/setup.sh"'
+
+section "122. One help text per script, and it tells the truth"
+check "start.sh has one help text, not a second older copy in the option loop" \
+  '[ "$(grep -c "echo \"Amiga Retroplay Archive Minimal CLI Dispatcher\"" "$ROOT/start.sh")" -eq 1 ]'
+run h_all ./all.sh --help
+check "all.sh --help lists every exit code, not just 0, 2 and 1" \
+  'grep -q "3 = network" "$T/h_all.log" && grep -q "4 = setup" "$T/h_all.log" && grep -q "130 = interrupted" "$T/h_all.log"'
+check "...and the options it has always had but never listed" \
+  'grep -q -- "--preview-new" "$T/h_all.log" && grep -q -- "--jobs N" "$T/h_all.log" && grep -q -- "--version" "$T/h_all.log" && grep -q -- "--plan" "$T/h_all.log"'
+check "every option all.sh --help names is one it accepts" \
+  '( for o in $(grep -oE "(^| )--[a-z][a-z-]*" "$T/h_all.log" | tr -d " " | sort -u); do
+        case "$o" in --color) continue ;; esac
+        grep -qE -- "(^ *|\|)$o(\)|\||=)" "$ROOT/all.sh" || { echo "not accepted: $o" >&2; exit 1; }
+     done; exit 0 )'
+run h_upd ./update.sh --help
+check "update.sh --help shows the folders it will mirror" 'grep -q "MIRROR_DIRS" "$T/h_upd.log" && grep -q "WHDLoad/Games" "$T/h_upd.log"'
+
+section "123. uninstall_deps.sh finds its list in a scripts/ layout"
+# lib.sh records installs in the MAIN folder. With the scripts tidied into
+# scripts/, the uninstaller used to look beside itself and find nothing.
+UD="$T/undeps"; setup mkdir -p "$UD/scripts" "$UD/bin"
+cp "$REPO"/*.sh "$UD/scripts/"; chmod +x "$UD/scripts"/*.sh
+: > "$UD/bin/tool-a"; : > "$UD/bin/tool-b"
+printf '#!/bin/sh\nexec "$@"\n' > "$UD/bin/sudo"; chmod +x "$UD/bin/sudo"   # a sudo that just runs the command
+( cd "$UD/scripts" && bash -c 'SCRIPT_DIR="$PWD"; . ./lib.sh; record_installed_dep source-build "$1"' _ "$UD/bin/tool-a" ) > /dev/null 2>&1
+check "lib.sh records an install in the main folder, not in scripts/" \
+  'grep -qx "source-build:$UD/bin/tool-a" "$UD/.retroplay_installed_deps.log" && [ ! -e "$UD/scripts/.retroplay_installed_deps.log" ]'
+( cd "$UD/scripts" && ./uninstall_deps.sh --dry-run ) > "$T/ud_dry.log" 2>&1; st=$?
+check "the uninstaller, run from scripts/, finds that list" \
+  '[ "$st" -eq 0 ] && grep -q "Would delete the file .$UD/bin/tool-a." "$T/ud_dry.log" && ! grep -q "Nothing to uninstall" "$T/ud_dry.log"'
+check "...and --dry-run removes nothing" '[ -e "$UD/bin/tool-a" ] && [ -s "$UD/.retroplay_installed_deps.log" ]'
+# a second list beside the scripts is read too, and the same entry counts once
+printf 'source-build:%s\nsource-build:%s\n' "$UD/bin/tool-a" "$UD/bin/tool-b" > "$UD/scripts/.retroplay_installed_deps.log"
+( cd "$UD/scripts" && ./uninstall_deps.sh --dry-run ) > "$T/ud_dry2.log" 2>&1
+check "a list left beside the scripts is read as well, without repeating an entry" \
+  '[ "$(grep -c "Would delete" "$T/ud_dry2.log")" -eq 2 ]'
+( cd "$UD/scripts" && PATH="$UD/bin:$PATH" ./uninstall_deps.sh --yes ) > "$T/ud_run.log" 2>&1; st=$?
+check "--yes removes everything tracked in either list" \
+  '[ "$st" -eq 0 ] && [ ! -e "$UD/bin/tool-a" ] && [ ! -e "$UD/bin/tool-b" ] && grep -q "Removed 2 of 2" "$T/ud_run.log"'
+check "...and both lists are gone afterwards" \
+  '[ ! -e "$UD/.retroplay_installed_deps.log" ] && [ ! -e "$UD/scripts/.retroplay_installed_deps.log" ]'
+( cd "$UD/scripts" && ./uninstall_deps.sh ) > "$T/ud_none.log" 2>&1
+check "with nothing tracked it names the main-folder file it looked for" \
+  'grep -q "Nothing to uninstall: $UD/.retroplay_installed_deps.log" "$T/ud_none.log"'
+# an entry it does not act on is kept, in the main list, and the stray copy still goes
+printf 'mystery:thing\n' > "$UD/scripts/.retroplay_installed_deps.log"
+( cd "$UD/scripts" && ./uninstall_deps.sh --yes ) > /dev/null 2>&1
+check "an entry it cannot act on is kept - moved to the main list, not lost" \
+  'grep -qx "mystery:thing" "$UD/.retroplay_installed_deps.log" && [ ! -e "$UD/scripts/.retroplay_installed_deps.log" ]'
+# the flat layout (scripts in the main folder) is unchanged
+UF="$T/undeps_flat"; setup mkdir -p "$UF"; cp "$REPO"/*.sh "$UF/"; : > "$UF/tool-c"
+printf 'source-build:%s\n' "$UF/tool-c" > "$UF/.retroplay_installed_deps.log"
+( cd "$UF" && PATH="$UD/bin:$PATH" ./uninstall_deps.sh --yes ) > /dev/null 2>&1
+check "with the scripts in the main folder it works as it always did" \
+  '[ ! -e "$UF/tool-c" ] && [ ! -e "$UF/.retroplay_installed_deps.log" ]'
+check "the uninstaller and lib.sh use the same rule for the main folder" \
+  'grep -q "SCRIPT_DIR%/scripts" "$ROOT/uninstall_deps.sh" && grep -q "SCRIPT_DIR%/scripts" "$ROOT/lib.sh"'
 
 # ================================================================ summary ===
 echo

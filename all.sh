@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.10.03.1   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.11.15.1   (every script in the set must carry the same stamp)
 # Remember where the user ran this from, before any cd: retroplay.conf is
 # looked for there first (see lib.sh).
 RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
@@ -8,7 +8,7 @@ RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
 #   Options: --aga --ecs --rtg --aga-laced --ecs-laced --set NAME --variants LIST
 #            --clean --rebuild --force --skip-update --dry-run/--plan --cron
 #            --dest DIR --art LIST --demo-art LIST --ffs/--pfs --detox/--no-detox
-#            --status --test-notify --debug --help
+#            --amiga-names/--no-amiga-names --status --test-notify --debug --help
 # Run 'all.sh --help' for the authoritative, current list.
 #
 # Amiga Retroplay - pipeline engine
@@ -28,9 +28,14 @@ RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
 #   * Free disk space is checked before extracting or copying.
 #   * An updated game REPLACES its old folder, so files from older versions
 #     don't linger; each batch is also kept in a dated new_<variant> folder.
-#   * One summary report per run (reports/), optional notifications.
+#   * Names are made Amiga-safe at the end of the run (amiga_names.py;
+#     AMIGA_NAMES in retroplay.conf, --no-amiga-names to skip it once).
+#   * One summary report per run (in logs/, only the latest is kept),
+#     optional notifications.
 #
-# Exit codes: 0 = work done, 2 = nothing to do, 1 = failure.
+# Exit codes: 0 = work done, 2 = nothing to do, 3 = network or server problem,
+#             4 = setup or option problem, 5 = some archives could not be
+#             extracted, 130 = interrupted, 1 = any other failure.
 
 set -u -o pipefail
 
@@ -53,50 +58,6 @@ for _a in "$@"; do
     esac
 done
 unset _a
-rp_banner "all.sh"
-
-usage() {
-    cat << 'USAGE'
-Usage: all.sh [options]
-
-Builds or updates every variant listed in VARIANTS (retroplay.conf; default
-"aga ecs rtg aga-laced ecs-laced") - or just the ones you name - extracting
-archives only once. Each collection needs its own room on the drive; set
-VARIANTS in retroplay.conf to build fewer of them.
-
-Choosing variants (default: VARIANTS from retroplay.conf):
-  --aga --ecs --rtg --aga-laced --ecs-laced   Pick variants (repeatable)
-  --laced               Build the laced form of each AGA/ECS variant picked
-  --all                 Every variant: aga, ecs, rtg, aga-laced, ecs-laced
-  --set NAME            Use the iGame_NAME artwork set as a variant
-  --variants "a b c"    Give the whole list at once
-  --dest PATH           Custom output folder (only with a single variant)
-
-What to do:
-  --rebuild             Rebuild from the archives already downloaded, without
-                        checking for updates (same as --clean --skip-update)
-  --clean               Check for updates, then rebuild from scratch
-  --skip-update         Don't download; process whatever is already queued
-  --refresh-artwork     Refresh artwork for every game, including ones the
-                        nightly gap-fill would skip (artwork already in the
-                        collection is always rewritten from the packs)
-  --force               Also run the artwork gap-fill on up-to-date variants
-  --dry-run             Show what would happen, change nothing
-  --status              Show the last run, each variant's state, drive, schedule
-  --test-notify         Send a test notification and report whether it worked
-  --cron                Unattended mode for cron: sets a full PATH, rotates
-                        and writes to all_cron.log
-
-Overrides for retroplay.conf settings:
-  --art ORDER  --demo-art ORDER  --ffs | --pfs  --no-detox | --detox
-  --quiet               Errors and the final result only (good for cron)
-  --verbose             More detail about each stage
-  --debug               Diagnostic detail (implies --verbose)
-  --color auto|always|never   Colour: a terminal by default; NO_COLOR is honoured
-
-Exit codes: 0 = work done, 2 = nothing to do, 1 = failure.
-USAGE
-}
 
 # What this run was asked to do, for the lock record and the logs. Built from
 # "$@" (not "$*") so an argument containing spaces is still readable as one
@@ -115,6 +76,153 @@ rp_render_args() {
     done
     printf '%s' "${out# }"
 }
+# ----- A copy of a run started by hand: logs/last_run.log -----
+# A nightly run has logs/all_cron.log. A run typed at a terminal had nothing:
+# once it scrolled away it was gone. So such a run is started again under
+# `script`, which records it while leaving it a real terminal - the progress
+# bars still redraw in place, colour and prompts still work, and Ctrl-C still
+# reaches the run. (Piping through `tee` would have been simpler and wrong:
+# every script here asks "is this a terminal?" to decide how to draw progress,
+# whether to ask questions and whether to run gently, and behind a pipe the
+# answer changes.) When the run ends the recording is cleaned - escape codes
+# out, each redrawn bar reduced to its final state - into logs/last_run.log.
+#
+# Purpose:       keep what a hand-started run printed.
+# Assumptions:   stdin and stdout are a terminal; `script` exists (util-linux
+#                on Linux, BSD on macOS - the two take their arguments in a
+#                different order, and both are tried harmlessly first).
+# Inputs:        the script's own arguments; RUN_LOG in retroplay.conf.
+# Outputs:       logs/last_run.log, replacing the previous one.
+# Side effects:  runs this script once more, as a child, with RP_RUN_LOGGED=1
+#                so that child does not do the same again. This shell holds no
+#                lock and changes nothing itself; it exits with the child's
+#                status, which the child hands back through a small file
+#                because not every `script` passes it on.
+# Not used for:  --cron (has its own log), --dry-run/--plan, --status,
+#                --test-notify, --help, --version (nothing worth keeping, and
+#                they should answer instantly), a stage of another run, or
+#                any run whose output is not a terminal - whoever redirected
+#                that is already keeping it.
+run_with_log() {
+    local ts stat cmd rc flavour esc log="$RP_LOG_ROOT/last_run.log" shown
+    mkdir -p "$RP_LOG_ROOT" 2>/dev/null || return 0
+    ts="$RP_LOG_ROOT/.run_typescript.$$"; stat="$RP_LOG_ROOT/.run_status.$$"
+    if script --version 2>&1 | grep -q 'util-linux'; then
+        flavour=linux
+        script -q -c true /dev/null >/dev/null 2>&1 || return 0
+    else
+        flavour=bsd
+        script -q /dev/null true >/dev/null 2>&1 || return 0
+    fi
+    # %q quotes each argument for the shell that `script` starts, so a --dest
+    # with spaces in it arrives as one argument.
+    cmd="$(printf '%q ' "$BASH" "$SCRIPT_DIR/all.sh" ${1+"$@"})"
+    cmd="$cmd; echo \$? > $(printf '%q' "$stat")"
+    shown="$(rp_render_args ${1+"$@"})"
+    RP_RUN_LOGGED=1; export RP_RUN_LOGGED
+    rm -f -- "$ts" "$stat"
+    if [ "$flavour" = linux ]; then
+        script -q -c "$cmd" "$ts"
+    else
+        script -q "$ts" "$BASH" -c "$cmd"
+    fi
+    rc=$?
+    [ -s "$stat" ] && rc="$(head -1 "$stat")"
+    case "$rc" in ''|*[!0-9]*) rc=1 ;; esac
+    if [ -s "$ts" ]; then
+        esc="$(printf '\033')"
+        {
+            printf 'all.sh %s\n' "$shown"
+            printf 'Finished %s - exit %s (%s)\n\n' "$(rp_ts)" "$rc" "$(rp_exit_meaning "$rc")"
+            # Escape sequences out; then, of everything a line was redrawn
+            # with (carriage returns), keep only what was left showing.
+            tr -d '\000' < "$ts" |
+            sed -e "s/${esc}\[[0-9;?]*[A-Za-z]//g" -e '/^Script started on /d' -e '/^Script done on /d' |
+            awk '{ n = split($0, part, "\r"); keep = ""
+                   for (i = n; i >= 1; i--) if (part[i] != "") { keep = part[i]; break }
+                   print keep }'
+        } > "$log.tmp" 2>/dev/null && mv -f -- "$log.tmp" "$log"
+        rm -f -- "$log.tmp"
+    fi
+    rm -f -- "$ts" "$stat"
+    exit "$rc"
+}
+if [ -z "${RP_RUN_LOGGED:-}" ] && [ "${RP_CHILD:-0}" = "0" ] && [ "${RP_RUN_LOG:-yes}" = "yes" ] \
+   && [ -t 0 ] && [ -t 1 ] && command -v script >/dev/null 2>&1; then
+    _wrap=1
+    for _a in ${1+"$@"}; do
+        case "$(printf '%s' "$_a" | tr '[:upper:]' '[:lower:]')" in
+            --cron|--dry-run|--plan|--status|--test-notify|-h|--help) _wrap=0 ;;
+        esac
+    done
+    [ "$_wrap" -eq 1 ] && run_with_log ${1+"$@"}
+    unset _a _wrap
+fi
+
+rp_banner "all.sh"
+
+usage() {
+    cat << 'USAGE'
+Usage: all.sh [options]
+
+Builds or updates every variant listed in VARIANTS (retroplay.conf; default
+"aga ecs rtg aga-laced ecs-laced") - or just the ones you name - extracting
+archives only once. Each collection needs its own room on the drive; set
+VARIANTS in retroplay.conf to build fewer of them.
+
+Choosing variants (default: VARIANTS from retroplay.conf):
+  --aga --ecs --rtg --aga-laced --ecs-laced   Pick variants (repeatable)
+  --laced               Build the laced form of each AGA/ECS variant picked
+  --all                 Every variant: aga, ecs, rtg, aga-laced, ecs-laced
+  --set NAME            Use the iGame_NAME artwork set as a variant
+  --variants "a b c"    Give the whole list at once (--variant NAME adds one)
+  --dest PATH           Custom output folder (only with a single variant)
+
+What to do:
+  --rebuild             Rebuild from the archives already downloaded, without
+                        checking for updates (same as --clean --skip-update)
+  --clean               Check for updates, then rebuild from scratch
+  --skip-update         Don't download; process whatever is already queued
+  --refresh-artwork     Refresh artwork for every game, including ones the
+                        nightly gap-fill would skip (artwork already in the
+                        collection is always rewritten from the packs)
+  --force               Also run the artwork gap-fill on up-to-date variants
+  --preview-new         Build the dated folder of just the new games and leave
+                        the collection itself alone
+  --no-amiga-names      Skip the Amiga-safe names clean-up at the end of this
+                        run (amiga_names.py over the collections in build/:
+                        accented letters and # ? \ - never - or +).
+                        It is on by default; AMIGA_NAMES="no" in retroplay.conf
+                        turns it off for every run, and --amiga-names turns it
+                        back on for one
+  --dry-run, --plan     Show what would happen - including which names the
+                        clean-up would change - and change nothing
+  --status              Show the last run, each variant's state, drive, schedule
+  --test-notify         Send a test notification and report whether it worked
+  --cron                Unattended mode for cron: sets a full PATH and writes
+                        to logs/all_cron.log (the latest run only)
+
+Overrides for retroplay.conf settings:
+  --art ORDER  --demo-art ORDER  --ffs | --pfs  --no-detox | --detox
+  --amiga-names | --no-amiga-names
+  --jobs N              How many things to do at once (overrides JOBS)
+  --quiet               Errors and the final result only (good for cron)
+  --verbose             More detail about each stage
+  --debug               Diagnostic detail (implies --verbose)
+  --color auto|always|never   Colour: a terminal by default; NO_COLOR is honoured
+  --version             Print the version and exit
+
+Logs and the run report are in logs/. It is cleared at the start of every
+run and only the latest report is kept, so it always describes the last run.
+A run started by hand at a terminal is also copied to logs/last_run.log
+(RUN_LOG="no" in retroplay.conf turns that off).
+
+Exit codes: 0 = work done, 2 = nothing to do, 3 = network or server problem,
+            4 = setup or option problem, 5 = some archives could not be
+            extracted, 130 = interrupted, 1 = any other failure.
+USAGE
+}
+
 ORIG_ARGS="$(rp_render_args ${1+"$@"})"
 VARIANT_ARGS=""; DEST_OVERRIDE=""; WANT_LACED=0
 vstart=0            # when the collection being worked on started (see variant_row)
@@ -123,6 +231,7 @@ REFRESH_ART=0        # --refresh-artwork: replace artwork already in the collect
 PREVIEW_ONLY=0       # --preview-new: save the dated batch, do not install it
 DRY_RUN=0; CRON=0; DEBUG=0
 ART_OVERRIDE=""; DEMO_ART_OVERRIDE=""; FS_OVERRIDE=""; DETOX_OVERRIDE=""
+AMIGA_NAMES_OVERRIDE=""   # --amiga-names / --no-amiga-names: overrides AMIGA_NAMES
 
 while [ $# -gt 0 ]; do
     opt="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
@@ -148,7 +257,7 @@ while [ $# -gt 0 ]; do
             PREVIEW_ONLY=1; shift ;;
         --refresh-artwork) REFRESH_ART=1; shift ;;
         --jobs)      rp_require_option_value "$1" "$#" "${2-}"; RP_JOBS_OVERRIDE="$2"; export RP_JOBS_OVERRIDE; shift 2 ;;
-        --dry-run)   DRY_RUN=1; shift ;;
+        --dry-run|--plan) DRY_RUN=1; shift ;;      # --plan: the name start.sh and the README use
         --cron)      CRON=1; shift ;;
         --art)       rp_require_option_value "$1" "$#" "${2-}"; ART_OVERRIDE="$2"; shift 2 ;;
         --demo-art)  rp_require_option_value "$1" "$#" "${2-}"; DEMO_ART_OVERRIDE="$2"; shift 2 ;;
@@ -156,6 +265,8 @@ while [ $# -gt 0 ]; do
         --pfs)       FS_OVERRIDE=pfs; shift ;;
         --no-detox)  DETOX_OVERRIDE=no; shift ;;
         --detox)     DETOX_OVERRIDE=yes; shift ;;
+        --no-amiga-names) AMIGA_NAMES_OVERRIDE=no; shift ;;
+        --amiga-names)    AMIGA_NAMES_OVERRIDE=yes; shift ;;
         --debug)     DEBUG=1; RP_VERBOSITY=3; RP_DEBUG=1; export RP_VERBOSITY RP_DEBUG; rp_set_colours; shift ;;
         --quiet)     RP_VERBOSITY=0; export RP_VERBOSITY; shift ;;
         --verbose)   [ "$RP_VERBOSITY" -lt 2 ] && RP_VERBOSITY=2; export RP_VERBOSITY; shift ;;
@@ -173,11 +284,13 @@ done
 
 # ----- Cron mode -----
 # (cron's bare PATH is already taken care of by lib.sh, for every script:
-# it adds back the PATH remembered from your last interactive run.) cron
-# can't rotate its own >> log, so --cron does that and writes the log itself.
+# it adds back the PATH remembered from your last interactive run.) --cron
+# writes the log itself. It is opened for appending here and emptied further
+# down, once this run holds the lock - so all_cron.log only ever holds the
+# most recent run, and a run that is refused because another is still going
+# adds its one message to that run's log instead of wiping it.
 if [ "$CRON" -eq 1 ]; then
     mkdir -p "$RP_LOG_ROOT" 2>/dev/null; CRON_LOG="$RP_LOG_ROOT/all_cron.log"
-    rp_rotate_log "$CRON_LOG" "$RP_LOG_MAX_MB" "$RP_LOG_KEEP"
     exec >> "$CRON_LOG" 2>&1 < /dev/null
     echo
     echo "==================== all.sh --cron: $(date '+%Y-%m-%d %H:%M:%S') ===================="
@@ -242,6 +355,15 @@ if ! rp_flock_bin >/dev/null 2>&1 && [ -t 0 ] && rp_may_install_tools; then
 fi
 
 rp_lock_take "all.sh $ORIG_ARGS" || rp_lock_refuse "all.sh"
+# This run is the one that counts now: start the nightly log again from empty.
+# The log was opened with >>, so everything printed from here on lands at the
+# new start of the file. The heading and any settings warnings were printed
+# before the lock was taken, so they are said again.
+if [ "$CRON" -eq 1 ]; then
+    : > "$CRON_LOG"
+    echo "==================== all.sh --cron: $(date '+%Y-%m-%d %H:%M:%S') ===================="
+    rp_print_config_warnings
+fi
 if [ "$RP_LOCK_HELD" = "2" ]; then
     rp_warn "'flock' not found - using a simpler lock folder instead"
     if [ "$OS_TYPE" = "darwin" ]; then
@@ -271,6 +393,9 @@ USE_DETOX="${DETOX_OVERRIDE:-$RP_USE_DETOX}"
 DETOX_FLAG=""; [ "$USE_DETOX" = "yes" ] || DETOX_FLAG="--no-detox"
 DEBUG_FLAG=""; [ "$DEBUG" -eq 1 ] && DEBUG_FLAG="--debug"
 DEMO_ART="${DEMO_ART_OVERRIDE:-$RP_DEMO_ART_ORDER}"
+AMIGA_NAMES="${AMIGA_NAMES_OVERRIDE:-$RP_AMIGA_NAMES}"   # yes unless turned off
+AMIGA_NAMES_MARK="$RP_STATE_DIR/amiga_names_last"       # when the clean-up last finished
+FINALISE_SHOWN=0     # set once the "[5/5] Finalise" heading has been printed
 RUN_TS="$(rp_timestamp)"
 WORK_ROOT="$RP_OUTPUT_ROOT/.retroplay_work"     # same drive as the output, so moves are instant
 STAGE_ROOT="$RP_STATE_DIR/stage"                # same drive as the archives, so staging can hardlink
@@ -426,10 +551,11 @@ finish() {
     esac
     # For the status view: the last run's result.
     rp_state_init
-    printf 'code=%s\ntime=%s\nresult=%s\nreport=reports/%s.txt\n' "$st" "$(rp_ts)" "$result" "$RUN_TS" \
+    printf 'code=%s\ntime=%s\nresult=%s\nreport=%s/%s.txt\n' "$st" "$(rp_ts)" "$result" "${REPORT_DIR##*/}" "$RUN_TS" \
         | rp_atomic_write "$RP_STATE_DIR/last_run"
     if [ "$st" -ne 2 ] || [ -s "$REPORT_TMP" ]; then
-        rp_step 5 "$TOTAL_STEPS" "Finalise - report, notifications, tidy-up"
+        # The names clean-up opens this phase itself when it runs.
+        [ "$FINALISE_SHOWN" -eq 1 ] || rp_step 5 "$TOTAL_STEPS" "Finalise - report, notifications, tidy-up"
         mkdir -p "$REPORT_DIR"
         {
             echo "Amiga Retroplay run report - $(date '+%Y-%m-%d %H:%M:%S')"
@@ -475,20 +601,20 @@ finish() {
         echo
         echo "======================== Summary ========================"
         cat "$REPORT_DIR/$RUN_TS.txt"
-        echo "(saved as reports/$RUN_TS.txt)"
-        # Keep the newest 60 reports. Report names are timestamps, so the
-        # shell's own glob order is the chronological one.
-        _rep_total="$(rp_count_matching "$REPORT_DIR/*.txt")"
-        if [ "$_rep_total" -gt 60 ]; then
-            _rep_n=0
-            for _rep in "$REPORT_DIR"/*.txt; do
-                [ -e "$_rep" ] || continue
-                _rep_n=$((_rep_n + 1))
-                [ "$_rep_n" -le $((_rep_total - 60)) ] || break
-                rm -f -- "$_rep" "${_rep%.txt}"_*
-            done
-        fi
-        unset _rep _rep_n _rep_total
+        echo "(saved as ${REPORT_DIR##*/}/$RUN_TS.txt)"
+        # Only the latest report is kept. Now that this run's is written, the
+        # earlier ones (and their no-artwork lists) go. Report names start
+        # with the run's timestamp, so anything not starting with this run's
+        # belongs to an older run. A run that writes no report - nothing to
+        # do - never gets here, so the previous report stays to be read.
+        for _rep in "$REPORT_DIR"/[0-9]*.txt; do
+            [ -f "$_rep" ] || continue
+            case "${_rep##*/}" in
+                "$RUN_TS"*) ;;
+                *) rm -f -- "$_rep" ;;
+            esac
+        done
+        unset _rep
     fi
     [ -n "${ARTWORK_NOTE:-}" ] && result="$result ($ARTWORK_NOTE)"
     body="$(cat "$REPORT_DIR/$RUN_TS.txt" 2>/dev/null)"
@@ -713,6 +839,223 @@ for i in "${!V_TOK[@]}"; do
     done
 done
 
+# ============================================================================
+# Amiga-safe names (the first job of the Finalise phase)
+# ============================================================================
+# Runs amiga_names.py - which ships beside these scripts and is used exactly
+# as it is - over what this suite built, so accented letters and the
+# characters # ? \ never reach the Amiga in a file or drawer name. (- and +
+# are legal there and are left alone.)
+#
+# Purpose:       python3 amiga_names.py --apply <folder>, for every collection
+#                (build/retro_*) and every dated batch (build/new_*/<date>).
+# Inputs:        AMIGA_NAMES (retroplay.conf; --amiga-names/--no-amiga-names
+#                override it for one run). The script is looked for beside
+#                these scripts, then in the main folder (for a scripts/ layout
+#                where it was left behind).
+# Outputs:       a progress bar; one line in the run report; the full list of
+#                changes in logs/amiga_names.log (only when something changed).
+# Side effects:  renames files and folders INSIDE those folders. Run while
+#                this run still holds the lock, so nothing else is working on
+#                a collection at the same time.
+#
+# Why per folder and not once over build/: amiga_names.py never renames the
+# folder it is given, only what is inside it. The dated batch folders are
+# named by the suite (2026-11-15_020000) and rp_prune_batches sorts them by
+# that name to decide which is oldest, so no clean-up rule - today's or a
+# later one - may ever get to rewrite them. Handing over each collection and
+# each batch separately cleans everything inside them and leaves the names
+# the suite itself relies on alone.
+#
+# A problem here never fails the run: the collections are already installed.
+# (Defined here, ahead of the build, because the "nothing to do" exit just
+# below can call it too.)
+# The three pieces below are shared by the clean-up itself and by --dry-run,
+# which shows what the clean-up would do without doing it.
+
+# amiga_names_find: where to look and what to run.
+# Outputs:  AN_TARGETS (folders), AN_PY (the script), AN_WHY (why not, if so).
+# Returns:  0 ready; 1 nothing to check; 2 cannot run (AN_WHY says why).
+AN_TARGETS=(); AN_PY=""; AN_WHY=""; AN_TOTAL=0; AN_PYFAIL=0
+amiga_names_find() {
+    local c t seen
+    AN_TARGETS=(); AN_PY=""; AN_WHY=""
+    for c in "$RP_BUILD_ROOT"/retro "$RP_BUILD_ROOT"/retro_* "$RP_BUILD_ROOT"/new_*/*; do
+        [ -d "$c" ] && [ ! -L "$c" ] && AN_TARGETS+=("$c")
+    done
+    # A collection built somewhere else with --dest belongs to this run too.
+    for c in ${V_DEST[@]+"${V_DEST[@]}"}; do
+        [ -d "$c" ] || continue
+        seen=0
+        for t in ${AN_TARGETS[@]+"${AN_TARGETS[@]}"}; do [ "$t" = "$c" ] && seen=1; done
+        [ "$seen" -eq 1 ] || AN_TARGETS+=("$c")
+    done
+    [ "${#AN_TARGETS[@]}" -gt 0 ] || return 1
+    for c in "$SCRIPT_DIR/amiga_names.py" "$RP_BASE_DIR/amiga_names.py"; do
+        [ -f "$c" ] && { AN_PY="$c"; break; }
+    done
+    if [ -z "$AN_PY" ]; then AN_WHY="amiga_names.py is missing from $SCRIPT_DIR"; return 2; fi
+    if ! command -v python3 >/dev/null 2>&1; then AN_WHY="python3 is not installed"; return 2; fi
+    return 0
+}
+
+# amiga_names_scan <plan file>: ask what WOULD change - amiga_names.py with
+# no --apply, which renames nothing. This is what gives the bar a real total,
+# and on most nights it is the only pass.
+# Outputs:  <plan>      "<count><TAB><folder>" for each folder with changes
+#           <plan>.list every PREVIEW/SKIP line, as amiga_names.py printed it
+#           <plan>.err  anything it wrote to stderr
+#           AN_TOTAL (names that would change), AN_PYFAIL (folders it failed on)
+amiga_names_scan() {
+    local plan="$1" t planned checked=0
+    AN_TOTAL=0; AN_PYFAIL=0
+    : > "$plan"; : > "$plan.err"; : > "$plan.list"
+    RP_PROGRESS_LAST=""
+    for t in "${AN_TARGETS[@]}"; do
+        if ! PYTHONIOENCODING=utf-8 python3 "$AN_PY" "$t" > "$plan.out" 2>> "$plan.err" < /dev/null; then
+            AN_PYFAIL=$((AN_PYFAIL + 1))
+        fi
+        grep -E '^(PREVIEW|SKIP)' "$plan.out" >> "$plan.list" 2>/dev/null
+        planned="$(grep -c -E '^(PREVIEW|SKIP)' "$plan.out" 2>/dev/null)"
+        case "$planned" in ''|*[!0-9]*) planned=0 ;; esac
+        if [ "$planned" -gt 0 ]; then
+            printf '%s\t%s\n' "$planned" "$t" >> "$plan"
+            AN_TOTAL=$((AN_TOTAL + planned))
+        fi
+        checked=$((checked + 1))
+        rp_progress "$checked" "${#AN_TARGETS[@]}" "Checking names"
+    done
+    rm -f "$plan.out"
+}
+
+# amiga_names_plan: the --dry-run view. Reads only; renames nothing.
+amiga_names_plan() {
+    local plan="$REPORT_TMP.names" planned t n=0 line
+    if [ "$AMIGA_NAMES" != "yes" ]; then
+        echo "Amiga-safe names: off (AMIGA_NAMES=no or --no-amiga-names) - no names would be changed."
+        return 0
+    fi
+    amiga_names_find
+    case "$?" in
+        1) echo "Amiga-safe names: nothing built yet, so nothing to check."; return 0 ;;
+        2) echo "Amiga-safe names: would be skipped - $AN_WHY."; return 0 ;;
+    esac
+    echo "Amiga-safe names - what the clean-up at the end of a run would change, as things stand:"
+    amiga_names_scan "$plan"
+    if [ "$AN_PYFAIL" -gt 0 ]; then
+        echo "  (could not check $AN_PYFAIL folder(s): $(tail -1 "$plan.err" 2>/dev/null))"
+    fi
+    if [ "$AN_TOTAL" -eq 0 ]; then
+        echo "  nothing - every name in ${#AN_TARGETS[@]} folder(s) is already Amiga-safe"
+    else
+        while IFS="$(printf '\t')" read -r planned t; do
+            [ -n "$t" ] && printf '  %-34s %s name(s)\n' "${t#"$RP_BUILD_ROOT"/}" "$planned"
+        done < "$plan"
+        echo "  For example:"
+        while IFS= read -r line; do
+            n=$((n + 1)); [ "$n" -le 8 ] || break
+            line="${line#PREVIEW: }"
+            printf '    %s\n' "${line/"$RP_BUILD_ROOT"\//}"
+        done < "$plan.list"
+        [ "$AN_TOTAL" -gt 8 ] && echo "    ...and $((AN_TOTAL - 8)) more"
+        echo "  (SKIP = the Amiga-safe name is already taken, so that one is left as it is.)"
+    fi
+    echo "  Games this run would add are checked when they arrive."
+    rm -f "$plan" "$plan.err" "$plan.list"
+    return 0
+}
+
+amiga_names_cleanup() {
+    local planned line t
+    local plan="$REPORT_TMP.names" log="$RP_LOG_ROOT/amiga_names.log"
+    local n=0 renamed=0 skipped=0 errors=0 t0=$SECONDS total pyfail
+    [ "$DRY_RUN" -eq 0 ] || return 0
+    if [ "$AMIGA_NAMES" != "yes" ]; then
+        rp_verbose "Amiga-safe names: off (AMIGA_NAMES=no or --no-amiga-names)"
+        return 0
+    fi
+    amiga_names_find
+    case "$?" in
+        1) return 0 ;;
+        2)
+            rp_step 5 "$TOTAL_STEPS" "Finalise - Amiga-safe names, report, notifications, tidy-up"
+            FINALISE_SHOWN=1
+            rp_warn "$AN_WHY - names were not checked (./doctor.sh explains the fix; AMIGA_NAMES=\"no\" turns this off)"
+            report "[Amiga names] skipped - $AN_WHY"
+            return 0 ;;
+    esac
+
+    rp_step 5 "$TOTAL_STEPS" "Finalise - Amiga-safe names, report, notifications, tidy-up"
+    FINALISE_SHOWN=1
+
+    rp_info "      checking names in ${#AN_TARGETS[@]} folder(s) under $RP_BUILD_ROOT"
+    amiga_names_scan "$plan"
+    total="$AN_TOTAL"; pyfail="$AN_PYFAIL"
+    if [ "$pyfail" -gt 0 ]; then
+        rp_warn "amiga_names.py could not check $pyfail of ${#AN_TARGETS[@]} folder(s): $(tail -1 "$plan.err" 2>/dev/null)"
+        report "[Amiga names] WARNING: $pyfail folder(s) could not be checked - $(tail -1 "$plan.err" 2>/dev/null)"
+    fi
+
+    if [ "$total" -eq 0 ]; then
+        rp_info "      every name is already Amiga-safe"
+        [ "$pyfail" -gt 0 ] || report "[Amiga names] checked ${#AN_TARGETS[@]} folder(s) - every name is already Amiga-safe"
+    else
+        # Pass 2: the same command with --apply. amiga_names.py prints one
+        # line per name it handles (RENAMED / SKIP / ERROR); each line moves
+        # the bar on one and goes into the log. -u so the lines arrive as
+        # they happen rather than in bursts.
+        mkdir -p "$RP_LOG_ROOT" 2>/dev/null
+        {
+            echo "Amiga-safe names - $(rp_ts)"
+            echo "Command: python3 $AN_PY --apply <folder>   (for each folder named below)"
+            echo
+        } > "$log"
+        RP_PROGRESS_LAST=""
+        while IFS="$(printf '\t')" read -r planned t; do
+            [ -n "$t" ] || continue
+            printf '== %s\n' "$t" >> "$log"
+            while IFS= read -r line; do
+                printf '%s\n' "$line" >> "$log"
+                case "$line" in
+                    RENAMED:*) renamed=$((renamed + 1)) ;;
+                    SKIP*)     skipped=$((skipped + 1)) ;;
+                    ERROR:*)   errors=$((errors + 1)) ;;
+                    *)         continue ;;                 # a traceback line, kept in the log
+                esac
+                n=$((n + 1))
+                if [ "$n" -le "$total" ] && { [ $((n % 25)) -eq 0 ] || [ "$n" -eq "$total" ]; }; then
+                    rp_progress "$n" "$total" "Amiga-safe names"
+                fi
+            done < <(PYTHONIOENCODING=utf-8 python3 -u "$AN_PY" --apply "$t" 2>&1 < /dev/null)
+        done < "$plan"
+        # Finish the bar's line if the count came up short of the plan.
+        [ "$n" -lt "$total" ] && rp_progress "$total" "$total" "Amiga-safe names"
+
+        line="$renamed renamed"
+        [ "$skipped" -gt 0 ] && line="$line, $skipped left as they were (the Amiga-safe name is already taken)"
+        [ "$errors" -gt 0 ] && line="$line, $errors could not be renamed"
+        rp_info "      $line - list: ${RP_LOG_ROOT##*/}/amiga_names.log"
+        report "[Amiga names] $line (list: ${RP_LOG_ROOT##*/}/amiga_names.log)"
+        if [ "$errors" -gt 0 ]; then
+            # Counted with the run's other errors, so the summary cannot say
+            # "No errors logged" after a name failed to change.
+            {
+                printf '===== amiga_names.log =====\n'
+                grep '^ERROR:' "$log"
+                printf '\n'
+            } >> "$RP_LOG_ROOT/retroerror.log"
+        fi
+    fi
+    rm -f "$plan" "$plan.err" "$plan.list"
+    if [ "$pyfail" -eq 0 ] && [ "$errors" -eq 0 ]; then
+        rp_state_init
+        rp_ts | rp_atomic_write "$AMIGA_NAMES_MARK"
+    fi
+    STAGE_TIMES="${STAGE_TIMES}amiga_names_seconds=$(( SECONDS - t0 ))
+"
+    return 0
+}
+
 any_work=0
 for i in "${!V_TOK[@]}"; do [ "${V_ACT[$i]}" != none ] && any_work=1; done
 
@@ -739,12 +1082,19 @@ if [ "$DRY_RUN" -eq 1 ]; then
         fi
     done
     echo
+    amiga_names_plan
+    echo
     echo "Dry run only - nothing was changed."
     exit 0
 fi
 
 if [ "$any_work" -eq 0 ]; then
     echo "Nothing new to process - every variant is up to date."
+    # Nothing was built, so there is nothing new to rename - except the first
+    # time: collections built before this clean-up existed (or while it was
+    # switched off) have never been through it. Once it has completed, quiet
+    # nights skip it again; it is a walk of every file in build/.
+    [ -f "$AMIGA_NAMES_MARK" ] || amiga_names_cleanup
     exit 2
 fi
 stage_end plan_seconds
@@ -1089,7 +1439,7 @@ if [ "${#FULL[@]}" -gt 0 ]; then
         fetch_missing_artwork "$i" "$miss"
         games="$(rp_count_games "$dest")"; nomiss="$(save_missing_list "$i" "$miss")"
         line="$key: full build - $games games${V_EXCL[$i]:+ (without ${V_EXCL[$i]} releases)}, $nomiss without artwork"
-        [ "$nomiss" -gt 0 ] && line="$line (list: reports/${RUN_TS}_${key}_no_artwork.txt)"
+        [ "$nomiss" -gt 0 ] && line="$line (list: ${REPORT_DIR##*/}/${RUN_TS}_${key}_no_artwork.txt)"
         report "$line"
     done
     rm -rf -- "$WORK_ROOT/common" "$WORK_ROOT"/extra_*
@@ -1276,7 +1626,7 @@ for g in ${G_SIG[@]+"${!G_SIG[@]}"}; do
             line="$key: PREVIEW - $bgames game(s) from $narch archive(s) put in ${V_NEW[$i]##*/}/$RUN_TS; $key itself was not changed and the archives stay queued"
         else
         line="$key: $bgames game(s) added/updated from $narch archive(s) - batch saved in ${V_NEW[$i]##*/}/$RUN_TS, $nomiss without artwork"
-        [ "$nomiss" -gt 0 ] && line="$line (list: reports/${RUN_TS}_${key}_no_artwork.txt)"
+        [ "$nomiss" -gt 0 ] && line="$line (list: ${REPORT_DIR##*/}/${RUN_TS}_${key}_no_artwork.txt)"
         [ "$nfailed" -gt 0 ] && line="$line; $nfailed archive(s) failed and stay queued"
         fi
         if [ "$PREVIEW_ONLY" -eq 1 ]; then
@@ -1331,6 +1681,13 @@ note_backup_space() {
     return 0
 }
 note_backup_space
+
+# Everything is installed: the build is over, and the Finalise phase starts
+# with the names clean-up. The build's time is closed off here so that the
+# report shows the two separately (finish() only times a build still running).
+stage_end build_seconds
+BUILD_TIMER_STARTED=0
+amiga_names_cleanup
 
 # All possible work is done; report extraction failures with exit 5.
 [ "$INTEGRITY_ISSUES" -eq 1 ] && exit "$RP_EXIT_INTEGRITY"

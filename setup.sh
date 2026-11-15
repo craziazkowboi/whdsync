@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.10.03.1   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.11.15.1   (every script in the set must carry the same stamp)
 # Remember where the user ran this from, before any cd: retroplay.conf is
 # looked for there first (see lib.sh).
 RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
 # Amiga Retroplay - one-step setup
 #
 # Installs everything the scripts need and sets them up, then runs doctor.sh.
+# It measures the drive you choose and suggests how many collections fit.
 # Safe to run again at any time: every step checks first and only does what's
 # missing. Anything it installs is recorded, so uninstall_deps.sh can remove
 # exactly that later (and never something you already had).
@@ -36,7 +37,7 @@ for a in "$@"; do
         --no-cron) CRON_CHOICE=no ;;
         --quiet|--verbose|--no-color|--no-colour|--color=*|--colour=*)
             rp_common_opt "$a" >/dev/null ;;
-        -h|--help) sed -n '4,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '6,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "Unknown option: $a (try --help)" >&2; exit 4 ;;
     esac
 done
@@ -99,12 +100,15 @@ fi
 # ------------------------------------------------------------------- 2. tools
 step "2. Tools"
 # command | apt package | brew package
+# (python3 is for the Amiga-safe names clean-up at the end of every build,
+# amiga_names.py - and for the optional artwork search.)
 TOOLS="wget|wget|wget
 lha|lhasa|lha
 7z|p7zip-full|p7zip
 unar|unar|unar
 unzip|unzip|unzip
 curl|curl|curl
+python3|python3|python3
 flock|util-linux|util-linux"
 want_pkgs=""
 while IFS='|' read -r cmd apt brew; do
@@ -124,6 +128,15 @@ if [ "$PM" = "brew" ]; then
         [ -x "$b" ] && "$b" -c '[ "${BASH_VERSINFO[0]}" -ge 4 ]' 2>/dev/null && bash4="$b"
     done
     if [ -n "$bash4" ]; then ok "bash 4+ for merge.sh ($bash4)"; else note "bash 4+ is missing (merge.sh needs it) - will install 'bash'"; want_pkgs="$want_pkgs bash"; fi
+fi
+
+# The names clean-up is a file of this suite, not a package: it only has to
+# be here. Looked for beside the scripts, then one folder up (scripts/ layout).
+if [ -f "$SCRIPT_DIR/amiga_names.py" ] || [ -f "$RP_BASE_DIR/amiga_names.py" ]; then
+    ok "amiga_names.py (Amiga-safe names, run at the end of each build)"
+else
+    note "amiga_names.py is not in $SCRIPT_DIR - builds still work, but names won't be made Amiga-safe."
+    note "  Copy it from the release, or set AMIGA_NAMES=\"no\" in retroplay.conf."
 fi
 
 install_pkgs() {   # installs the missing packages; records only ones that weren't installed before
@@ -292,13 +305,69 @@ fi
 step "5. Settings (retroplay.conf)"
 if [ -f "$RP_CONF_FILE" ]; then ok "retroplay.conf already exists - left as it is"
 else
-    # The default matches what all.sh builds with no settings at all. Each
-    # variant is a full collection of its own, so say what that costs before
-    # asking - on an SD card or a Pi Zero, three is the sensible start, and
-    # the laced ones can be added to VARIANTS later without redoing anything.
+    # Where first, then how much: the drive decides how many collections fit.
+    out="$(ask "Where should the collection go (a folder, e.g. a USB drive; '.' = here)" ".")"
+    if [ "$out" != "." ] && [ ! -d "$out" ]; then
+        note "$out doesn't exist - using this folder for now (change OUTPUT_ROOT in retroplay.conf later)"
+        out="."
+    fi
+    case "$out" in
+        .)  out_abs="$RP_BASE_DIR" ;;
+        /*) out_abs="$out" ;;
+        *)  out_abs="$RP_BASE_DIR/$out" ;;
+    esac
+
+    # ---- Size the first run ------------------------------------------------
+    # Each variant is a complete collection of its own, and a full build puts
+    # the new collection BESIDE the finished one before swapping it in, so the
+    # room needed is (collections + 1), plus the archives if they are still to
+    # be downloaded onto the same drive, plus the reserve MIN_FREE_MB keeps.
+    #
+    # Once archives are on disk they are measured (x SPACE_FACTOR, the same
+    # rule doctor.sh and all.sh use). On a first run there is nothing to
+    # measure, so two rough figures stand in. They are deliberately round and
+    # easy to change; the first real run prints the true sizes in its report.
+    SETUP_EST_COLLECTION_MB="${RP_SETUP_EST_COLLECTION_MB:-10000}"   # one finished collection
+    SETUP_EST_DOWNLOADS_MB="${RP_SETUP_EST_DOWNLOADS_MB:-6000}"      # the whole archive mirror
+    free_mb="${RP_SETUP_FREE_MB:-}"                                  # (set by the tests)
+    if [ -z "$free_mb" ]; then
+        free_kb="$(rp_free_kb "$out_abs")"
+        case "$free_kb" in ''|*[!0-9]*) free_mb="" ;; *) free_mb=$((free_kb / 1024)) ;; esac
+    fi
+    have_kb="$(rp_du_kb "$RP_DOWNLOAD_ROOT/HD_Loaders" "$RP_DOWNLOAD_ROOT/JST" "$RP_DOWNLOAD_ROOT/WHDLoad")"
+    if [ "${have_kb:-0}" -gt 1024 ]; then
+        coll_mb=$(( have_kb * RP_SPACE_FACTOR / 1024 )); dl_mb=0
+        size_basis="measured from the archives already downloaded"
+    else
+        coll_mb="$SETUP_EST_COLLECTION_MB"; dl_mb="$SETUP_EST_DOWNLOADS_MB"
+        size_basis="a rough figure - the first run reports the real sizes"
+        # Archives going to a different drive don't count against this one.
+        if [ "$(df -P "$out_abs" 2>/dev/null | awk 'NR==2 {print $1}')" != \
+             "$(df -P "$RP_BASE_DIR" 2>/dev/null | awk 'NR==2 {print $1}')" ]; then dl_mb=0; fi
+    fi
+    need_for() { echo $(( dl_mb + ($1 + 1) * coll_mb + RP_MIN_FREE_MB )); }
+    suggest="aga ecs rtg aga-laced ecs-laced"
+    if [ -n "$free_mb" ]; then
+        if   [ "$free_mb" -ge "$(need_for 5)" ]; then suggest="aga ecs rtg aga-laced ecs-laced"
+        elif [ "$free_mb" -ge "$(need_for 3)" ]; then suggest="aga ecs rtg"
+        else suggest="aga"; fi
+        note "Space on $out_abs: $(( free_mb / 1024 )) GB free. One collection is about $(( (coll_mb + 512) / 1024 )) GB ($size_basis)."
+        note "  Room needed, including the working copy a build keeps beside the old one:"
+        note "    one collection   about $(( ($(need_for 1) + 512) / 1024 )) GB        three   about $(( ($(need_for 3) + 512) / 1024 )) GB        all five   about $(( ($(need_for 5) + 512) / 1024 )) GB"
+        if [ "$free_mb" -lt "$(need_for 1)" ]; then
+            note "  Even one collection may not fit here. A bigger drive (a USB SSD is also far faster) is the fix;"
+            note "  setup carries on with one variant, and all.sh checks the space again before it builds."
+        elif [ "$suggest" != "aga ecs rtg aga-laced ecs-laced" ]; then
+            note "  Suggested for this drive: $suggest   (add more to VARIANTS later - nothing is redone)"
+        fi
+    fi
+    # Each variant is a full collection of its own, so say what that costs
+    # before asking. The answer offered is the largest set that fits the
+    # drive; with plenty of room that is all five, which is what all.sh
+    # builds with no settings at all.
     note "Each variant is a complete collection: five of them take about five times the"
     note "space and merge time of one. On a small card, answer: aga ecs rtg"
-    variants="$(ask "Which variants to build (aga ecs rtg aga-laced ecs-laced)" "aga ecs rtg aga-laced ecs-laced")"
+    variants="$(ask "Which variants to build (aga ecs rtg aga-laced ecs-laced)" "$suggest")"
     # Fetch the artwork packs the chosen variants use, and only those: a
     # laced collection built without its pack comes out identical to the
     # plain one, and a pack nobody builds from is a wasted download.
@@ -310,11 +379,6 @@ else
         esac
     done
     packs="${packs# }"; unset _v
-    out="$(ask "Where should the collection go (a folder, e.g. a USB drive; '.' = here)" ".")"
-    if [ "$out" != "." ] && [ ! -d "$out" ]; then
-        note "$out doesn't exist - using this folder for now (change OUTPUT_ROOT in retroplay.conf later)"
-        out="."
-    fi
     topic="$(ask "ntfy topic for failure notifications (blank = none)" "")"
     if [ "$DRY" -eq 1 ]; then echo "  + write retroplay.conf (VARIANTS=\"$variants\", ARTWORK_PACKS=\"$packs\", OUTPUT_ROOT=\"$out\")"
     else
@@ -392,7 +456,8 @@ finish_setup() {
     setup_note complete
     if [ "$TIDY_INTO_SCRIPTS" -eq 1 ]; then
         mkdir -p "$SCRIPT_DIR/scripts" || return 0
-        for f in "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR"/to_ilbm.py; do
+        # (every .py: to_ilbm.py and amiga_names.py both belong with the scripts)
+        for f in "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR"/*.py; do
             [ -f "$f" ] || continue
             mv "$f" "$SCRIPT_DIR/scripts/" 2>/dev/null
         done

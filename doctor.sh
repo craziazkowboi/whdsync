@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.10.03.1   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.11.15.1   (every script in the set must carry the same stamp)
 # Remember where the user ran this from, before any cd: retroplay.conf is
 # looked for there first (see lib.sh).
 RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
@@ -19,7 +19,7 @@ DOCTOR_ARGS=("$@")
 for _a in "$@"; do
     case "$_a" in
         -h|--help)
-            echo "Usage: doctor.sh [--color=MODE]"
+            echo "Usage: doctor.sh [--color=MODE] [--quiet|--verbose]"
             echo "Checks the setup and explains how to fix any problems. Changes nothing."
             echo "  --color=MODE   auto (default), always or never. NO_COLOR is honoured."
             echo "Exit status: 0 = no problems, 1 = problems found."
@@ -115,6 +115,32 @@ if [ "${RP_ARTWORK_FETCH:-no}" = "yes" ]; then
 else
     good "python3/Pillow not needed (ARTWORK_FETCH=no)"
 fi
+# The end-of-run names clean-up (all.sh, Finalise phase) needs python3 and
+# amiga_names.py. A run carries on without them - the clean-up is skipped and
+# says so - which is why these are warnings, not problems.
+if [ "${RP_AMIGA_NAMES:-yes}" = "yes" ]; then
+    _an_py=""
+    for _c in "$SCRIPT_DIR/amiga_names.py" "$RP_BASE_DIR/amiga_names.py"; do
+        [ -f "$_c" ] && { _an_py="$_c"; break; }
+    done
+    if [ -z "$_an_py" ]; then
+        warn "amiga_names.py is missing - the Amiga-safe names clean-up will be skipped" \
+             "Fix: copy amiga_names.py from the release into $SCRIPT_DIR  (or set AMIGA_NAMES=\"no\")"
+    elif ! command -v python3 >/dev/null 2>&1; then
+        warn "python3 is missing - the Amiga-safe names clean-up will be skipped" \
+             "$(install_hint python3 python3)  (or set AMIGA_NAMES=\"no\")"
+    elif ! python3 -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$_an_py" >/dev/null 2>&1; then
+        warn "amiga_names.py does not parse as Python - the names clean-up would fail" \
+             "Fix: copy a fresh amiga_names.py from the release into ${_an_py%/*}"
+    elif [ -s "$RP_STATE_DIR/amiga_names_last" ]; then
+        good "Amiga-safe names clean-up: python3 and amiga_names.py (last ran $(head -1 "$RP_STATE_DIR/amiga_names_last"))"
+    else
+        good "Amiga-safe names clean-up: python3 and amiga_names.py (runs at the end of the next build)"
+    fi
+    unset _an_py _c
+else
+    good "Amiga-safe names clean-up: off (AMIGA_NAMES=no)"
+fi
 if [ "$RP_USE_DETOX" = "yes" ]; then
     if command -v detox >/dev/null 2>&1; then good "detox ($(detox -V 2>&1 | head -1))"
     else prob "USE_DETOX=yes but detox is not installed" "$(install_hint detox 'detox (or build 3.0.1 from source - start.sh offers to)')"; fi
@@ -158,6 +184,7 @@ if [ -n "$RP_CONFIG_WARNINGS" ]; then
     while IFS= read -r w; do [ -n "$w" ] && warn "$w"; done <<< "$RP_CONFIG_WARNINGS"
 fi
 good "variants: $RP_VARIANTS   filesystem: $RP_FILESYSTEM   output folder: $RP_OUTPUT_ROOT"
+good "mirroring (MIRROR_DIRS): $(rp_mirror_dirs | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
 
 head_ "Artwork"
 found_sets=""
@@ -265,8 +292,13 @@ free_kb="$(rp_free_kb "$RP_OUTPUT_ROOT")"
 arch_kb="$(rp_du_kb "$RP_DOWNLOAD_ROOT/HD_Loaders" "$RP_DOWNLOAD_ROOT/JST" "$RP_DOWNLOAD_ROOT/WHDLoad")"
 if [ -n "$free_kb" ]; then
     good "$((free_kb / 1024)) MB free; downloads use $((arch_kb / 1024)) MB"
-    if [ "${RP_LOG_RETENTION_DAYS:-1}" -gt 0 ]; then good "logs are deleted after $RP_LOG_RETENTION_DAYS day(s) (LOG_RETENTION_DAYS)"
-    else good "logs are kept for ever (LOG_RETENTION_DAYS=0)"; fi
+    # Logs are no longer kept by age: every run clears logs/ and keeps only
+    # the latest log and report (LOG_RETENTION_DAYS is accepted but unused).
+    good "logs and the run report: only the most recent are kept, in ${RP_LOG_ROOT##*/}/"
+    # A hand-started run is copied to logs/last_run.log through `script`.
+    if [ "${RP_RUN_LOG:-yes}" != "yes" ]; then good "log of hand-started runs: off (RUN_LOG=no)"
+    elif command -v script >/dev/null 2>&1; then good "log of hand-started runs: ${RP_LOG_ROOT##*/}/last_run.log"
+    else warn "the 'script' command is missing - hand-started runs won't be copied to ${RP_LOG_ROOT##*/}/last_run.log" "$(install_hint util-linux bsdutils)"; fi
     need=$((arch_kb * RP_SPACE_FACTOR * 2 / 1024))
     if [ "$arch_kb" -gt 0 ] && [ $((free_kb / 1024)) -lt "$need" ]; then
         warn "a full rebuild may need about $need MB free" "Point OUTPUT_ROOT at a bigger drive (a USB SSD is also much faster than an SD card)"

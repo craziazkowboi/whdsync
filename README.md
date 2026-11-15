@@ -14,7 +14,7 @@ downloads/            →  extract  →  artwork  →  sort  →  build/retro_ag
 
 - **Runs on** a Raspberry Pi (including a Pi Zero 2 W) or a Mac. Linux and macOS, nothing else needed.
 - **Safe by design.** It never deletes a collection until its replacement is ready, never overwrites artwork you changed yourself, and stops rather than guessing.
-- **Tested.** 684 automated tests plus 231 option checks, run offline on every change. GitHub Actions runs them on Ubuntu and on macOS (bash 3.2), with ShellCheck.
+- **Tested.** 738 automated tests plus 239 option checks, run offline on every change. GitHub Actions runs them on Ubuntu and on macOS (bash 3.2), with ShellCheck.
 
 ---
 
@@ -26,6 +26,7 @@ downloads/            →  extract  →  artwork  →  sort  →  build/retro_ag
 - [Everyday use](#everyday-use)
 - [Where everything lives](#where-everything-lives)
 - [Artwork](#artwork)
+- [Amiga-safe names](#amiga-safe-names)
 - [The nightly run](#the-nightly-run)
 - [Settings](#settings)
 - [When something goes wrong](#when-something-goes-wrong)
@@ -41,9 +42,9 @@ downloads/            →  extract  →  artwork  →  sort  →  build/retro_ag
 | | |
 |---|---|
 | **A computer** | Raspberry Pi OS / Debian / Ubuntu, or macOS |
-| **Disk space** | Roughly 3× the size of the collection you want. A full set of three variants needs a few hundred GB — start with one variant if you're unsure |
+| **Disk space** | Each variant is a complete collection, and a build keeps a working copy beside the old one, so allow for one more collection than you build, plus the archives. `./setup.sh` measures your drive and tells you what fits — start with one variant if you're unsure |
 | **Time** | The first run downloads a lot. Leave it overnight |
-| **Tools** | `wget`, `lha`, `7z`, `unar`, `unlzx` — **the setup script installs all of these for you** |
+| **Tools** | `wget`, `lha`, `7z`, `unar`, `unlzx` — **the setup script installs all of these for you**. `python3` for the names clean-up (already on Raspberry Pi OS; on a Mac it comes with the Xcode command line tools) |
 
 On a Raspberry Pi, putting the collection on a **USB SSD** rather than the SD card makes an enormous difference to speed, and saves the card a lot of wear. Setup asks where you want it.
 
@@ -58,7 +59,7 @@ Download **`whdsync.zip`** — everything in one archive — save it wherever yo
 ```bash
 unzip whdsync.zip          # creates a whdsync/ folder
 cd whdsync
-chmod +x *.sh to_ilbm.py   # usually already set
+chmod +x *.sh *.py         # usually already set
 ```
 
 Prefer Git?
@@ -87,7 +88,7 @@ It will:
 1. install the tools it needs (`apt` on Linux, Homebrew on macOS);
 2. download and compile `unlzx`, which has no package anywhere (the source is 1990s C and leaves out the headers a modern compiler insists on — setup adds them, so it builds on a current Raspberry Pi OS and on macOS);
 3. add the two text encodings Linux needs for Amiga filenames;
-4. ask three questions — which machines you build for, where the collection should go, and whether you want failure notifications;
+4. ask three questions — where the collection should go, which machines you build for, and whether you want failure notifications. It measures the drive you choose first and suggests how many collections fit (all five, the three plain ones, or one), showing the room each choice needs;
 5. offer to set up the nightly update;
 6. finish by checking everything.
 
@@ -98,7 +99,7 @@ It's safe to run again at any time: every step checks first and only does what's
 ## Your first run
 
 ```bash
-./start.sh --plan      # optional: shows what WOULD happen, changes nothing
+./start.sh --plan      # optional: shows what WOULD happen (and which names would be cleaned); changes nothing
 ./all.sh               # the real thing
 ```
 
@@ -110,9 +111,11 @@ What to expect, in order:
 | `[2/5] Updates` | Fetches the artwork packs, then mirrors the Retroplay archives | minutes; **hours** on a first run |
 | `[3/5] Plan` | Works out what each collection needs | seconds |
 | `[4/5] Build` | Extracts, sorts, adds artwork and installs each collection | **hours** on a Pi |
-| `[5/5] Finalise` | Writes the report, sends notifications, tidies up | seconds |
+| `[5/5] Finalise` | Makes file and drawer names Amiga-safe, writes the report, sends notifications, tidies up | seconds; minutes the first time on a Pi |
 
-Each phase announces itself with the time, and long jobs show progress, so you can always tell it's working. A readable report is written to `reports/`, and a summary appears at the end, including how long extracting, sorting, the artwork merge and installing each took — the numbers to look at before changing any `JOBS` setting.
+Each phase announces itself with the time, and long jobs show progress, so you can always tell it's working. A readable report is written to `logs/`, and a summary appears at the end, including how long extracting, sorting, the artwork merge and installing each took — the numbers to look at before changing any `JOBS` setting.
+
+A run you start by hand at a terminal is also copied, as plain text, to `logs/last_run.log`, so you can read it back after it has scrolled away.
 
 **You can stop it at any time with Ctrl-C.** Nothing is left half-installed: an interrupted build is redone next time, and everything already downloaded is kept.
 
@@ -159,13 +162,14 @@ whdsync/
 │   ├── WHDLoad/  HD_Loaders/  JST/
 │   ├── artwork_archive/         downloaded artwork archives
 │   └── old/                     superseded archives, kept for a while
-├── logs/             deleted automatically after LOG_RETENTION_DAYS
+├── logs/             the latest log and run report — cleared on every run
 ├── .retroplay/       state: the queue, what's built, artwork manifests
 │                     (tidied at the start of every run - only essentials stay)
-├── reports/          one readable summary per run
 ├── retroplay.conf    your settings
 └── the scripts
 ```
+
+`logs/` only ever holds the most recent of each thing: the last run's report (`<date>.txt`, with its lists of games that have no artwork), `last_run.log` for the last run you started by hand, `all_cron.log` for the last nightly run, `update.log` for the last download pass, `retroerror.log` and `amiga_names.log` when the last run had something to put in them. There is no separate `reports/` folder any more — if you have one from an earlier version, the next run moves its newest report into `logs/` and removes it.
 
 `build/` can live on another drive — set `OUTPUT_ROOT` during setup or in `retroplay.conf`. The scripts can also be tidied into a `scripts/` subfolder if you prefer; everything else then sits alongside it.
 
@@ -258,12 +262,51 @@ Within each pack, sections are tried in `ART_ORDER` — `Screens,Covers,Titles` 
 
 ---
 
+## Amiga-safe names
+
+The last job of every run that changed something is a pass over what was built, so that no file or drawer reaches the Amiga with a name it handles badly. It runs `amiga_names.py`, which sits beside the scripts, as
+
+```bash
+python3 amiga_names.py --apply <folder>
+```
+
+for each collection (`build/retro_*`) and each dated batch (`build/new_*/<date>`) — wherever your `build/` folder is, including on another drive.
+
+`#` and `?` are AmigaDOS's pattern-matching wildcards and `\` is not a name character there, which is why those three go. `-` and `+` are ordinary, legal characters on the Amiga: WHDLoad slaves open their data files by name, so they are never touched.
+
+| In a name | Becomes |
+|---|---|
+| `ä ö ü ß` (and `Ä Ö Ü ẞ`) | `ae oe ue ss` |
+| `æ œ ø ł` | `ae oe o l` |
+| any other accented letter (`é`, `ñ`, `ç` …) | the plain letter |
+| `#` `?` `\` | `_` |
+| `-` `+` and everything else | left exactly as it is |
+
+- **It shows its progress** with the same bar as every other stage: first checking each folder, then one step per name changed. On most nights there is nothing to change and it stops after the check.
+- **What it changed is recorded.** The run report gets one line (`[Amiga names] 12 renamed`), and every rename is listed in `logs/amiga_names.log`.
+- **Nothing is overwritten.** If the Amiga-safe name is already taken, the file is left as it is and listed as `SKIP`.
+- **It never fails a run.** If `python3` or `amiga_names.py` is missing, the run says so and carries on.
+- **A quiet night skips it.** When nothing was built there is nothing new to rename — except the first time, so collections you built before this existed are cleaned on the very next run.
+- **The folders the tool names itself are left alone** (`retro_aga`, the batch dates): only what is inside them is renamed.
+
+Turn it off for one run with `--no-amiga-names`, or for good with `AMIGA_NAMES="no"` in `retroplay.conf`; `--amiga-names` turns it back on for one run.
+
+To see what it would do without changing anything, ask for the plan — it lists how many names in each collection would change, with examples:
+
+```bash
+./start.sh --plan
+```
+
+or run the script yourself without `--apply`: `python3 amiga_names.py build/retro_aga`. `./start.sh --status` shows when the names were last checked, and `./doctor.sh` checks that `python3` and `amiga_names.py` are both there.
+
+---
+
 ## Staying up to date
 
 Once a day, a run will tell you if a newer release exists:
 
 ```
- A newer release is available: 0.6   (you are running 0.5)
+ A newer release is available: 0.7   (you are running 0.6)
  Nothing has been downloaded - have a look and decide yourself:
    https://github.com/craziazkowboi/whdsync/releases
 ```
@@ -285,7 +328,7 @@ The nightly run is silent unless something needs you. To hear about failures, se
 ./start.sh --test-notify
 ```
 
-Output from each night goes to `logs/all_cron.log`, and a summary to `reports/`. To include artwork updates in the nightly run, set `ARTWORK_SYNC="auto"`.
+Output from the latest night goes to `logs/all_cron.log`, and its summary to `logs/<date>.txt`; each run replaces the previous ones. Artwork updates are part of the nightly run by default (`ARTWORK_SYNC="auto"`); set it to `ask` to fetch artwork by hand only.
 
 ---
 
@@ -293,7 +336,7 @@ Output from each night goes to `logs/all_cron.log`, and a summary to `reports/`.
 
 Settings live in `retroplay.conf`, looked for in this order: **the folder you ran the script from**, then the folder the scripts are in, then the folder above it (so it works whether the scripts sit in `scripts/` or not). With none, the built-in defaults are used and every run says so. `./start.sh --status` shows which file is in force.
 
-**Artwork order.** The default is `Screens,Covers,Titles`. RTG uses `Covers,Screens,Titles` (set by `ART_ORDER_RTG`), because covers read better on an RTG display. Any variant can be overridden with `ART_ORDER_<VARIANT>`, and `--art` overrides everything for one run. Copy `retroplay.conf.example` if you don't have one; every setting is commented there. The ones people change most:
+**Artwork order.** The default is `Screens,Covers,Titles`. RTG uses `Covers,Screens,Titles` (set by `ART_ORDER_RTG`), because covers read better on an RTG display. Any variant can be overridden with `ART_ORDER_<VARIANT>`, and `--art` overrides everything for one run. Copy `retroplay.conf.example` if you don't have one; every setting is commented there, and the values in it are the built-in defaults. The ones people change most:
 
 | Setting | Default | What it does |
 |---|---|---|
@@ -303,16 +346,20 @@ Settings live in `retroplay.conf`, looked for in this order: **the folder you ra
 | `ART_ORDER` | `Screens,Covers,Titles` | Which artwork iGame shows first |
 | `ART_ORDER_RTG` | `Covers,Screens,Titles` | Overrides the order for RTG (`ART_ORDER_<VARIANT>` works for any variant) |
 | `FILESYSTEM` | `pfs` | Use `ffs` for the 30-character filename limit. With `pfs`, every run ends with a reminder to run `setfnsize <drive:> 107` on the Amiga first |
-| `ARTWORK_SYNC` | `ask` | `auto` also updates artwork in the nightly run |
-| `LOG_RETENTION_DAYS` | `1` | Delete logs after this many days; `0` keeps them for ever |
+| `ARTWORK_SYNC` | `auto` | Artwork is kept up to date as part of a run. `ask` = only when you run `--artwork-sync`; `no` = never |
+| `AMIGA_NAMES` | `yes` | Make file and drawer names Amiga-safe at the end of a run (see [Amiga-safe names](#amiga-safe-names)). `no` turns it off |
 | `UPDATE_CHECK` | `yes` | Say when a newer release exists (reads a version number only) |
 | `PROGRESS_STYLE` | `auto` | `auto` = blocks on macOS, ASCII on Linux/A314; or `smooth`/`ascii` |
 | `ARTWORK_KEEP_BACKUPS` | `2` | Previous artwork versions kept for rollback |
 | `STATE_BACKUP` | `no` | Keep rolling copies of the state folder (queue and markers only) |
 | `JOBS` | `auto` | How many things to do at once. `auto` is what each stage works out from the CPU count and the memory; `EXTRACT_JOBS`, `MERGE_JOBS` and `SORT_JOBS` set one stage, and `--jobs N` overrides them all for one run |
+| `MIRROR_DIRS` | `HD_Loaders/Games, JST/Games, WHDLoad/Magazines, WHDLoad/Demos, WHDLoad/Games` | Which Retroplay folders are mirrored, comma separated. Each must be under `WHDLoad/`, `HD_Loaders/` or `JST/`. Add `WHDLoad/Games/Beta & Unreleased` for the betas |
+| `RUN_LOG` | `yes` | Copy a run started by hand at a terminal to `logs/last_run.log` |
 | `NTFY_TOPIC` | *(empty)* | Get told when a run fails |
 
 See what's in force with `./start.sh --status`, and the full list in `retroplay.conf.example`.
+
+`LOG_RETENTION_DAYS`, `LOG_MAX_MB` and `LOG_KEEP` from earlier versions are still accepted, so an older `retroplay.conf` keeps working, but they no longer do anything: `logs/` is cleared on every run instead.
 
 ---
 
@@ -332,6 +379,7 @@ It checks the whole setup and, for anything wrong, tells you the command that fi
 | "some archives couldn't be extracted" (exit 5) | A damaged download. Everything else was installed; it retries by itself, and after three attempts fetches a fresh copy |
 | "network or server problem" (exit 3) | The server was unreachable. It tries again next run |
 | "scripts are not from the same version" | Some files weren't updated. Copy the whole set across |
+| "no UTF-8 locale is installed" / "no ISO-8859-1 locale is installed" | A warning, not a stop: the run carries on, and a few old archives may extract with odd names. `./setup.sh` adds the locales. Any of `en_GB`, `en_AU`, `en_US` or `C.UTF-8` will do |
 | A game has no artwork | Ask why: `./merge.sh --why SuperSkidmarks -d build/retro_aga`. It lists every set and section it looked in, and anything in `artwork/` with a similar name |
 
 **Ask it why:**
@@ -373,7 +421,7 @@ lock whose run is still alive or which was taken on another machine.
 
 **Exit codes**, if you script around it: `0` done, `2` nothing to do, `3` network, `4` setup problem, `5` some archives failed, `130` interrupted.
 
-Logs are in `logs/`, the last run's summary in `reports/`.
+The last run's logs and its summary are both in `logs/`. They are replaced by the next run, so copy anything you want to keep (or make a `--support-bundle`, which is never cleared).
 
 ---
 
@@ -392,6 +440,8 @@ Logs are in `logs/`, the last run's summary in `reports/`.
 ./uninstall_deps.sh              # do it
 ```
 
+It works from the list of what was installed, kept in the main folder (`.retroplay_installed_deps.log`), and finds it whether the scripts sit there or in `scripts/`.
+
 **Remove everything:** disable the schedule, run `./uninstall_deps.sh`, then delete the folder. Your collections are just files in `build/` — copy them somewhere first if you want to keep them.
 
 ---
@@ -407,7 +457,7 @@ Every one of these has an automated test that fails if the protection is removed
 - **Artwork you changed is never overwritten**, and the previous version is kept so an update can be rolled back.
 - **Two runs can't overlap**, and a refused run says which one holds the lock.
 - **Your queue of pending downloads is backed up** every run, and restored if it's ever lost.
-- **Filenames are made Amiga-safe** (PFS or FFS limits) before anything reaches your Amiga.
+- **Filenames are made Amiga-safe** (PFS or FFS limits, and no accented letters or `# ? \`) before anything reaches your Amiga.
 
 ---
 
@@ -439,17 +489,19 @@ Every script takes `-h` / `--help`. Options are case-insensitive where a variant
 | `--skip-update` | Don't check the server |
 | `--force` | Also fill in artwork for games that have none |
 | `--refresh-artwork` | Rewrite artwork for **every** game, not just gaps |
-| `--dry-run` / `--plan` | Show what would happen; change nothing |
+| `--no-amiga-names` / `--amiga-names` | Skip (or force) the Amiga-safe names clean-up for this run; `AMIGA_NAMES` sets the default |
+| `--dry-run` / `--plan` | Show what would happen, including which names the clean-up would change; change nothing |
 | `--dest DIR` | Build into this folder (single variant only) |
 | `--art LIST` / `--demo-art LIST` | Artwork order, e.g. `Covers,Screens,Titles` |
 | `--ffs` / `--pfs` | Filename limits to enforce |
 | `--detox` / `--no-detox` | Clean filenames with detox, or don't |
 | `--status` | Last run, what's queued, drive, schedule |
 | `--test-notify` | Send a test notification |
-| `--cron` | Unattended mode: full `PATH`, own log, no prompts |
+| `--cron` | Unattended mode: full `PATH`, own log (`logs/all_cron.log`, latest run only), no prompts |
 | `--preview-new` | Build the dated folder of just the new games; leave the collection alone |
 | `--jobs N` | How many things to do at once (overrides `JOBS` in the config) |
 | `--quiet` / `--verbose` / `--debug` | How much to print |
+| `--version` | Print the version and exit |
 | `--color=auto\|always\|never` | Colour, regardless of whether output is a terminal. `NO_COLOR` or `NOCOLOR` set to anything turns colour off; an explicit `--color=always` still wins, as the [no-color.org](https://no-color.org) convention says |
 
 ### `start.sh` — the front end
@@ -459,7 +511,7 @@ Accepts the variant and formatting options above, plus:
 | Option | Meaning |
 |---|---|
 | `--sync` (or `--auto`) | Update and build |
-| `--plan` | Show what a run would do |
+| `--plan` | Show what a run would do, including the names plan |
 | `--update` `--extract` `--merge` `--sort` `--quick` | Run one stage only |
 | `--rebuild` | Rebuild from downloaded archives |
 | `--status` | Full status |
@@ -468,6 +520,7 @@ Accepts the variant and formatting options above, plus:
 | `--schedule [options]` | Set up, show or remove the nightly run |
 | `--doctor` | Check the setup |
 | `--artwork-status` `--artwork-plan` `--artwork-sync` `--artwork-verify` `--artwork-rollback NAME` | Artwork (see below) |
+| `--no-amiga-names` / `--amiga-names` | Skip (or force) the Amiga-safe names clean-up for this run |
 | `--only-missing` | Merge only games with no artwork |
 | `--refresh-artwork` | Rewrite artwork for every game |
 | `--report-missing FILE` | Write the no-artwork list to a file |
@@ -510,7 +563,7 @@ Run these directly only if you want one job done. Each works out which collectio
 | `merge.sh` | variant options, `-d DIR`, `--art LIST`, `--demo-art LIST`, `--only-missing`, `--refresh-artwork`, `--report-missing FILE`, `--why NAME`, `--a314`, `--custom`, `--debug` |
 | `sort.sh` | `-d DIR`, `--ffs`, `--pfs`, `--skipchk`, `--skip-variant-sort`, `--detox`/`--no-detox`, `--custom` |
 | `extract.sh` | `-d DIR`, `-u` (unattended), `--exclude-tags LIST`, `--only-tags LIST`, `--jobs N`, `--debug` |
-| `update.sh` | `--dry-run` |
+| `update.sh` | `--dry-run` (the folders it mirrors are `MIRROR_DIRS` in `retroplay.conf`; `--help` lists them) |
 | `quick.sh` | **deprecated** — it now runs `./start.sh --preview-new` and passes your options through. It will be removed in a later release |
 
 `merge.sh`, `sort.sh` and `extract.sh` also take `--jobs N`. Run by hand, each
@@ -522,10 +575,10 @@ takes the same lock a build does, so they cannot clash with a nightly run.
 
 | Command | Options |
 |---|---|
-| `setup.sh` | `--yes`, `--dry-run`, `--cron`, `--no-cron` |
+| `setup.sh` | `--yes`, `--dry-run`, `--cron`, `--no-cron` (with `--yes` it takes the number of collections that fits the drive) |
 | `install_cron.sh` (`start.sh --schedule`) | `--time HH:MM`, `--daily`, `--show`, `--disable`, `--dry-run`, `--yes` |
 | `uninstall_deps.sh` | `--dry-run`, `--yes` |
-| `doctor.sh` | *(no options)* |
+| `doctor.sh` | `--color=MODE` |
 
 ### Exit codes
 
@@ -543,7 +596,7 @@ Both run offline against mock tools and a mock server, so a full run takes minut
 
 Released as `whdsync.zip` (unpack and run `./setup.sh`) and `whdsync.bundle` (a complete Git repository in one file: `git clone whdsync.bundle whdsync`).
 
-The layout: `all.sh` is the engine; `start.sh` is the front end; `update.sh`, `extract.sh`, `merge.sh`, `sort.sh` and `artwork_sync.sh` each do one job; `lib.sh` holds everything shared. All scripts carry a version stamp and refuse to run as a mixed set.
+The layout: `all.sh` is the engine; `start.sh` is the front end; `update.sh`, `extract.sh`, `merge.sh`, `sort.sh` and `artwork_sync.sh` each do one job; `amiga_names.py` is the end-of-run names clean-up, called by `all.sh`; `lib.sh` holds everything shared. All scripts carry a version stamp and refuse to run as a mixed set.
 
 Contributions welcome — please keep the tests passing, add one for whatever you change, and stick to bash 3.2 (macOS ships it) outside `merge.sh`.
 

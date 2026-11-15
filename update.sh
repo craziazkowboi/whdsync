@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.10.03.1   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.11.15.1   (every script in the set must carry the same stamp)
 # Remember where the user ran this from, before any cd: retroplay.conf is
 # looked for there first (see lib.sh).
 RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
@@ -77,7 +77,11 @@ while [ $# -gt 0 ]; do
             echo "  --color=MODE    auto (default), always or never. NO_COLOR is honoured."
             echo "  -h, --help      Show this help and exit."
             echo
-            echo "Exit codes: 0 = new files, 2 = nothing new, 3 = server/network error."
+            echo "  The folders mirrored are MIRROR_DIRS in retroplay.conf; currently:"
+            rp_mirror_dirs | sed 's/^/      /'
+            echo
+            echo "Exit codes: 0 = new files, 2 = nothing new, 3 = server/network error,"
+            echo "            4 = setup or option problem."
             exit 0 ;;
         *)
             rp_common_opt "$1" "${2-}"; _co=$?
@@ -147,14 +151,22 @@ if [ -n "$missing_art" ]; then
     echo
 fi
 
-dirs=(
-    "HD_Loaders/Games"
-    "JST/Games"
-    # "WHDLoad/Games/Beta & Unreleased"
-    "WHDLoad/Magazines"
-    "WHDLoad/Demos"
-    "WHDLoad/Games"
-)
+# Which server folders are mirrored comes from MIRROR_DIRS in retroplay.conf
+# (it used to be a list written into this script, with one entry commented
+# out for anyone who wanted it). rp_mirror_dirs has already dropped anything
+# that is not a folder under WHDLoad/, HD_Loaders/ or JST/, and lib.sh falls
+# back to the default list rather than mirroring nothing.
+dirs=()
+while IFS= read -r _md; do
+    [ -n "$_md" ] && dirs+=("$_md")
+done << MIRROR_EOF
+$(rp_mirror_dirs)
+MIRROR_EOF
+unset _md
+if [ "${#dirs[@]}" -eq 0 ]; then
+    echo "ERROR: MIRROR_DIRS in retroplay.conf names no folder to mirror." >&2
+    exit 4
+fi
 # Remote name for a local directory: "WHDLoad/Games" is published as
 # "Commodore_Amiga_-_WHDLoad_-_Games" (spaces to underscores, "/" to "_-_").
 remote_dir_for() {

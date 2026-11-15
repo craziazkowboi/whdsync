@@ -7,7 +7,10 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 T="$(mktemp -d "${TMPDIR:-/tmp}/rp_matrix.XXXXXX")"; if [ -n "${MATRIX_KEEP:-}" ]; then trap 'echo "KEPT $T"' EXIT; else trap 'rm -rf "$T"' EXIT; fi
 ROOT="$T/r"; SERVER="$T/server"; MOCK="$T/mock"; mkdir -p "$ROOT" "$SERVER" "$MOCK" "$T/tmp"
 export TMPDIR="$T/tmp"
-cp "$REPO"/*.sh "$REPO"/retroplay.conf.example "$ROOT"/; chmod +x "$ROOT"/*.sh
+cp "$REPO"/*.sh "$REPO"/*.py "$REPO"/retroplay.conf.example "$ROOT"/; chmod +x "$ROOT"/*.sh
+# These runs use hand-made artwork fixtures; the shipped default (auto) would
+# replace them from the mock source on the first run.
+printf 'ARTWORK_SYNC="ask"\n' > "$ROOT/retroplay.conf"
 cat > "$MOCK/lha" << 'M'
 #!/usr/bin/env bash
 arc=""; for a in "$@"; do case "$a" in *.lha|*.lzx|*.zip) arc="$a";; esac; done
@@ -115,6 +118,11 @@ tt "1|4" "all.sh --dest with two variants" ./all.sh --aga --ecs --dest x
 tt "0" "all.sh --rebuild --art/--demo-art" ./all.sh --rebuild --rtg --art Screens,Titles,Covers --demo-art Covers,Titles,Screens
 tt "0|2" "all.sh --cron --skip-update" ./all.sh --cron --skip-update
 tt "0" "all.sh --AGA --REBUILD (case)" ./all.sh --AGA --REBUILD
+tt "0|2" "all.sh --no-amiga-names" ./all.sh --aga --skip-update --force --no-amiga-names
+tt "0|2" "all.sh --amiga-names" ./all.sh --aga --skip-update --force --amiga-names
+tt "0|2" "all.sh --plan" ./all.sh --plan --skip-update
+tt "0|2" "all.sh --preview-new --jobs 1" ./all.sh --aga --preview-new --jobs 1
+tt "1|4" "all.sh --jobs (no value)" ./all.sh --jobs
 fi
 if sec 4; then
 echo "== start.sh actions and menu"
@@ -145,6 +153,9 @@ tt "1|4" "artwork_sync.sh --rollback (no value)" ./artwork_sync.sh --rollback
 tt "1|4" "artwork_fetch.sh --list (no value)" ./artwork_fetch.sh --list
 tt "1|2|4" "artwork_fetch.sh with no options" ./artwork_fetch.sh
 tt "0|2" "start.sh --plan" ./start.sh --plan
+tt "0|2" "start.sh --sync --no-amiga-names" ./start.sh --sync --aga --skip-update --no-amiga-names
+tt "0|2" "start.sh --sync --amiga-names" ./start.sh --sync --aga --skip-update --amiga-names
+tt "0" "start.sh --help advanced" ./start.sh --help advanced
 tt "0|2" "start.sh --sync --skip-update" ./start.sh --sync --skip-update
 tt "0" "setup.sh --dry-run --no-cron" ./setup.sh --dry-run --no-cron
 tt "0|1" "start.sh --doctor" ./start.sh --doctor

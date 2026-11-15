@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.10.03.1   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.11.15.1   (every script in the set must carry the same stamp)
 # Remember where the user ran this from, before any cd: retroplay.conf is
 # looked for there first (see lib.sh).
 RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
@@ -7,6 +7,7 @@ RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
 # Purpose: The front end: a menu, and one place to reach every command.
 #   Options: --sync/--auto --plan --update --extract --merge --sort --quick
 #            --rebuild --status --test-notify --doctor --setup --schedule
+#            --no-amiga-names (skip the Amiga-safe names clean-up for one run)
 #            --artwork-status/-plan/-sync/-verify/-rollback  (see artwork_sync.sh)
 #            plus the variant and formatting options passed through to all.sh
 # Run 'start.sh --help' for the authoritative, current list.
@@ -72,7 +73,8 @@ show_usage_and_exit() {
   echo "Everyday"
   echo "  (no options)          Menu."
   echo "  --sync                Update and build.  (--auto is the old name.)"
-  echo "  --plan                Show what a sync would do; changes nothing."
+  echo "  --plan                Show what a sync would do (and which names the"
+  echo "                        clean-up would change); changes nothing."
   echo "  --status              Last run, each collection, the drive, the schedule."
   echo "  --doctor              Check the setup and explain how to fix problems."
   echo "  --setup               First-time setup."
@@ -82,6 +84,8 @@ show_usage_and_exit() {
   echo "  --aga --ecs --rtg --aga-laced --ecs-laced --set NAME"
   echo "  --dest PATH           Build somewhere other than the configured folder."
   echo "  --ffs --pfs           Amiga filename limits (PFS is the default)."
+  echo "  --no-amiga-names      Skip the Amiga-safe names clean-up at the end of this run"
+  echo "                        (on by default; AMIGA_NAMES in retroplay.conf)."
   echo
   echo "Artwork"
   echo "  --artwork-status --artwork-plan --artwork-sync --artwork-verify"
@@ -103,15 +107,26 @@ show_usage_and_exit() {
   echo "  --rebuild --clean --skip-update --force --preview-new"
   echo "  --extract --merge --sort     One stage only, outside the queue."
   echo "  --art LIST --demo-art LIST --report-missing FILE"
-  echo "  --skipchk --skip-variant-sort --detox --no-detox"
+  echo "  --skipchk --skip-variant-sort --detox --no-detox --amiga-names"
   echo "  --install-missing-tools --check-update --test-notify"
   echo "  --quiet --verbose --debug --color=auto|always|never --version"
   echo
   echo "  $(basename "$0") --help advanced      what each advanced option does"
   echo
+  echo "Logs and the run report are in logs/ (last_run.log is the last run you"
+  echo "started by hand). Only the most recent of each is kept."
+  echo
   if [ "${1:-}" = "advanced" ]; then
       echo "Advanced options in full"
       echo "  --auto                Same as --sync (the older name)."
+      echo "  --aga --ecs --rtg     Work on retro_aga / retro_ecs / retro_rtg."
+      echo "  --aga-laced           Work on retro_aga_laced (the laced AGA artwork)."
+      echo "  --ecs-laced           Work on retro_ecs_laced (the laced ECS artwork)."
+      echo "                        On their own these pick the collection and the menu"
+      echo "                        decides what to do; add --sync to build, or"
+      echo "                        --refresh-artwork to redo its artwork now."
+      echo "  --set NAME            Use the iGame_NAME artwork folder as the variant."
+      echo "  --jobs N              How many things to do at once, for this run."
       echo "  --update              Only download new archives."
       echo "  --extract             Only extract; does not queue or install."
       echo "  --merge               Only add artwork to a folder (--dest)."
@@ -130,6 +145,13 @@ show_usage_and_exit() {
       echo "  --skip-variant-sort   Skip moving games into CD32/AGA/NTSC/MT32/CDTV"
       echo "                        and language folders."
       echo "  --detox / --no-detox  Force the detox pre-clean on or off."
+      echo "  --amiga-names / --no-amiga-names"
+      echo "                        Force the end-of-run names clean-up on or off for this"
+      echo "                        run. It runs amiga_names.py over the collections and"
+      echo "                        dated batches in build/, replacing accented letters and"
+      echo "                        the characters # ? \\ in file and drawer names (- and +"
+      echo "                        are legal on the Amiga and are left alone)."
+      echo "                        What it changed is listed in logs/amiga_names.log."
       echo "  --install-missing-tools  Install missing archive tools now."
       echo "  --check-update        Ask GitHub whether a newer release exists."
       echo "                        It only reports; it never downloads or runs anything."
@@ -140,6 +162,9 @@ show_usage_and_exit() {
       echo "  --color=MODE          auto (default), always, or never."
       echo "  --version             Print the version and exit."
       echo "  --exit                Exit immediately."
+      echo
+      echo "Exit codes: 0 done, 2 nothing to do, 3 network or server problem,"
+      echo "            4 setup or option problem, 5 some archives failed, 130 interrupted."
       echo
       echo "Options are case-insensitive: --AGA and --aga both work."
       echo
@@ -208,6 +233,7 @@ JOBS_OPT=""          # --jobs N: how many things to do at once
 FORCE_OPT=0          # --force: also run the artwork gap-fill on up-to-date variants
 REPORT_MISSING_OPT=""  # --report-missing FILE (passed to merge.sh)
 DETOX_EXPLICIT=""    # "yes"/"no" when --detox/--no-detox was given
+AMIGA_NAMES_EXPLICIT=""  # "yes"/"no" when --amiga-names/--no-amiga-names was given
 DELEGATED_AUTO=0
 AUTO_EXIT=0
 NOTHING_NEW_FALLBACK=0
@@ -500,66 +526,11 @@ while [ $# -gt 0 ]; do
   opt_lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
   case "$opt_lc" in
     -h|--help)
-      echo
-      echo "Amiga Retroplay Archive Minimal CLI Dispatcher"
-      echo "Version: ${RP_SUITE_VERSION}"
-      echo
-      echo "Usage: $(basename "$0") [options]"
-      echo
-      echo "Options (case-insensitive - --AGA and --aga both work):"
-      echo "  -h, --help            Show this help and exit."
-      echo "  --auto                Run full automation: update, extract, merge, sort."
-      echo "  --update              Only update archives."
-      echo "  --extract             Only extract archives."
-      echo "  --merge               Only merge artwork."
-      echo "  --sort                Only sort languages."
-      echo "  --quick               Old name for --preview-new: build the dated batch"
-      echo "                        of new games and leave the collection alone."
-      echo "  --ecs                 Work on retro_ecs."
-      echo "  --aga                 Work on retro_aga."
-      echo "  --rtg                 Work on retro_rtg."
-      echo "  --ecs-laced           Work on retro_ecs_laced (iGame_ECS_Laced artwork)."
-      echo "  --aga-laced           Work on retro_aga_laced (iGame_AGA_Laced artwork)."
-      echo "                        On their own these pick the collection and the menu"
-      echo "                        decides what to do; add --sync to build, or"
-      echo "                        --refresh-artwork to redo its artwork now."
-      echo "  --set [name]          Run merge.sh with --set NAME (any iGame_NAME directory)."
-      echo "  --ffs                 Run sort.sh with --ffs (FFS filename limits)."
-      echo "  --pfs                 Run sort.sh with --pfs (PFS filename limits, default)."
-      echo "  --dest [path]         Set custom destination directory."
-      echo "  --art [order]         Set merge priority order for non-demos (e.g., Screens,Covers,Titles)."
-      echo "  --demo-art [order]    Set merge priority order for demos (e.g., Titles,Screens,Covers)."
-      echo "  --no-detox            Skip detox entirely - the startup dependency check and"
-      echo "                        the pre-clean step in sort.sh."
-      echo "  --skipchk             Run sort.sh with --skipchk (skip the Amiga filesystem"
-      echo "                        compliance check entirely)."
-      echo "  --skip-variant-sort   Run sort.sh with --skip-variant-sort (skip moving games"
-      echo "                        into CD32/AGA/NTSC/MT32/CDTV and language subfolders -"
-      echo "                        for when that reorganization was already done earlier"
-      echo "                        on a shared base tree)."
-      echo "  --rebuild             Rebuild from the archives already downloaded, without"
-      echo "                        checking for updates (with --auto's variant options)."
-      echo "  --clean               With --auto: check for updates, then rebuild from scratch."
-      echo "  --skip-update         With --auto: don't download; process what's already queued."
-      echo "  --force               With --auto: also fill in missing artwork when up to date."
-      echo "  --detox               Use detox even if retroplay.conf says USE_DETOX=no."
-      echo "  --report-missing FILE With --merge: list games that got no artwork in FILE."
-      echo "  --sync                Update and build (same as --auto)."
-      echo "  --plan                Show what a sync would do; changes nothing."
-      echo "  --setup               Run the setup helper."
-      echo "  --schedule [options]  Set up the nightly run (see install_cron.sh --help)."
-      echo "  --artwork-status      What artwork is installed and whether it's current."
-      echo "  --artwork-plan        What an artwork update would do; changes nothing."
-      echo "  --artwork-sync        Download and install newer artwork packs safely."
-      echo "  --artwork-verify      Check installed artwork (read-only)."
-      echo "  --artwork-rollback N  Put back the previous version of pack N."
-      echo "  --doctor              Check the setup and explain how to fix any problems."
-      echo "  --status              Show the last run, each variant's state, drive and schedule."
-      echo "  --test-notify         Send a test notification (ntfy/email from retroplay.conf)."
-      echo "  --debug               Enable debug output (also passed to extract.sh/merge.sh)."
-      echo "  --exit                Exit immediately."
-      echo
-      exit 0
+      # Never reached in practice: --help anywhere on the line is answered
+      # before the tool checks (SHOW_HELP_ONLY, above). There used to be a
+      # second, older copy of the help text here, which had drifted from the
+      # real one. One help text, one place.
+      show_usage_and_exit "${2:-}"
       ;;
     --auto)
       ACTION="auto"
@@ -657,6 +628,15 @@ while [ $# -gt 0 ]; do
     --detox)
       NO_DETOX=0
       DETOX_EXPLICIT=yes
+      shift
+      ;;
+    --no-amiga-names)
+      # Passed to the engine (all.sh), which is where the clean-up runs.
+      AMIGA_NAMES_EXPLICIT=no
+      shift
+      ;;
+    --amiga-names)
+      AMIGA_NAMES_EXPLICIT=yes
       shift
       ;;
     --sync)
@@ -974,45 +954,24 @@ set -e
 trap 'error_handler ${LINENO} $?' ERR
 
 if [ "$NO_TOOLS_NEEDED" -eq 0 ]; then
-# ----- Locale check for ASCII & Latin-1 -----
-ascii_locale="C.utf8"
-latin1_locale="en_US.iso88591"
-missing_locales=""
-
-# Only check locales if not running on macOS
+# ----- Locale check (advice only) -----
+# The same candidate lists extract.sh tries, through the same helper
+# (rp_pick_locale), so what is said here is what will actually happen there.
+# This used to demand C.UTF-8 and en_US.ISO-8859-1 by name and stop the run
+# without them - on a machine with en_GB.UTF-8 and en_GB.ISO-8859-1, which
+# extract.sh is perfectly happy with. Neither is a reason to stop any more:
+# with no UTF-8 locale extract.sh falls back to C, and with no Latin-1 locale
+# it skips that one pass. A few old archives may then extract with mangled
+# names, so say so - once, with the fix - and carry on.
 if [ "$(uname -s)" != "Darwin" ]; then
-  # locale -a spells the same locale differently depending on the system
-  # (C.utf8 / C.UTF-8, en_US.iso88591 / en_US.ISO-8859-1), so compare
-  # case-insensitively with dashes removed - the same way doctor.sh does.
-  _norm_locales="$(locale -a 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '-')"
-  if ! printf '%s\n' "$_norm_locales" | grep -qx "c.utf8"; then
-    missing_locales="$ascii_locale"
+  if ! rp_pick_locale "${LANG:-}" en_AU.UTF-8 en_GB.UTF-8 en_US.UTF-8 C.UTF-8 C.utf8 >/dev/null 2>&1; then
+    rp_warn "no UTF-8 locale is installed - carrying on with the plain C locale"
+    echo "         A few archives with accented filenames may extract with odd names." >&2
+    echo "         Fix: ./setup.sh   (or add C.UTF-8 UTF-8 to /etc/locale.gen and run sudo locale-gen)" >&2
   fi
-
-  if ! printf '%s\n' "$_norm_locales" | grep -qx "en_us.iso88591"; then
-    if [ -n "$missing_locales" ]; then
-      missing_locales="$missing_locales, $latin1_locale"
-    else
-      missing_locales="$latin1_locale"
-    fi
-  fi
-
-  if [ -n "$missing_locales" ]; then
-    echo "Dependency check:"
-    echo "Missing locales: $missing_locales"
-    echo
-    echo "To install these locales:"
-    echo "For Debian/Ubuntu:"
-    echo "  1. Edit /etc/locale.gen and uncomment/add:"
-    echo "     C.UTF-8 UTF-8"
-    echo "     en_US ISO-8859-1"
-    echo "  2. Run:"
-    echo "     sudo locale-gen"
-    echo "     sudo dpkg-reconfigure locales"
-    echo "For other Linux distributions:"
-    echo "  - Refer to your system's locale documentation"
-    echo "  - Make sure language packs are installed and regenerate locales"
-    exit 1
+  if ! rp_pick_locale en_AU.ISO-8859-1 en_GB.ISO-8859-1 en_US.ISO-8859-1 >/dev/null 2>&1; then
+    rp_warn "no ISO-8859-1 locale is installed - a few old archives may extract with mangled filenames"
+    echo "         Fix: ./setup.sh   (or add en_US ISO-8859-1 to /etc/locale.gen and run sudo locale-gen)" >&2
   fi
 fi
 fi   # NO_TOOLS_NEEDED
@@ -1145,6 +1104,8 @@ if [ "$ACTION" = "auto" ]; then
   [ -n "$SORT_OPT" ] && engine_args+=("$SORT_OPT")
   [ "$DETOX_EXPLICIT" = "no" ] && engine_args+=(--no-detox)
   [ "$DETOX_EXPLICIT" = "yes" ] && engine_args+=(--detox)
+  [ "$AMIGA_NAMES_EXPLICIT" = "no" ] && engine_args+=(--no-amiga-names)
+  [ "$AMIGA_NAMES_EXPLICIT" = "yes" ] && engine_args+=(--amiga-names)
   [ "$DEBUG_MODE" -eq 1 ] && engine_args+=(--debug)
   [ "$CLEAN_OPT" -eq 1 ] && engine_args+=(--clean)
   [ "$SKIP_UPDATE" -eq 1 ] && engine_args+=(--skip-update)

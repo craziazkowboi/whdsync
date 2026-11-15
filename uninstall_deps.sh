@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# retroplay-suite: 2026.10.03.1   (every script in the set must carry the same stamp)
+# retroplay-suite: 2026.11.15.1   (every script in the set must carry the same stamp)
 # Remember where the user ran this from, before any cd: retroplay.conf is
 # looked for there first (see lib.sh).
 RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
@@ -13,7 +13,8 @@ set -uo pipefail
 #   behalf when you answered "y" to one of their install prompts - never
 #   anything that was already present on your system before that. Nothing
 #   here guesses; it works entirely from a tracking file
-#   (.retroplay_installed_deps.log) that each script appends to at the
+#   (.retroplay_installed_deps.log, in the main folder - the one above
+#   scripts/ if you use that layout) that each script appends to at the
 #   exact moment an install it offered actually succeeds. If that file
 #   doesn't mention a package, this script will not touch it, no matter
 #   how it got onto your system.
@@ -24,7 +25,26 @@ set -uo pipefail
 
 OS_TYPE="$(uname -s | tr '[:upper:]' '[:lower:]')"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEP_TRACK_FILE="$SCRIPT_DIR/.retroplay_installed_deps.log"
+# The tracking file lives in the MAIN folder - the one holding artwork/,
+# build/ and downloads/ - which is where lib.sh writes it (RP_BASE_DIR). When
+# the scripts sit in a scripts/ subfolder that is the folder above this one.
+# This used to look beside the scripts only, so after setup.sh had tidied
+# them into scripts/ it reported "nothing to uninstall" while the real list
+# sat one folder up, untouched. Same rule as lib.sh, kept in step by hand
+# because this script deliberately does not load lib.sh: it must still work
+# when the rest of the set is broken or half removed.
+case "$SCRIPT_DIR" in
+    */scripts) BASE_DIR="${SCRIPT_DIR%/scripts}" ;;
+    *)         BASE_DIR="$SCRIPT_DIR" ;;
+esac
+DEP_TRACK_FILE="$BASE_DIR/.retroplay_installed_deps.log"
+# A list written beside the scripts (by hand-copied scripts, or any layout
+# where the two folders differ) is read as well and folded into the main one,
+# so nothing that was recorded can be stranded in either place.
+LEGACY_TRACK_FILE=""
+if [ "$SCRIPT_DIR" != "$BASE_DIR" ] && [ -s "$SCRIPT_DIR/.retroplay_installed_deps.log" ]; then
+    LEGACY_TRACK_FILE="$SCRIPT_DIR/.retroplay_installed_deps.log"
+fi
 
 ASSUME_YES=0
 DRY_RUN=0
@@ -65,7 +85,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-if [ ! -s "$DEP_TRACK_FILE" ]; then
+if [ ! -s "$DEP_TRACK_FILE" ] && [ -z "$LEGACY_TRACK_FILE" ]; then
     echo "Nothing to uninstall: $DEP_TRACK_FILE is missing or empty."
     echo "That means these scripts haven't auto-installed anything on this"
     echo "system yet (or it's already been cleaned up by a previous run of"
@@ -74,6 +94,7 @@ if [ ! -s "$DEP_TRACK_FILE" ]; then
 fi
 
 echo "Reading tracked installs from: $DEP_TRACK_FILE"
+[ -n "$LEGACY_TRACK_FILE" ] && echo "                          and: $LEGACY_TRACK_FILE"
 echo
 
 # Read into an array up front (rather than looping directly over the file)
@@ -81,9 +102,19 @@ echo
 # successful item, and iterating a live file while rewriting it partway
 # through is exactly the kind of thing that skips or repeats lines.
 tracked_lines=()
-while IFS= read -r line || [ -n "$line" ]; do
-    [ -n "$line" ] && tracked_lines+=("$line")
-done < "$DEP_TRACK_FILE"
+for _tf in "$DEP_TRACK_FILE" "$LEGACY_TRACK_FILE"; do
+    [ -n "$_tf" ] && [ -f "$_tf" ] || continue
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] || continue
+        # The same entry in both files is one install, removed once.
+        _dup=0
+        for _seen in "${tracked_lines[@]+"${tracked_lines[@]}"}"; do
+            [ "$_seen" = "$line" ] && { _dup=1; break; }
+        done
+        [ "$_dup" -eq 0 ] && tracked_lines+=("$line")
+    done < "$_tf"
+done
+unset _tf _dup _seen
 
 if [ "${#tracked_lines[@]}" -eq 0 ]; then
     echo "Nothing to uninstall: the tracking file has no entries."
@@ -182,11 +213,13 @@ fi
 
 # Rewrite the tracking file with only the lines that were NOT successfully
 # removed (failures and skips stay, so a later run can retry them).
-if [ "${#removed_lines[@]}" -gt 0 ]; then
+# Also done when there are two lists, even if nothing was removed: what is
+# left is written to the main one and the stray copy goes.
+if [ "${#removed_lines[@]}" -gt 0 ] || [ -n "$LEGACY_TRACK_FILE" ]; then
     remaining=()
     for line in "${tracked_lines[@]}"; do
         is_removed=0
-        for removed in "${removed_lines[@]}"; do
+        for removed in "${removed_lines[@]+"${removed_lines[@]}"}"; do
             [ "$line" = "$removed" ] && is_removed=1 && break
         done
         [ "$is_removed" -eq 0 ] && remaining+=("$line")
@@ -197,6 +230,7 @@ if [ "${#removed_lines[@]}" -gt 0 ]; then
     else
         printf '%s\n' "${remaining[@]}" > "$DEP_TRACK_FILE"
     fi
+    [ -n "$LEGACY_TRACK_FILE" ] && rm -f -- "$LEGACY_TRACK_FILE"
 fi
 
 echo

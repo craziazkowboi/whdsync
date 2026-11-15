@@ -76,7 +76,7 @@ rp_load_config() {
     RP_DOWNLOAD_RETRIES="3"
     RP_GAPFILL_DAYS="7"
     RP_VERIFY_DOWNLOADS="auto"
-    RP_ARTWORK_SYNC="ask"
+    RP_ARTWORK_SYNC="auto"
     RP_ARTWORK_SOURCE_URL="https://ftp2.grandis.nu/turran/FTP/Collection/Various/WHDLoad_Images"
     RP_ARTWORK_ARCHIVE_DIR="artwork_archive"
     RP_ARTWORK_STATE_ROOT=""
@@ -106,6 +106,11 @@ rp_load_config() {
     RP_UPDATE_CHECK_INTERVAL_HOURS="24"
     RP_STATE_BACKUP_MAX_MB="50"   # if yes: skip when it would exceed this
     RP_NICE="auto"                # be gentle in unattended runs: auto | no
+    RP_AMIGA_NAMES="yes"          # make names Amiga-safe at the end of a run (amiga_names.py)
+    RP_RUN_LOG="yes"              # keep logs/last_run.log for a run started by hand
+    # The server folders update.sh mirrors, comma separated (a name may hold
+    # spaces). See rp_mirror_dirs for what is accepted.
+    RP_MIRROR_DIRS="HD_Loaders/Games, JST/Games, WHDLoad/Magazines, WHDLoad/Demos, WHDLoad/Games"
     RP_CONFIG_WARNINGS=""
 
     [ -f "$RP_CONF_FILE" ] || { rp_finish_config; return 0; }
@@ -162,7 +167,7 @@ rp_load_config() {
             ARTWORK_VERIFY_DOWNLOADS|ARTWORK_FAILURE_POLICY|ARTWORK_CHECK_INTERVAL_HOURS|\
             ARTWORK_FETCH|ARTWORK_FETCH_COMMAND|ARTWORK_FETCH_LIMIT|\
             ARTWORK_DIR|BUILD_DIR|DOWNLOAD_DIR|LOG_DIR|LOG_RETENTION_DAYS|STATE_BACKUP_MAX_MB|STATE_BACKUP|PROGRESS_STYLE|NICE|\
-            JOBS|EXTRACT_JOBS|MERGE_JOBS|SORT_JOBS|\
+            JOBS|EXTRACT_JOBS|MERGE_JOBS|SORT_JOBS|AMIGA_NAMES|RUN_LOG|MIRROR_DIRS|\
             UPDATE_CHECK|UPDATE_CHECK_URL|UPDATE_CHECK_INTERVAL_HOURS|REPO_URL)
                 printf -v "RP_$key" '%s' "$val" ;;
             ART_ORDER_[A-Z0-9_]*|EXCLUDE_TAGS_[A-Z0-9_]*)
@@ -208,6 +213,33 @@ rp_finish_config() {
     case "$RP_ARTWORK_VERIFY_DOWNLOADS" in yes|no) ;; *) RP_ARTWORK_VERIFY_DOWNLOADS=yes ;; esac
     case "$RP_NICE" in auto|no) ;; *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}NICE must be auto or no - using auto
 "; RP_NICE=auto ;; esac
+    # A typo must not quietly switch the clean-up off, so anything that is not
+    # plainly yes or no is reported and treated as yes (the default).
+    case "$(printf '%s' "$RP_AMIGA_NAMES" | tr '[:upper:]' '[:lower:]')" in
+        y|yes|1|true|on)  RP_AMIGA_NAMES=yes ;;
+        n|no|0|false|off) RP_AMIGA_NAMES=no ;;
+        *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}AMIGA_NAMES must be yes or no - using yes
+"; RP_AMIGA_NAMES=yes ;;
+    esac
+    case "$(printf '%s' "$RP_RUN_LOG" | tr '[:upper:]' '[:lower:]')" in
+        y|yes|1|true|on)  RP_RUN_LOG=yes ;;
+        n|no|0|false|off) RP_RUN_LOG=no ;;
+        *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}RUN_LOG must be yes or no - using yes
+"; RP_RUN_LOG=yes ;;
+    esac
+    # MIRROR_DIRS: say now which entries will be ignored, and never let an
+    # empty or all-wrong list turn "mirror these folders" into "mirror nothing".
+    _md_bad="$(rp_mirror_dirs bad)"
+    if [ -n "$_md_bad" ]; then
+        RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}MIRROR_DIRS: ignoring $(printf '%s' "$_md_bad" | tr '\n' ';' | sed 's/;$//; s/;/, /g') - each entry must be a folder under WHDLoad/, HD_Loaders/ or JST/
+"
+    fi
+    if [ -z "$(rp_mirror_dirs)" ]; then
+        RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}MIRROR_DIRS names no usable folder - using the default list
+"
+        RP_MIRROR_DIRS="HD_Loaders/Games, JST/Games, WHDLoad/Magazines, WHDLoad/Demos, WHDLoad/Games"
+    fi
+    unset _md_bad
     case "$RP_ARTWORK_FETCH" in yes|no) ;; *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}ARTWORK_FETCH must be yes or no - using no
 "; RP_ARTWORK_FETCH=no ;; esac
     case "$RP_ARTWORK_SOURCE_URL" in http://*|https://*|ftp://*) ;; *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}ARTWORK_SOURCE_URL must start with http://, https:// or ftp://
@@ -250,10 +282,53 @@ rp_finish_config() {
     case "$RP_BUILD_DIR"    in /*) RP_BUILD_ROOT="$RP_BUILD_DIR" ;;      *) RP_BUILD_ROOT="$RP_OUTPUT_ROOT/${RP_BUILD_DIR:-build}" ;; esac
     RP_ARTWORK_ROOT="${RP_ARTWORK_ROOT%/}"; RP_DOWNLOAD_ROOT="${RP_DOWNLOAD_ROOT%/}"
     RP_LOG_ROOT="${RP_LOG_ROOT%/}"; RP_BUILD_ROOT="${RP_BUILD_ROOT%/}"
-    RP_REPORT_ROOT="$RP_BASE_DIR/reports"
+    # Run reports live with the logs: one folder to look in, one to clean.
+    # (They used to have a reports/ folder of their own; rp_prune_logs folds
+    # an existing one into logs/ the first time it runs.)
+    RP_REPORT_ROOT="$RP_LOG_ROOT"
     rp_set_bar_style                  # PROGRESS_STYLE has been read by now
     # Downloaded artwork archives live with the other downloads.
     RP_ARTWORK_CACHE="$RP_DOWNLOAD_ROOT/artwork_archive"
+}
+
+# rp_mirror_dirs [bad]: the folders update.sh mirrors, one per line, from
+# MIRROR_DIRS (comma separated, so "WHDLoad/Games/Beta & Unreleased" can be
+# an entry). With "bad", prints the entries that were refused instead.
+#
+# An entry is accepted only when it is a relative path under one of the three
+# roots the rest of the pipeline knows how to extract and sort - WHDLoad/,
+# HD_Loaders/ or JST/ - with no "..", no leading "/" and no empty part. That
+# is what keeps a typo from mirroring a server folder into somewhere the
+# extractor never looks (or outside the downloads folder altogether).
+# Duplicates are dropped; the order written is the order mirrored.
+rp_mirror_dirs() {
+    local want="${1:-good}" rest="${RP_MIRROR_DIRS:-}" item seen="
+" ok
+    while [ -n "$rest" ]; do
+        case "$rest" in
+            *,*) item="${rest%%,*}"; rest="${rest#*,}" ;;
+            *)   item="$rest"; rest="" ;;
+        esac
+        item="$(printf '%s' "$item" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s|/*$||')"
+        [ -n "$item" ] || continue
+        ok=1
+        case "$item" in
+            /*|*..*|*//*) ok=0 ;;
+            WHDLoad/?*|HD_Loaders/?*|JST/?*) ;;
+            *) ok=0 ;;
+        esac
+        case "$seen" in *"
+$item
+"*) continue ;; esac
+        seen="$seen$item
+"
+        if [ "$ok" -eq 1 ]; then
+            [ "$want" = "good" ] && printf '%s\n' "$item"
+        else
+            [ "$want" = "bad" ] && printf '%s\n' "$item"
+        fi
+    done
+    return 0
 }
 
 rp_yesno() {
@@ -874,8 +949,8 @@ rp_layout_problems() {
 # can do real damage - e.g. an older extract.sh recreating
 # Users/<you>/Downloads/Amiga/... inside retro_* - so the set is checked as
 # a whole. Prints each script whose stamp doesn't match this lib.sh.
-RP_SUITE_VERSION="2026.10.03.1"
-RP_RELEASE="0.5"                  # the release these scripts belong to
+RP_SUITE_VERSION="2026.11.15.1"
+RP_RELEASE="0.6"                  # the release these scripts belong to
 RP_SUITE_FILES="all.sh start.sh extract.sh merge.sh sort.sh update.sh quick.sh aga.sh ecs.sh rtg.sh doctor.sh install_cron.sh uninstall_deps.sh setup.sh artwork_sync.sh artwork_fetch.sh"
 
 rp_suite_mismatches() {
@@ -1158,6 +1233,16 @@ rp_print_status() {
     else
         echo "  Notifications: off (set NTFY_TOPIC or NOTIFY_EMAIL in retroplay.conf)"
     fi
+    if [ "${RP_AMIGA_NAMES:-yes}" = "yes" ]; then
+        if [ -s "$RP_STATE_DIR/amiga_names_last" ]; then
+            echo "  Amiga names:   on - last checked $(head -1 "$RP_STATE_DIR/amiga_names_last")"
+        else
+            echo "  Amiga names:   on - not run yet (the next run does it)"
+        fi
+    else
+        echo "  Amiga names:   off (AMIGA_NAMES in retroplay.conf)"
+    fi
+    [ -s "$RP_LOG_ROOT/last_run.log" ] && echo "  Last run log:  ${RP_LOG_ROOT##*/}/last_run.log"
     last=""
     for _r in "$RP_REPORT_ROOT"/*.txt; do
         [ -e "$_r" ] || continue
@@ -1165,7 +1250,7 @@ rp_print_status() {
         last="$_r"
     done
     unset _r
-    [ -n "$last" ] && echo "  Last report:   reports/${last##*/}"
+    [ -n "$last" ] && echo "  Last report:   ${RP_LOG_ROOT##*/}/${last##*/}"
     return 0
 }
 
@@ -1693,6 +1778,11 @@ rp_pick_locale() {
     local want have norm
     have=" $(rp_locale_list) "
     for want in "$@"; do
+        # An empty candidate (callers pass "${LANG:-}", which is often unset
+        # under cron) is not a locale. Without this it "matched" the padding
+        # in the list, so a machine with no UTF-8 locale at all was told it
+        # had one, and extract.sh went on to export LANG="".
+        [ -n "$want" ] || continue
         # locale -a prints en_US.iso88591 for what is written en_US.ISO-8859-1
         norm="$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]' | tr -d '-')"
         case "$have" in *" $norm "*) printf '%s' "$want"; return 0 ;; esac
@@ -1854,7 +1944,7 @@ rp_show_failed() {
     printf '\nGames without artwork, from the newest run\n'
     newest="$(rp_newest_matching "$RP_REPORT_ROOT/*_no_artwork.txt" || true)"
     if [ -n "$newest" ]; then
-        printf '  %s (%s games)\n' "reports/${newest##*/}" "$(grep -c . "$newest" 2>/dev/null || echo 0)"
+        printf '  %s (%s games)\n' "${RP_LOG_ROOT##*/}/${newest##*/}" "$(grep -c . "$newest" 2>/dev/null || echo 0)"
         sed -n '1,10p' "$newest" | sed 's/^/    /'
         [ "$(grep -c . "$newest")" -gt 10 ] && printf '    ...\n'
     else
@@ -2036,7 +2126,7 @@ rp_support_bundle() {
         # the suite does not recognise at all - is shown as <hidden>. Hiding
         # by name ("contains TOKEN or KEY") would miss a secret with an
         # innocent-looking name.
-        awk -v safe=" VARIANTS OUTPUT_ROOT ART_ORDER DEMO_ART_ORDER FILESYSTEM USE_DETOX MIN_FREE_MB SPACE_FACTOR KEEP_NEW_BATCHES OLD_ARCHIVE_DAYS LOG_MAX_MB LOG_KEEP NOTIFY_ON_SUCCESS STRUCTURED_ART_SETS MAX_EXTRACT_ATTEMPTS DOWNLOAD_RETRIES GAPFILL_DAYS VERIFY_DOWNLOADS ARTWORK_SYNC ARTWORK_SOURCE_URL ARTWORK_ARCHIVE_DIR ARTWORK_STATE_ROOT ARTWORK_PACKS ARTWORK_OPTIONAL_PACKS ARTWORK_KEEP_BACKUPS ARTWORK_LOCAL_CHANGE_POLICY ARTWORK_VERIFY_DOWNLOADS ARTWORK_FAILURE_POLICY ARTWORK_CHECK_INTERVAL_HOURS ARTWORK_FETCH ARTWORK_FETCH_LIMIT ARTWORK_DIR BUILD_DIR DOWNLOAD_DIR LOG_DIR LOG_RETENTION_DAYS STATE_BACKUP_MAX_MB STATE_BACKUP PROGRESS_STYLE NICE JOBS EXTRACT_JOBS MERGE_JOBS SORT_JOBS UPDATE_CHECK UPDATE_CHECK_URL UPDATE_CHECK_INTERVAL_HOURS REPO_URL " '
+        awk -v safe=" VARIANTS OUTPUT_ROOT ART_ORDER DEMO_ART_ORDER FILESYSTEM USE_DETOX MIN_FREE_MB SPACE_FACTOR KEEP_NEW_BATCHES OLD_ARCHIVE_DAYS LOG_MAX_MB LOG_KEEP NOTIFY_ON_SUCCESS STRUCTURED_ART_SETS MAX_EXTRACT_ATTEMPTS DOWNLOAD_RETRIES GAPFILL_DAYS VERIFY_DOWNLOADS ARTWORK_SYNC ARTWORK_SOURCE_URL ARTWORK_ARCHIVE_DIR ARTWORK_STATE_ROOT ARTWORK_PACKS ARTWORK_OPTIONAL_PACKS ARTWORK_KEEP_BACKUPS ARTWORK_LOCAL_CHANGE_POLICY ARTWORK_VERIFY_DOWNLOADS ARTWORK_FAILURE_POLICY ARTWORK_CHECK_INTERVAL_HOURS ARTWORK_FETCH ARTWORK_FETCH_LIMIT ARTWORK_DIR BUILD_DIR DOWNLOAD_DIR LOG_DIR LOG_RETENTION_DAYS STATE_BACKUP_MAX_MB STATE_BACKUP PROGRESS_STYLE NICE AMIGA_NAMES RUN_LOG MIRROR_DIRS JOBS EXTRACT_JOBS MERGE_JOBS SORT_JOBS UPDATE_CHECK UPDATE_CHECK_URL UPDATE_CHECK_INTERVAL_HOURS REPO_URL " '
             /^[ \t]*#/ || !/=/ { print; next }
             {
                 key = $0; sub(/^[ \t]*/, "", key); sub(/[ \t]*=.*/, "", key)
@@ -2585,13 +2675,63 @@ rp_migrate_layout() {
     return 0
 }
 
-# Deletes logs older than LOG_RETENTION_DAYS (0 = keep them for ever).
-# Only the logs folder is touched; reports and state are left alone.
+# Clears the logs folder at the start of a run, so it only ever holds the most
+# recent of each thing. (This used to delete logs older than
+# LOG_RETENTION_DAYS; that setting, LOG_MAX_MB and LOG_KEEP are still accepted
+# in retroplay.conf so an older file does not produce warnings, but they no
+# longer do anything.)
+#
+#   KEPT:     all_cron.log   the nightly run's output - all.sh --cron empties
+#                            it itself, once it holds the run lock
+#             update.log     the last download pass; update.sh empties it when
+#                            it runs, and --why-queued reads it in between
+#             last_run.log   everything the last hand-started run printed;
+#                            all.sh replaces it when such a run ends
+#             <date>*.txt    the last run report and its no-artwork lists -
+#                            replaced by all.sh when it writes a new report,
+#                            so there is always one to read
+#             whdsync-support-*.tar.gz   made on request, never by a run
+#   REMOVED:  every other *.log (retroerror.log, artwork_fetch.log,
+#             amiga_names.log, stage logs left by a killed run) and rotated
+#             *.log.N files from earlier versions
+#
+# Also folds a reports/ folder from an earlier version into logs/: the newest
+# report (and its lists) is moved across, older ones are deleted, and the
+# folder is removed if nothing else is in it.
 rp_prune_logs() {
-    [ "${RP_LOG_RETENTION_DAYS:-1}" -gt 0 ] 2>/dev/null || return 0
+    local old="$RP_BASE_DIR/reports" newest base f
+    mkdir -p "$RP_LOG_ROOT" 2>/dev/null
     [ -d "$RP_LOG_ROOT" ] || return 0
-    find "$RP_LOG_ROOT" -type f \( -name '*.log' -o -name '*.log.[0-9]' \) \
-        -mtime +"$(( RP_LOG_RETENTION_DAYS - 1 ))" -exec rm -f {} + 2>/dev/null
+    if [ -d "$old" ] && [ "$old" != "$RP_LOG_ROOT" ]; then
+        newest="$(rp_newest_matching "$old/[0-9]*.txt" || true)"
+        if [ -n "$newest" ]; then
+            # Report names start with the run's timestamp, 2026-11-15_020000
+            # (17 characters); its no-artwork lists share that prefix.
+            base="${newest##*/}"; base="${base:0:17}"
+            # Only when logs/ has no report yet, so a newer one is never
+            # joined by an older run's lists.
+            if [ -z "$(rp_newest_matching "$RP_LOG_ROOT/[0-9]*.txt" || true)" ]; then
+                for f in "$old/$base"*.txt; do
+                    [ -f "$f" ] && mv -f -- "$f" "$RP_LOG_ROOT/" 2>/dev/null
+                done
+            fi
+        fi
+        rm -f -- "$old"/[0-9]*.txt 2>/dev/null
+        if rmdir "$old" 2>/dev/null; then
+            rp_info "      reports/ is now part of ${RP_LOG_ROOT##*/}/ - the last report was moved there"
+        fi
+    fi
+    for f in "$RP_LOG_ROOT"/*.log "$RP_LOG_ROOT"/.*.log "$RP_LOG_ROOT"/*.log.[0-9]*; do
+        [ -f "$f" ] || continue
+        case "${f##*/}" in
+            all_cron.log|update.log) continue ;;
+            # The copy of a hand-started run. It is written when that run
+            # ends (see all.sh), replacing the previous one, so it is left
+            # alone here - otherwise a cron run would delete it.
+            last_run.log) continue ;;
+        esac
+        rm -f -- "$f"
+    done
     return 0
 }
 
