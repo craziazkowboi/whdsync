@@ -11,6 +11,9 @@
   terminal (`RUN_LOG="no"` turns it off).
 - **`MIRROR_DIRS`** in `retroplay.conf`: the server folders `update.sh`
   mirrors, which used to be a list written into the script.
+- **`DOWNLOAD_TIMEOUT`** (60 s stalled) and **`ARTWORK_TIMEOUT`** (one hour
+  per pack, doubled from 30 minutes; 0 = no limit) in `retroplay.conf`. Both
+  used to be fixed values in the scripts.
 - `setup.sh` measures the drive you choose and suggests how many collections
   fit; it also installs `python3` and checks `amiga_names.py` is there.
 - `doctor.sh` checks the names step, shows the mirror list and the run log.
@@ -38,4 +41,9 @@
   the scripts.
 - `rp_pick_locale` took an unset `LANG` for a match, so a machine with no
   UTF-8 locale was told it had one.
+- Without `curl`, an artwork download waited 30 minutes for a host that did
+  not answer: `wget -T` overrode the 15-second connect timeout given just
+  before it. Each `wget` timeout is now set by name, the overall limit comes
+  from `timeout`/`gtimeout`, and with `curl` a stalled transfer is dropped
+  after `DOWNLOAD_TIMEOUT` instead of waiting out the whole limit.
 

@@ -119,6 +119,18 @@ SPACE_FACTOR=3
 MAX_EXTRACT_ATTEMPTS=3
 DOWNLOAD_RETRIES=3
 
+# How long downloads may take, in seconds.
+# DOWNLOAD_TIMEOUT: how long any download may sit with nothing arriving -
+#   connecting, or stalled part-way - before that attempt is given up and
+#   tried again (DOWNLOAD_RETRIES above). It is NOT a limit on a whole
+#   download: the first mirror of the game archives takes hours and is never
+#   cut short while data keeps coming. Raise it on a very poor connection.
+# ARTWORK_TIMEOUT: the most one artwork pack may take from start to finish.
+#   A pack is hundreds of MB; one that runs out of time is left exactly as it
+#   was and tried again on the next run. 0 = no limit.
+DOWNLOAD_TIMEOUT=60
+ARTWORK_TIMEOUT=3600
+
 # The artwork gap-fill runs when an artwork pack changes, or after this many days.
 GAPFILL_DAYS=7
 

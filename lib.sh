@@ -74,6 +74,8 @@ rp_load_config() {
     RP_STRUCTURED_ART_SETS="AGA ECS RTG"
     RP_MAX_EXTRACT_ATTEMPTS="3"
     RP_DOWNLOAD_RETRIES="3"
+    RP_DOWNLOAD_TIMEOUT="60"      # seconds a download may stall before that attempt is given up
+    RP_ARTWORK_TIMEOUT="3600"     # seconds one artwork pack may take in all (0 = no limit)
     RP_GAPFILL_DAYS="7"
     RP_VERIFY_DOWNLOADS="auto"
     RP_ARTWORK_SYNC="auto"
@@ -162,6 +164,7 @@ rp_load_config() {
             MIN_FREE_MB|SPACE_FACTOR|KEEP_NEW_BATCHES|OLD_ARCHIVE_DAYS|LOG_MAX_MB|\
             LOG_KEEP|NTFY_TOPIC|NTFY_SERVER|NOTIFY_EMAIL|NOTIFY_ON_SUCCESS|STRUCTURED_ART_SETS|\
             MAX_EXTRACT_ATTEMPTS|DOWNLOAD_RETRIES|GAPFILL_DAYS|VERIFY_DOWNLOADS|\
+            DOWNLOAD_TIMEOUT|ARTWORK_TIMEOUT|\
             ARTWORK_SYNC|ARTWORK_SOURCE_URL|ARTWORK_ARCHIVE_DIR|ARTWORK_STATE_ROOT|ARTWORK_PACKS|\
             ARTWORK_OPTIONAL_PACKS|ARTWORK_KEEP_BACKUPS|ARTWORK_LOCAL_CHANGE_POLICY|\
             ARTWORK_VERIFY_DOWNLOADS|ARTWORK_FAILURE_POLICY|ARTWORK_CHECK_INTERVAL_HOURS|\
@@ -188,6 +191,7 @@ rp_finish_config() {
     # became 0 and turned the daily artwork check into an every-run check.
     for n in MIN_FREE_MB SPACE_FACTOR KEEP_NEW_BATCHES OLD_ARCHIVE_DAYS LOG_MAX_MB LOG_KEEP \
              MAX_EXTRACT_ATTEMPTS DOWNLOAD_RETRIES GAPFILL_DAYS LOG_RETENTION_DAYS \
+             DOWNLOAD_TIMEOUT ARTWORK_TIMEOUT \
              ARTWORK_CHECK_INTERVAL_HOURS ARTWORK_KEEP_BACKUPS ARTWORK_FETCH_LIMIT STATE_BACKUP_MAX_MB \
              UPDATE_CHECK_INTERVAL_HOURS; do
         ref="RP_$n"
@@ -203,6 +207,17 @@ rp_finish_config() {
     : "${RP_MAX_EXTRACT_ATTEMPTS:=3}" "${RP_DOWNLOAD_RETRIES:=3}" "${RP_GAPFILL_DAYS:=7}"
     : "${RP_ARTWORK_FETCH_LIMIT:=25}" "${RP_ARTWORK_KEEP_BACKUPS:=2}" "${RP_ARTWORK_CHECK_INTERVAL_HOURS:=24}" "${RP_LOG_RETENTION_DAYS:=1}" "${RP_STATE_BACKUP_MAX_MB:=50}"
     : "${RP_UPDATE_CHECK_INTERVAL_HOURS:=24}"
+    : "${RP_DOWNLOAD_TIMEOUT:=60}" "${RP_ARTWORK_TIMEOUT:=3600}"
+    # DOWNLOAD_TIMEOUT is a stall timeout, and 0 would mean "wait for ever":
+    # one silent server would then hang a nightly run with the lock held,
+    # and every night after it would be refused. So 0 is not accepted there.
+    # (ARTWORK_TIMEOUT is a limit on a whole pack, where 0 = no limit is a
+    # reasonable thing to want on a very slow link - a stall still ends it.)
+    if [ "$((10#$RP_DOWNLOAD_TIMEOUT))" -lt 1 ]; then
+        RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}DOWNLOAD_TIMEOUT must be at least 1 second - using 60
+"
+        RP_DOWNLOAD_TIMEOUT=60
+    fi
     # Artwork settings: check the words, and the pack names for anything unsafe.
     case "$RP_ARTWORK_SYNC" in ask|auto|yes|no) ;; *) RP_CONFIG_WARNINGS="${RP_CONFIG_WARNINGS}ARTWORK_SYNC must be ask, auto, yes or no - using ask
 "; RP_ARTWORK_SYNC=ask ;; esac
@@ -1596,28 +1611,58 @@ rp_sha256() {
 rp_have_sha256() { command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1; }
 
 # rp_fetch <url> <output file>: download to the given path (curl or wget).
+#
+# Purpose:  one download, with limits that suit a file of hundreds of MB.
+# Inputs:   ARTWORK_TIMEOUT (retroplay.conf) - seconds the whole download may
+#             take; 0 = no limit. RP_FETCH_TIMEOUT overrides it (tests).
+#           DOWNLOAD_TIMEOUT - seconds it may sit with no data arriving.
+#           RP_CONNECT_TIMEOUT - seconds to wait for the host to answer (15).
+# Returns:  0 downloaded; non-zero otherwise (124 = the overall limit ran out
+#           under wget). The caller removes a part-written file.
+#
+# Three different limits, and the difference matters:
+#   * CONNECT is short: a host that will not answer should be given up on in
+#     seconds, not after the time allowed for a whole pack.
+#   * STALL is medium: a transfer that stops moving is dead, however much
+#     time the pack as a whole has left.
+#   * OVERALL is long: an artwork pack is hundreds of megabytes and a Pi on a
+#     slow link genuinely needs the time. (A 60-second overall cap - a common
+#     suggestion - would abandon every large pack part-way and look like a
+#     corrupt download.)
+#
+# curl has all three as options. wget has no overall limit at all, and its -T
+# sets EVERY timeout at once - which is how this used to go wrong without
+# curl: "--connect-timeout=15 -T 1800" reads as a 15 second connect limit, but
+# -T came second and overrode it, so an unreachable host was waited on for
+# half an hour. wget is now given each timeout by name, and the overall limit
+# comes from the `timeout` command where there is one (GNU coreutils; gtimeout
+# from Homebrew). Without it, wget still cannot hang: the stall limit ends a
+# transfer that has stopped, only a slow-but-moving one is left to finish.
 rp_fetch() {
-    # On a terminal, show the transfer meter; in a log, stay quiet (the
-    # caller prints one line per file instead).
-    #
-    # Two different limits, and the difference matters: the CONNECT timeout is
-    # short, because a host that will not answer should be given up on in
-    # seconds, while the overall limit stays long, because an artwork pack is
-    # hundreds of megabytes and a Pi on a slow link genuinely needs the time.
-    # (A 60-second overall cap - a common suggestion - would abandon every
-    # large pack part-way and look like a corrupt download.)
-    local ct="${RP_CONNECT_TIMEOUT:-15}" mt="${RP_FETCH_TIMEOUT:-1800}"
+    local ct="${RP_CONNECT_TIMEOUT:-15}" mt="${RP_FETCH_TIMEOUT:-${RP_ARTWORK_TIMEOUT:-3600}}"
+    local st="${RP_DOWNLOAD_TIMEOUT:-60}" cap=""
+    case "$mt" in ''|*[!0-9]*) mt=3600 ;; esac
     if command -v curl >/dev/null 2>&1; then
+        # --speed-time/--speed-limit: give up when under 1 byte/s for $st
+        # seconds, i.e. stalled. -m 0 is curl's own "no overall limit".
+        # On a terminal, show the transfer meter; in a log, stay quiet (the
+        # caller prints one line per file instead).
         if [ -t 1 ] && [ -z "${RP_FETCH_QUIET:-}" ]; then
-            curl -fL --progress-bar --connect-timeout "$ct" -m "$mt" -o "$2" "$1"
+            curl -fL --progress-bar --connect-timeout "$ct" --speed-time "$st" --speed-limit 1 -m "$mt" -o "$2" "$1"
         else
-            curl -fsSL --connect-timeout "$ct" -m "$mt" -o "$2" "$1"
+            curl -fsSL --connect-timeout "$ct" --speed-time "$st" --speed-limit 1 -m "$mt" -o "$2" "$1"
         fi
     elif command -v wget >/dev/null 2>&1; then
+        if [ "$mt" -gt 0 ]; then
+            if command -v timeout >/dev/null 2>&1; then cap="timeout $mt"
+            elif command -v gtimeout >/dev/null 2>&1; then cap="gtimeout $mt"; fi
+        fi
+        # $cap is deliberately unquoted: it is a command prefix, or nothing.
+        # shellcheck disable=SC2086
         if [ -t 1 ] && [ -z "${RP_FETCH_QUIET:-}" ]; then
-            wget --connect-timeout="$ct" -T "$mt" --progress=bar:force -O "$2" "$1"
+            $cap wget --dns-timeout="$ct" --connect-timeout="$ct" --read-timeout="$st" --progress=bar:force -O "$2" "$1"
         else
-            wget -q --connect-timeout="$ct" -T "$mt" -O "$2" "$1"
+            $cap wget -q --dns-timeout="$ct" --connect-timeout="$ct" --read-timeout="$st" -O "$2" "$1"
         fi
     else return 1; fi
 }
@@ -2126,7 +2171,7 @@ rp_support_bundle() {
         # the suite does not recognise at all - is shown as <hidden>. Hiding
         # by name ("contains TOKEN or KEY") would miss a secret with an
         # innocent-looking name.
-        awk -v safe=" VARIANTS OUTPUT_ROOT ART_ORDER DEMO_ART_ORDER FILESYSTEM USE_DETOX MIN_FREE_MB SPACE_FACTOR KEEP_NEW_BATCHES OLD_ARCHIVE_DAYS LOG_MAX_MB LOG_KEEP NOTIFY_ON_SUCCESS STRUCTURED_ART_SETS MAX_EXTRACT_ATTEMPTS DOWNLOAD_RETRIES GAPFILL_DAYS VERIFY_DOWNLOADS ARTWORK_SYNC ARTWORK_SOURCE_URL ARTWORK_ARCHIVE_DIR ARTWORK_STATE_ROOT ARTWORK_PACKS ARTWORK_OPTIONAL_PACKS ARTWORK_KEEP_BACKUPS ARTWORK_LOCAL_CHANGE_POLICY ARTWORK_VERIFY_DOWNLOADS ARTWORK_FAILURE_POLICY ARTWORK_CHECK_INTERVAL_HOURS ARTWORK_FETCH ARTWORK_FETCH_LIMIT ARTWORK_DIR BUILD_DIR DOWNLOAD_DIR LOG_DIR LOG_RETENTION_DAYS STATE_BACKUP_MAX_MB STATE_BACKUP PROGRESS_STYLE NICE AMIGA_NAMES RUN_LOG MIRROR_DIRS JOBS EXTRACT_JOBS MERGE_JOBS SORT_JOBS UPDATE_CHECK UPDATE_CHECK_URL UPDATE_CHECK_INTERVAL_HOURS REPO_URL " '
+        awk -v safe=" VARIANTS OUTPUT_ROOT ART_ORDER DEMO_ART_ORDER FILESYSTEM USE_DETOX MIN_FREE_MB SPACE_FACTOR KEEP_NEW_BATCHES OLD_ARCHIVE_DAYS LOG_MAX_MB LOG_KEEP NOTIFY_ON_SUCCESS STRUCTURED_ART_SETS MAX_EXTRACT_ATTEMPTS DOWNLOAD_RETRIES GAPFILL_DAYS VERIFY_DOWNLOADS ARTWORK_SYNC ARTWORK_SOURCE_URL ARTWORK_ARCHIVE_DIR ARTWORK_STATE_ROOT ARTWORK_PACKS ARTWORK_OPTIONAL_PACKS ARTWORK_KEEP_BACKUPS ARTWORK_LOCAL_CHANGE_POLICY ARTWORK_VERIFY_DOWNLOADS ARTWORK_FAILURE_POLICY ARTWORK_CHECK_INTERVAL_HOURS ARTWORK_FETCH ARTWORK_FETCH_LIMIT ARTWORK_DIR BUILD_DIR DOWNLOAD_DIR LOG_DIR LOG_RETENTION_DAYS STATE_BACKUP_MAX_MB STATE_BACKUP PROGRESS_STYLE NICE AMIGA_NAMES RUN_LOG MIRROR_DIRS DOWNLOAD_TIMEOUT ARTWORK_TIMEOUT DOWNLOAD_RETRIES JOBS EXTRACT_JOBS MERGE_JOBS SORT_JOBS UPDATE_CHECK UPDATE_CHECK_URL UPDATE_CHECK_INTERVAL_HOURS REPO_URL " '
             /^[ \t]*#/ || !/=/ { print; next }
             {
                 key = $0; sub(/^[ \t]*/, "", key); sub(/[ \t]*=.*/, "", key)

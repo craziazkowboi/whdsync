@@ -14,7 +14,7 @@ downloads/            →  extract  →  artwork  →  sort  →  build/retro_ag
 
 - **Runs on** a Raspberry Pi (including a Pi Zero 2 W) or a Mac. Linux and macOS, nothing else needed.
 - **Safe by design.** It never deletes a collection until its replacement is ready, never overwrites artwork you changed yourself, and stops rather than guessing.
-- **Tested.** 738 automated tests plus 239 option checks, run offline on every change. GitHub Actions runs them on Ubuntu and on macOS (bash 3.2), with ShellCheck.
+- **Tested.** 751 automated tests plus 239 option checks, run offline on every change. GitHub Actions runs them on Ubuntu and on macOS (bash 3.2), with ShellCheck.
 
 ---
 
@@ -354,6 +354,8 @@ Settings live in `retroplay.conf`, looked for in this order: **the folder you ra
 | `STATE_BACKUP` | `no` | Keep rolling copies of the state folder (queue and markers only) |
 | `JOBS` | `auto` | How many things to do at once. `auto` is what each stage works out from the CPU count and the memory; `EXTRACT_JOBS`, `MERGE_JOBS` and `SORT_JOBS` set one stage, and `--jobs N` overrides them all for one run |
 | `MIRROR_DIRS` | `HD_Loaders/Games, JST/Games, WHDLoad/Magazines, WHDLoad/Demos, WHDLoad/Games` | Which Retroplay folders are mirrored, comma separated. Each must be under `WHDLoad/`, `HD_Loaders/` or `JST/`. Add `WHDLoad/Games/Beta & Unreleased` for the betas |
+| `DOWNLOAD_TIMEOUT` | `60` | Seconds a download may stall — connecting, or with no data arriving — before that attempt is given up and retried. Not a limit on the whole download |
+| `ARTWORK_TIMEOUT` | `3600` | Seconds one artwork pack may take in all (an hour). `0` = no limit. A pack that runs out of time is left as it was and tried again next run |
 | `RUN_LOG` | `yes` | Copy a run started by hand at a terminal to `logs/last_run.log` |
 | `NTFY_TOPIC` | *(empty)* | Get told when a run fails |
 
@@ -377,7 +379,7 @@ It checks the whole setup and, for anything wrong, tells you the command that fi
 |---|---|
 | "the output folder did not pass its check" | The lines above it say what was found. Usually the USB drive isn't mounted: the "It is on …, mounted at …" line shows which disk that folder is really on. Nothing was changed — mount the drive and run again. If the marker file was deleted, or another copy of the scripts replaced it, and your collections are in the folder, the run repairs that itself and carries on |
 | "some archives couldn't be extracted" (exit 5) | A damaged download. Everything else was installed; it retries by itself, and after three attempts fetches a fresh copy |
-| "network or server problem" (exit 3) | The server was unreachable. It tries again next run |
+| "network or server problem" (exit 3) | The server was unreachable, or a download stalled for longer than `DOWNLOAD_TIMEOUT` on every attempt. It tries again next run; on a very poor connection, raise `DOWNLOAD_TIMEOUT` (and `ARTWORK_TIMEOUT` if it is the artwork packs that don't finish) |
 | "scripts are not from the same version" | Some files weren't updated. Copy the whole set across |
 | "no UTF-8 locale is installed" / "no ISO-8859-1 locale is installed" | A warning, not a stop: the run carries on, and a few old archives may extract with odd names. `./setup.sh` adds the locales. Any of `en_GB`, `en_AU`, `en_US` or `C.UTF-8` will do |
 | A game has no artwork | Ask why: `./merge.sh --why SuperSkidmarks -d build/retro_aga`. It lists every set and section it looked in, and anything in `artwork/` with a similar name |

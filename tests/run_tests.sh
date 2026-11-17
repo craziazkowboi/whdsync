@@ -1798,8 +1798,8 @@ check "...and leaves nothing behind when it finishes" \
 # rp_fetch: a short connect timeout, but a long overall one for big packs
 check "downloads give up quickly on a dead host" \
   'grep -q "connect-timeout" "$ROOT/lib.sh"'
-check "...but still allow time for a pack of hundreds of megabytes" \
-  'grep -qE "RP_FETCH_TIMEOUT:-1800" "$ROOT/lib.sh"'
+check "...but still allow time for a pack of hundreds of megabytes (an hour by default)" \
+  'grep -q "RP_ARTWORK_TIMEOUT=\"3600\"" "$ROOT/lib.sh" && grep -q "RP_FETCH_TIMEOUT:-\${RP_ARTWORK_TIMEOUT" "$ROOT/lib.sh"'
 # Logs get a timestamp; terminals do not.
 check "a redirected line carries the date and time" \
   '(cd "$ROOT" && bash -c "SCRIPT_DIR=. . ./lib.sh; rp_info hello") 2>&1 |
@@ -3061,6 +3061,61 @@ check "with the scripts in the main folder it works as it always did" \
   '[ ! -e "$UF/tool-c" ] && [ ! -e "$UF/.retroplay_installed_deps.log" ]'
 check "the uninstaller and lib.sh use the same rule for the main folder" \
   'grep -q "SCRIPT_DIR%/scripts" "$ROOT/uninstall_deps.sh" && grep -q "SCRIPT_DIR%/scripts" "$ROOT/lib.sh"'
+
+section "124. Download timeouts come from retroplay.conf"
+cfgval() { ( cd "$ROOT" && bash -c "SCRIPT_DIR=.; . ./lib.sh; rp_load_config >/dev/null 2>&1; printf '%s|%s|%s' \"\$RP_DOWNLOAD_TIMEOUT\" \"\$RP_ARTWORK_TIMEOUT\" \"\$RP_CONFIG_WARNINGS\"" ) 2>/dev/null; }
+check "defaults: 60 seconds stalled, one hour for an artwork pack" 'case "$(cfgval)" in "60|3600|"*) true ;; *) false ;; esac'
+acfg DOWNLOAD_TIMEOUT 90; acfg ARTWORK_TIMEOUT 0
+check "both can be set, and 0 means no limit for an artwork pack" 'case "$(cfgval)" in "90|0|"*) true ;; *) false ;; esac'
+check "...without a warning" '! cfgval | grep -q "TIMEOUT"'
+# what update.sh hands to wget
+setup mkdir -p "$T/wgetspy"
+cat > "$T/wgetspy/wget" << SPY
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$T/wgetspy/args"
+exec "$MOCK/wget" "\$@"
+SPY
+chmod +x "$T/wgetspy/wget"
+( cd "$ROOT" && PATH="$T/wgetspy:$PATH" ./update.sh ) < /dev/null > "$T/tmo_upd.log" 2>&1
+check "update.sh passes DOWNLOAD_TIMEOUT to wget as its stall limit" \
+  'grep -q -- "--mirror" "$T/wgetspy/args" && ! grep -- "--mirror" "$T/wgetspy/args" | grep -qv -- "--timeout=90 "'
+check "update.sh has no timeout of its own written in" '! grep -q -- "--timeout=[0-9]" "$ROOT/update.sh"'
+acfg DOWNLOAD_TIMEOUT 0
+check "a stall limit of 0 (wait for ever) is refused, with a warning" \
+  'case "$(cfgval)" in "60|0|"*"DOWNLOAD_TIMEOUT must be at least 1"*) true ;; *) false ;; esac'
+acfg DOWNLOAD_TIMEOUT soon
+check "a value that is not a number is reported and the default used" \
+  'case "$(cfgval)" in "60|0|"*"DOWNLOAD_TIMEOUT must be a whole number"*) true ;; *) false ;; esac'
+grep -v -e '^DOWNLOAD_TIMEOUT=' -e '^ARTWORK_TIMEOUT=' "$ROOT/retroplay.conf" > "$ROOT/.c.tmp"; mv "$ROOT/.c.tmp" "$ROOT/retroplay.conf"
+# rp_fetch: what curl and wget are actually asked for
+setup mkdir -p "$T/fcurl" "$T/fwget"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" > "%s/fcurl/args"\nexit 0\n' "$T" > "$T/fcurl/curl"; chmod +x "$T/fcurl/curl"
+( PATH="$T/fcurl:$PATH" bash -c "SCRIPT_DIR=\"$ROOT\"; . \"$ROOT/lib.sh\"; rp_load_config >/dev/null 2>&1; rp_fetch http://mock/pack.lha \"$T/fcurl/out\"" ) > /dev/null 2>&1
+check "with curl: 15 s to connect, the stall limit, and an hour overall" \
+  'grep -q -- "--connect-timeout 15 " "$T/fcurl/args" && grep -q -- "--speed-time 60 --speed-limit 1 " "$T/fcurl/args" && grep -q -- "-m 3600 " "$T/fcurl/args"'
+# a PATH with everything except curl, so the wget branch is the one taken
+for d in /usr/bin /bin; do for f in "$d"/*; do
+    b="${f##*/}"; [ "$b" = curl ] && continue; [ -e "$T/fwget/$b" ] || ln -s "$f" "$T/fwget/$b" 2>/dev/null
+done; done
+rm -f "$T/fwget/wget" "$T/fwget/timeout" "$T/fwget/gtimeout"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" > "%s/fwget/args"\nexit 0\n' "$T" > "$T/fwget/wget"
+printf '#!/bin/sh\nprintf "%%s\\n" "$1" > "%s/fwget/cap"\nshift; exec "$@"\n' "$T" > "$T/fwget/timeout"
+chmod +x "$T/fwget/wget" "$T/fwget/timeout"
+# (PATH is set again after lib.sh loads: lib.sh adds back the folders it
+# remembers from earlier runs, and one of those holds the mock curl.)
+fw() { ( PATH="$T/fwget" "$BASH" -c "SCRIPT_DIR=\"$ROOT\"; . \"$ROOT/lib.sh\"; rp_load_config >/dev/null 2>&1; PATH=\"$T/fwget\"; hash -r; $1 rp_fetch http://mock/pack.lha \"$T/fwget/out\"" ) > /dev/null 2>&1; }
+rm -f "$T/fwget/args" "$T/fwget/cap"; fw ""
+check "without curl: wget is given its connect and stall limits by name" \
+  'grep -q -- "--connect-timeout=15 " "$T/fwget/args" && grep -q -- "--dns-timeout=15 " "$T/fwget/args" && grep -q -- "--read-timeout=60 " "$T/fwget/args"'
+check "...and never -T, which overrode the connect limit with the half-hour one" \
+  '! grep -qE -- "(^| )-T( |$)|--timeout=" "$T/fwget/args"'
+check "...with the overall limit applied from outside, since wget has none" '[ "$(cat "$T/fwget/cap" 2>/dev/null)" = 3600 ]'
+rm -f "$T/fwget/args" "$T/fwget/cap"; fw "RP_ARTWORK_TIMEOUT=0;"
+check "ARTWORK_TIMEOUT=0 puts no overall limit on it, but the stall limit stays" \
+  '[ ! -e "$T/fwget/cap" ] && grep -q -- "--read-timeout=60 " "$T/fwget/args"'
+run tmo_doc ./doctor.sh
+check "doctor.sh shows the timeouts in force" 'grep -q "download timeouts: 60s stalled, 60 min per artwork pack" "$T/tmo_doc.log"'
+run tmo_drain ./all.sh --variants aga
 
 # ================================================================ summary ===
 echo

@@ -80,6 +80,10 @@ while [ $# -gt 0 ]; do
             echo "  The folders mirrored are MIRROR_DIRS in retroplay.conf; currently:"
             rp_mirror_dirs | sed 's/^/      /'
             echo
+            echo "  A download that stalls for DOWNLOAD_TIMEOUT seconds ($RP_DOWNLOAD_TIMEOUT) is given up and"
+            echo "  tried again, up to DOWNLOAD_RETRIES ($RP_DOWNLOAD_RETRIES) times. There is no limit on how"
+            echo "  long a download that keeps moving may take."
+            echo
             echo "Exit codes: 0 = new files, 2 = nothing new, 3 = server/network error,"
             echo "            4 = setup or option problem."
             exit 0 ;;
@@ -292,6 +296,9 @@ do
     # the before/after listing) is what tells us which files are new OR were
     # re-published under the same name - and which ones actually completed.
     # Transient failures are retried with a growing pause.
+    # --timeout is DOWNLOAD_TIMEOUT from retroplay.conf (60 by default). It is
+    # wget's stall limit - connecting, or waiting for the next data - not a
+    # cap on the whole mirror, which on a first run legitimately takes hours.
     dl_log="$RP_LOG_ROOT/.wget_download.log"
     : > "$dl_log"
     # A mirrored symlink is a link into wherever the SERVER's filesystem
@@ -309,7 +316,7 @@ do
     while :; do
         # shellcheck disable=SC2086
         wget -nv -a "$dl_log" --mirror -np -nH --cut-dirs=2 --tries=3 --waitretry=10 \
-             $WGET_SYMLINK_OPT --timeout=60 "$FTP_BASE/$dirpath" > /dev/null 2>&1
+             $WGET_SYMLINK_OPT --timeout="$RP_DOWNLOAD_TIMEOUT" "$FTP_BASE/$dirpath" > /dev/null 2>&1
         wget_status=$?
         [ "$wget_status" -eq 0 ] && break
         [ "$attempt" -ge "$RP_DOWNLOAD_RETRIES" ] && break
@@ -372,7 +379,7 @@ do
             sed "s|^|$(date '+%Y-%m-%d %H:%M:%S') CORRUPT download, fetching it again: |" bad.txt >> "$logfile"
             pushd "$dir" > /dev/null || exit 1
             wget -nv -a "$dl_log" --mirror -np -nH --cut-dirs=2 --tries=3 --waitretry=10 \
-                 --timeout=60 "$FTP_BASE/$dirpath" > /dev/null 2>&1
+                 --timeout="$RP_DOWNLOAD_TIMEOUT" "$FTP_BASE/$dirpath" > /dev/null 2>&1
             popd > /dev/null || exit 1
             : > gone.txt
             while IFS= read -r nf; do

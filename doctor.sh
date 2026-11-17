@@ -185,6 +185,9 @@ if [ -n "$RP_CONFIG_WARNINGS" ]; then
 fi
 good "variants: $RP_VARIANTS   filesystem: $RP_FILESYSTEM   output folder: $RP_OUTPUT_ROOT"
 good "mirroring (MIRROR_DIRS): $(rp_mirror_dirs | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
+if [ "$RP_ARTWORK_TIMEOUT" -gt 0 ]; then _at="$((RP_ARTWORK_TIMEOUT / 60)) min per artwork pack"; else _at="no limit per artwork pack"; fi
+good "download timeouts: ${RP_DOWNLOAD_TIMEOUT}s stalled, $_at, $RP_DOWNLOAD_RETRIES attempts"
+unset _at
 
 head_ "Artwork"
 found_sets=""
