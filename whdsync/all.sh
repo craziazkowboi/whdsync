@@ -1,0 +1,1694 @@
+#!/usr/bin/env bash
+# retroplay-suite: 2026.11.15.1   (every script in the set must carry the same stamp)
+# Remember where the user ran this from, before any cd: retroplay.conf is
+# looked for there first (see lib.sh).
+RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
+#
+# Purpose: The engine: update, extract, artwork, sort, install - for every variant.
+#   Options: --aga --ecs --rtg --aga-laced --ecs-laced --set NAME --variants LIST
+#            --clean --rebuild --force --skip-update --dry-run/--plan --cron
+#            --dest DIR --art LIST --demo-art LIST --ffs/--pfs --detox/--no-detox
+#            --amiga-names/--no-amiga-names --status --test-notify --debug --help
+# Run 'all.sh --help' for the authoritative, current list.
+#
+# Amiga Retroplay - pipeline engine
+#
+# Builds and updates one or more artwork variants (by default AGA, ECS and
+# RTG - see VARIANTS in retroplay.conf) end to end. start.sh --auto, and so
+# aga.sh / ecs.sh / rtg.sh, also run through here for a single variant, so
+# every run gets the same protections:
+#
+#   * Archives are extracted and sorted ONCE, then copied per variant; only
+#     the artwork merge differs between variants.
+#   * New downloads are QUEUED per output folder and only removed from the
+#     queue once that folder has actually absorbed them - a failed or
+#     interrupted run is simply picked up again by the next one.
+#   * A full build is marked "building" until it finishes, so an interrupted
+#     one is redone instead of being mistaken for a finished collection.
+#   * Free disk space is checked before extracting or copying.
+#   * An updated game REPLACES its old folder, so files from older versions
+#     don't linger; each batch is also kept in a dated new_<variant> folder.
+#   * Names are made Amiga-safe at the end of the run (amiga_names.py;
+#     AMIGA_NAMES in retroplay.conf, --no-amiga-names to skip it once).
+#   * One summary report per run (in logs/, only the latest is kept),
+#     optional notifications.
+#
+# Exit codes: 0 = work done, 2 = nothing to do, 3 = network or server problem,
+#             4 = setup or option problem, 5 = some archives could not be
+#             extracted, 130 = interrupted, 1 = any other failure.
+
+set -u -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR" || { echo "ERROR: cannot cd to script directory: $SCRIPT_DIR" >&2; exit 1; }
+
+# Shared helpers (retroplay.conf settings, dependency tracking, pending
+# queues, disk-space checks...) live in lib.sh, next to this script.
+if [ ! -f "$SCRIPT_DIR/lib.sh" ]; then
+    echo "ERROR: lib.sh is missing from $SCRIPT_DIR - it ships with these scripts." >&2
+    exit 1
+fi
+. "$SCRIPT_DIR/lib.sh"
+rp_load_config
+
+# --version answers before anything else is printed (no banner, no checks).
+for _a in "$@"; do
+    case "$_a" in
+        --version|-V) printf 'whdsync %s (suite %s)\n' "$RP_RELEASE" "$RP_SUITE_VERSION"; exit 0 ;;
+    esac
+done
+unset _a
+
+# What this run was asked to do, for the lock record and the logs. Built from
+# "$@" (not "$*") so an argument containing spaces is still readable as one
+# argument: --dest "My Drive" stays --dest "My Drive", not two loose words.
+# Purpose:       a human-readable record of the command line.
+# Inputs:        the script's own arguments.
+# Outputs:       ORIG_ARGS, a single display string.
+# Side effects:  none. It is never re-executed, only printed.
+rp_render_args() {
+    local a out=""
+    for a in ${1+"$@"}; do
+        case "$a" in
+            *[!A-Za-z0-9_=/.,:+-]*) out="$out \"$a\"" ;;   # quote anything with a space or shell character
+            *)                      out="$out $a" ;;
+        esac
+    done
+    printf '%s' "${out# }"
+}
+# ----- A copy of a run started by hand: logs/last_run.log -----
+# A nightly run has logs/all_cron.log. A run typed at a terminal had nothing:
+# once it scrolled away it was gone. So such a run is started again under
+# `script`, which records it while leaving it a real terminal - the progress
+# bars still redraw in place, colour and prompts still work, and Ctrl-C still
+# reaches the run. (Piping through `tee` would have been simpler and wrong:
+# every script here asks "is this a terminal?" to decide how to draw progress,
+# whether to ask questions and whether to run gently, and behind a pipe the
+# answer changes.) When the run ends the recording is cleaned - escape codes
+# out, each redrawn bar reduced to its final state - into logs/last_run.log.
+#
+# Purpose:       keep what a hand-started run printed.
+# Assumptions:   stdin and stdout are a terminal; `script` exists (util-linux
+#                on Linux, BSD on macOS - the two take their arguments in a
+#                different order, and both are tried harmlessly first).
+# Inputs:        the script's own arguments; RUN_LOG in retroplay.conf.
+# Outputs:       logs/last_run.log, replacing the previous one.
+# Side effects:  runs this script once more, as a child, with RP_RUN_LOGGED=1
+#                so that child does not do the same again. This shell holds no
+#                lock and changes nothing itself; it exits with the child's
+#                status, which the child hands back through a small file
+#                because not every `script` passes it on.
+# Not used for:  --cron (has its own log), --dry-run/--plan, --status,
+#                --test-notify, --help, --version (nothing worth keeping, and
+#                they should answer instantly), a stage of another run, or
+#                any run whose output is not a terminal - whoever redirected
+#                that is already keeping it.
+run_with_log() {
+    local ts stat cmd rc flavour esc log="$RP_LOG_ROOT/last_run.log" shown
+    mkdir -p "$RP_LOG_ROOT" 2>/dev/null || return 0
+    ts="$RP_LOG_ROOT/.run_typescript.$$"; stat="$RP_LOG_ROOT/.run_status.$$"
+    if script --version 2>&1 | grep -q 'util-linux'; then
+        flavour=linux
+        script -q -c true /dev/null >/dev/null 2>&1 || return 0
+    else
+        flavour=bsd
+        script -q /dev/null true >/dev/null 2>&1 || return 0
+    fi
+    # %q quotes each argument for the shell that `script` starts, so a --dest
+    # with spaces in it arrives as one argument.
+    cmd="$(printf '%q ' "$BASH" "$SCRIPT_DIR/all.sh" ${1+"$@"})"
+    cmd="$cmd; echo \$? > $(printf '%q' "$stat")"
+    shown="$(rp_render_args ${1+"$@"})"
+    RP_RUN_LOGGED=1; export RP_RUN_LOGGED
+    rm -f -- "$ts" "$stat"
+    if [ "$flavour" = linux ]; then
+        script -q -c "$cmd" "$ts"
+    else
+        script -q "$ts" "$BASH" -c "$cmd"
+    fi
+    rc=$?
+    [ -s "$stat" ] && rc="$(head -1 "$stat")"
+    case "$rc" in ''|*[!0-9]*) rc=1 ;; esac
+    if [ -s "$ts" ]; then
+        esc="$(printf '\033')"
+        {
+            printf 'all.sh %s\n' "$shown"
+            printf 'Finished %s - exit %s (%s)\n\n' "$(rp_ts)" "$rc" "$(rp_exit_meaning "$rc")"
+            # Escape sequences out; then, of everything a line was redrawn
+            # with (carriage returns), keep only what was left showing.
+            tr -d '\000' < "$ts" |
+            sed -e "s/${esc}\[[0-9;?]*[A-Za-z]//g" -e '/^Script started on /d' -e '/^Script done on /d' |
+            awk '{ n = split($0, part, "\r"); keep = ""
+                   for (i = n; i >= 1; i--) if (part[i] != "") { keep = part[i]; break }
+                   print keep }'
+        } > "$log.tmp" 2>/dev/null && mv -f -- "$log.tmp" "$log"
+        rm -f -- "$log.tmp"
+    fi
+    rm -f -- "$ts" "$stat"
+    exit "$rc"
+}
+if [ -z "${RP_RUN_LOGGED:-}" ] && [ "${RP_CHILD:-0}" = "0" ] && [ "${RP_RUN_LOG:-yes}" = "yes" ] \
+   && [ -t 0 ] && [ -t 1 ] && command -v script >/dev/null 2>&1; then
+    _wrap=1
+    for _a in ${1+"$@"}; do
+        case "$(printf '%s' "$_a" | tr '[:upper:]' '[:lower:]')" in
+            --cron|--dry-run|--plan|--status|--test-notify|-h|--help) _wrap=0 ;;
+        esac
+    done
+    [ "$_wrap" -eq 1 ] && run_with_log ${1+"$@"}
+    unset _a _wrap
+fi
+
+rp_banner "all.sh"
+
+usage() {
+    cat << 'USAGE'
+Usage: all.sh [options]
+
+Builds or updates every variant listed in VARIANTS (retroplay.conf; default
+"aga ecs rtg aga-laced ecs-laced") - or just the ones you name - extracting
+archives only once. Each collection needs its own room on the drive; set
+VARIANTS in retroplay.conf to build fewer of them.
+
+Choosing variants (default: VARIANTS from retroplay.conf):
+  --aga --ecs --rtg --aga-laced --ecs-laced   Pick variants (repeatable)
+  --laced               Build the laced form of each AGA/ECS variant picked
+  --all                 Every variant: aga, ecs, rtg, aga-laced, ecs-laced
+  --set NAME            Use the iGame_NAME artwork set as a variant
+  --variants "a b c"    Give the whole list at once (--variant NAME adds one)
+  --dest PATH           Custom output folder (only with a single variant)
+
+What to do:
+  --rebuild             Rebuild from the archives already downloaded, without
+                        checking for updates (same as --clean --skip-update)
+  --clean               Check for updates, then rebuild from scratch
+  --skip-update         Don't download; process whatever is already queued
+  --refresh-artwork     Refresh artwork for every game, including ones the
+                        nightly gap-fill would skip (artwork already in the
+                        collection is always rewritten from the packs)
+  --force               Also run the artwork gap-fill on up-to-date variants
+  --preview-new         Build the dated folder of just the new games and leave
+                        the collection itself alone
+  --no-amiga-names      Skip the Amiga-safe names clean-up at the end of this
+                        run (amiga_names.py over the collections in build/:
+                        accented letters and # ? \ - never - or +).
+                        It is on by default; AMIGA_NAMES="no" in retroplay.conf
+                        turns it off for every run, and --amiga-names turns it
+                        back on for one
+  --dry-run, --plan     Show what would happen - including which names the
+                        clean-up would change - and change nothing
+  --status              Show the last run, each variant's state, drive, schedule
+  --test-notify         Send a test notification and report whether it worked
+  --cron                Unattended mode for cron: sets a full PATH and writes
+                        to logs/all_cron.log (the latest run only)
+
+Overrides for retroplay.conf settings:
+  --art ORDER  --demo-art ORDER  --ffs | --pfs  --no-detox | --detox
+  --amiga-names | --no-amiga-names
+  --jobs N              How many things to do at once (overrides JOBS)
+  --quiet               Errors and the final result only (good for cron)
+  --verbose             More detail about each stage
+  --debug               Diagnostic detail (implies --verbose)
+  --color auto|always|never   Colour: a terminal by default; NO_COLOR is honoured
+  --version             Print the version and exit
+
+Logs and the run report are in logs/. It is cleared at the start of every
+run and only the latest report is kept, so it always describes the last run.
+A run started by hand at a terminal is also copied to logs/last_run.log
+(RUN_LOG="no" in retroplay.conf turns that off).
+
+Exit codes: 0 = work done, 2 = nothing to do, 3 = network or server problem,
+            4 = setup or option problem, 5 = some archives could not be
+            extracted, 130 = interrupted, 1 = any other failure.
+USAGE
+}
+
+ORIG_ARGS="$(rp_render_args ${1+"$@"})"
+VARIANT_ARGS=""; DEST_OVERRIDE=""; WANT_LACED=0
+vstart=0            # when the collection being worked on started (see variant_row)
+CLEAN=0; SKIP_UPDATE=0; FORCE=0
+REFRESH_ART=0        # --refresh-artwork: replace artwork already in the collection
+PREVIEW_ONLY=0       # --preview-new: save the dated batch, do not install it
+DRY_RUN=0; CRON=0; DEBUG=0
+ART_OVERRIDE=""; DEMO_ART_OVERRIDE=""; FS_OVERRIDE=""; DETOX_OVERRIDE=""
+AMIGA_NAMES_OVERRIDE=""   # --amiga-names / --no-amiga-names: overrides AMIGA_NAMES
+
+while [ $# -gt 0 ]; do
+    opt="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    case "$opt" in
+        --aga|--ecs|--rtg|--aga-laced|--ecs-laced) VARIANT_ARGS="$VARIANT_ARGS ${opt#--}"; shift ;;
+        # --laced is a modifier, not a variant: it turns each plain AGA/ECS
+        # choice into its laced counterpart. It is applied after parsing, so
+        # it works whether it comes before or after --aga.
+        --laced)     WANT_LACED=1; shift ;;
+        --all)       VARIANT_ARGS="$VARIANT_ARGS aga ecs rtg aga-laced ecs-laced"; shift ;;
+        --set)       rp_require_option_value "$1" "$#" "${2-}"; VARIANT_ARGS="$VARIANT_ARGS $2"; shift 2 ;;
+        --variants)  rp_require_option_value "$1" "$#" "${2-}"; VARIANT_ARGS="$VARIANT_ARGS $2"; shift 2 ;;
+        --variant)   rp_require_option_value "$1" "$#" "${2-}"; VARIANT_ARGS="$VARIANT_ARGS $2"; shift 2 ;;
+        -d|--dest)   rp_require_option_value "$1" "$#" "${2-}"; DEST_OVERRIDE="$2"; shift 2 ;;
+        --clean)     CLEAN=1; shift ;;
+        --rebuild)   CLEAN=1; SKIP_UPDATE=1; shift ;;
+        --skip-update) SKIP_UPDATE=1; shift ;;
+        --force)     FORCE=1; shift ;;
+        --preview-new)
+            # Build the dated batch of new games and stop there: the
+            # collection itself is left exactly as it is. Same queue, same
+            # lock, same drive check, same report as a normal run.
+            PREVIEW_ONLY=1; shift ;;
+        --refresh-artwork) REFRESH_ART=1; shift ;;
+        --jobs)      rp_require_option_value "$1" "$#" "${2-}"; RP_JOBS_OVERRIDE="$2"; export RP_JOBS_OVERRIDE; shift 2 ;;
+        --dry-run|--plan) DRY_RUN=1; shift ;;      # --plan: the name start.sh and the README use
+        --cron)      CRON=1; shift ;;
+        --art)       rp_require_option_value "$1" "$#" "${2-}"; ART_OVERRIDE="$2"; shift 2 ;;
+        --demo-art)  rp_require_option_value "$1" "$#" "${2-}"; DEMO_ART_OVERRIDE="$2"; shift 2 ;;
+        --ffs)       FS_OVERRIDE=ffs; shift ;;
+        --pfs)       FS_OVERRIDE=pfs; shift ;;
+        --no-detox)  DETOX_OVERRIDE=no; shift ;;
+        --detox)     DETOX_OVERRIDE=yes; shift ;;
+        --no-amiga-names) AMIGA_NAMES_OVERRIDE=no; shift ;;
+        --amiga-names)    AMIGA_NAMES_OVERRIDE=yes; shift ;;
+        --debug)     DEBUG=1; RP_VERBOSITY=3; RP_DEBUG=1; export RP_VERBOSITY RP_DEBUG; rp_set_colours; shift ;;
+        --quiet)     RP_VERBOSITY=0; export RP_VERBOSITY; shift ;;
+        --verbose)   [ "$RP_VERBOSITY" -lt 2 ] && RP_VERBOSITY=2; export RP_VERBOSITY; shift ;;
+        --color|--colour)
+                     rp_require_option_value "$1" "$#" "${2-}"
+                     RP_COLOR="$2"; export RP_COLOR; rp_set_colours; shift 2 ;;
+        --color=*|--colour=*)
+                     RP_COLOR="${1#*=}"; export RP_COLOR; rp_set_colours; shift ;;
+                --status)    rp_print_status; exit 0 ;;
+        --test-notify) rp_test_notify; exit $? ;;
+        -h|--help)   usage; exit 0 ;;
+        *) echo "Unknown option: $1 (try --help)" >&2; exit 4 ;;
+    esac
+done
+
+# ----- Cron mode -----
+# (cron's bare PATH is already taken care of by lib.sh, for every script:
+# it adds back the PATH remembered from your last interactive run.) --cron
+# writes the log itself. It is opened for appending here and emptied further
+# down, once this run holds the lock - so all_cron.log only ever holds the
+# most recent run, and a run that is refused because another is still going
+# adds its one message to that run's log instead of wiping it.
+if [ "$CRON" -eq 1 ]; then
+    mkdir -p "$RP_LOG_ROOT" 2>/dev/null; CRON_LOG="$RP_LOG_ROOT/all_cron.log"
+    exec >> "$CRON_LOG" 2>&1 < /dev/null
+    echo
+    echo "==================== all.sh --cron: $(date '+%Y-%m-%d %H:%M:%S') ===================="
+fi
+
+rp_print_config_warnings
+
+# Refuse to run with a mix of old and new scripts - an out-of-date one can do
+# real damage (an older extract.sh recreated Users/<you>/Downloads/Amiga/...
+# inside retro_*).
+suite_bad="$(rp_suite_mismatches)"
+if [ -n "$suite_bad" ]; then
+    echo "ERROR: these scripts are not from the same version as lib.sh ($RP_SUITE_VERSION):" >&2
+    printf '%s\n' "$suite_bad" | sed 's/^/  /' >&2
+    echo "Copy the COMPLETE, current set of scripts into $SCRIPT_DIR, then run again." >&2
+    rp_notify "Amiga Retroplay: run refused" "Scripts from different versions found: $(printf '%s ' $suite_bad)- copy the complete current set."
+    exit "$RP_EXIT_CONFIG"
+fi
+
+# Every start.sh step run from here skips its interactive "view error log?"
+# prompt and appends to one shared retroerror.log for the whole run.
+export RETROPLAY_ALL_SH=1
+
+if [ "$DRY_RUN" -eq 0 ]; then
+OS_TYPE="$(uname -s | tr '[:upper:]' '[:lower:]')"
+
+# ----- Prevent overlapping runs -----
+# Two full pipelines against the same folders at once is exactly what
+# corrupts output and doubles the load on a small device, so a second
+# instance exits immediately instead of piling up. The lock itself lives in
+# lib.sh, so the stage scripts run by hand honour the same one.
+RUN_ID="$(date '+%Y%m%d-%H%M%S')-$$"
+RP_RUN_ID="$RUN_ID"
+
+# Installing packages mid-run would stop a build (or a cron job) at a sudo
+# prompt, so it only happens when explicitly asked for.
+if ! rp_flock_bin >/dev/null 2>&1 && [ -t 0 ] && rp_may_install_tools; then
+    echo "'flock' was not found - it's needed to guarantee only one run"
+    echo "happens at a time (e.g. so cron can't overlap a still-running pass)."
+    if [ "$OS_TYPE" = "darwin" ]; then
+        printf 'Install it now via Homebrew (brew install util-linux)? [y/N] '
+    else
+        printf 'Install it now via apt (sudo apt install util-linux)? [y/N] '
+    fi
+    read -r _flock_reply
+    case "$_flock_reply" in
+        [Yy]*)
+            if [ "$OS_TYPE" = "darwin" ]; then
+                _had=0; pkg_already_installed brew util-linux && _had=1
+                if brew install util-linux && [ "$_had" -eq 0 ]; then
+                    record_installed_dep "brew" "util-linux"
+                fi
+            else
+                _had=0; pkg_already_installed apt util-linux && _had=1
+                if sudo apt-get update && sudo apt-get install -y util-linux && [ "$_had" -eq 0 ]; then
+                    record_installed_dep "apt" "util-linux"
+                fi
+            fi
+            ;;
+    esac
+    unset _flock_reply
+fi
+
+rp_lock_take "all.sh $ORIG_ARGS" || rp_lock_refuse "all.sh"
+# This run is the one that counts now: start the nightly log again from empty.
+# The log was opened with >>, so everything printed from here on lands at the
+# new start of the file. The heading and any settings warnings were printed
+# before the lock was taken, so they are said again.
+if [ "$CRON" -eq 1 ]; then
+    : > "$CRON_LOG"
+    echo "==================== all.sh --cron: $(date '+%Y-%m-%d %H:%M:%S') ===================="
+    rp_print_config_warnings
+fi
+if [ "$RP_LOCK_HELD" = "2" ]; then
+    rp_warn "'flock' not found - using a simpler lock folder instead"
+    if [ "$OS_TYPE" = "darwin" ]; then
+        rp_info "  For the most reliable locking: brew install util-linux"
+    else
+        rp_info "  For the most reliable locking: sudo apt install util-linux"
+    fi
+fi
+
+fi
+
+# ============================================================================
+# Settings for this run
+# ============================================================================
+FS_FLAG="--${FS_OVERRIDE:-$RP_FILESYSTEM}"
+# Art orders must only name the three artwork sections.
+for _o in "${ART_OVERRIDE:-}" "${DEMO_ART_OVERRIDE:-}" "$RP_ART_ORDER" "$RP_DEMO_ART_ORDER"; do
+    [ -n "$_o" ] || continue
+    for _s in $(printf '%s' "$_o" | tr ',' ' '); do
+        case "$(printf '%s' "$_s" | tr '[:upper:]' '[:lower:]')" in
+            covers|screens|titles) ;;
+            *) rp_die "$RP_EXIT_CONFIG" "art order '$_o' contains '$_s' - use only Covers, Screens and Titles, e.g. Covers,Screens,Titles" ;;
+        esac
+    done
+done
+USE_DETOX="${DETOX_OVERRIDE:-$RP_USE_DETOX}"
+DETOX_FLAG=""; [ "$USE_DETOX" = "yes" ] || DETOX_FLAG="--no-detox"
+DEBUG_FLAG=""; [ "$DEBUG" -eq 1 ] && DEBUG_FLAG="--debug"
+DEMO_ART="${DEMO_ART_OVERRIDE:-$RP_DEMO_ART_ORDER}"
+AMIGA_NAMES="${AMIGA_NAMES_OVERRIDE:-$RP_AMIGA_NAMES}"   # yes unless turned off
+AMIGA_NAMES_MARK="$RP_STATE_DIR/amiga_names_last"       # when the clean-up last finished
+FINALISE_SHOWN=0     # set once the "[5/5] Finalise" heading has been printed
+RUN_TS="$(rp_timestamp)"
+WORK_ROOT="$RP_OUTPUT_ROOT/.retroplay_work"     # same drive as the output, so moves are instant
+STAGE_ROOT="$RP_STATE_DIR/stage"                # same drive as the archives, so staging can hardlink
+REPORT_DIR="$RP_REPORT_ROOT"
+REPORT_TMP="$(mktemp "${TMPDIR:-/tmp}/retroplay_report.XXXXXX")"
+# finish() (installed further down) is what normally clears these, but it is
+# not in place yet: until it is, anything that exits early - a bad option, a
+# drive that is not mounted - would leave the file in /tmp. This stop-gap trap
+# is replaced by `trap finish EXIT` once the real one is ready.
+trap 'rm -f "$REPORT_TMP" "$REPORT_TMP".* 2>/dev/null' EXIT INT TERM
+FAIL_REASON=""
+
+report() { printf '%s\n' "$*" >> "$REPORT_TMP"; }
+# Per-variant results for the table at the end.
+VARIANT_ROWS=""
+# Per-stage seconds, so a slow run can be explained rather than guessed at.
+# (Per-variant time is already in the summary table; this is the breakdown.)
+STAGE_TIMES=""
+# Inside the build phase, where the time went: added up across every
+# collection and batch, so the report can say whether a slow night was the
+# extraction, the sort, the artwork merge or copying into place. Taken from
+# $SECONDS around calls that happen anyway - nothing is re-scanned to get it.
+EXTRACT_SECS=0; SORT_SECS=0; MERGE_SECS=0; INSTALL_SECS=0
+_stage_t0=0
+BUILD_TIMER_STARTED=0   # build_seconds is only recorded for a build that began
+stage_start() { _stage_t0="$SECONDS"; }
+stage_end()   { STAGE_TIMES="$STAGE_TIMES$1=$(( SECONDS - _stage_t0 ))
+"; }
+variant_row() {   # variant_row <key> <started at $SECONDS> [note]
+    local key="$1" t0="$2" note="${3:-}" dest="" art="" games kb i kind i_last=0
+    for i in "${!V_KEY[@]}"; do
+        [ "${V_KEY[$i]}" = "$key" ] && { dest="${V_DEST[$i]}"; art="${V_ART[$i]%%,*}"; i_last="$i"; }
+    done
+    [ -n "$dest" ] && [ -d "$dest" ] || return 0
+    games="$(rp_count_games "$dest")"; kb="$(rp_du_kb "$dest")"
+    VARIANT_ROWS="$VARIANT_ROWS$key|${games:-0}|$(( ${kb:-0} / 1024 ))|$(rp_format_duration $(( SECONDS - t0 )))|${art:-none}|$note
+"
+    # Record what this collection now is, while the numbers are in hand. A
+    # preview left the collection exactly as it was, so there is nothing new
+    # to record - writing one here used to stamp the untouched live
+    # collection "kind=preview" with today's date.
+    [ "$note" = "preview" ] && return 0
+    case "$note" in
+        built)   kind=full ;;
+        updated) kind=update ;;
+        *)       kind="${note:-update}" ;;
+    esac
+    rp_write_manifest "$key" "$dest" "$kind" "${games:-0}" "${kb:-0}" \
+        "${V_ART[$i_last]:-}" "${V_MFLAGS[$i_last]:-}"
+    return 0
+}
+
+mark_success() { mkdir -p "$RP_STATE_DIR/last_success" 2>/dev/null; rp_ts | rp_atomic_write "$RP_STATE_DIR/last_success/$1"; }
+# fail_with <exit code> <message>; fail <message> = unexpected error (1).
+FAIL_CODE=1
+fail_with() { FAIL_CODE="$1"; shift; FAIL_REASON="$*"; echo; echo "ERROR: $*" >&2; exit "$FAIL_CODE"; }
+fail()      { fail_with 1 "$@"; }
+
+# ----- Resolve the variants -----
+V_TOK=(); V_DEST=(); V_KEY=(); V_EXCL=(); V_ART=(); V_NEW=(); V_MFLAGS=(); V_ACT=(); V_WHY=()
+# --laced rewrites the plain AGA/ECS choices into their laced counterparts
+# before anything else looks at the list. RTG has no laced pack, so it is
+# left as it is rather than silently dropped.
+if [ "$WANT_LACED" -eq 1 ]; then
+    _laced_in="${VARIANT_ARGS:-$RP_VARIANTS}"; _laced_out=""
+    for _lt in $(printf '%s' "$_laced_in" | tr ',' ' '); do
+        case "$(printf '%s' "$_lt" | tr '[:upper:]' '[:lower:]')" in
+            aga) _lt="aga-laced" ;;
+            ecs) _lt="ecs-laced" ;;
+        esac
+        _laced_out="$_laced_out $_lt"
+    done
+    VARIANT_ARGS="$_laced_out"
+    unset _laced_in _laced_out _lt
+fi
+for tok in $(printf '%s' "${VARIANT_ARGS:-$RP_VARIANTS}" | tr ',' ' '); do
+    tok="$(printf '%s' "$tok" | tr '[:upper:]' '[:lower:]')"
+    # A typo such as "agaa" would otherwise quietly build retro_agaa with
+    # fallback artwork only - reject anything that isn't a known variant or
+    # an existing iGame_<NAME> artwork folder.
+    case "$tok" in
+        aga|ecs|rtg|aga-laced|ecs-laced|default) ;;
+        *)
+            _found=""
+            for _d in "$RP_ARTWORK_ROOT"/[iI][gG][aA][mM][eE]_*; do
+                [ -d "$_d" ] || continue
+                [ "$(printf '%s' "${_d##*/}" | cut -d_ -f2- | tr '[:upper:]' '[:lower:]')" = "$tok" ] && _found=1
+            done
+            [ -n "$_found" ] || rp_die "$RP_EXIT_CONFIG" "unknown variant '$tok' - use aga, ecs, rtg, aga-laced, ecs-laced, or the name of an iGame_<NAME> artwork folder"
+            ;;
+    esac
+    dup=0
+    for t in "${V_TOK[@]+"${V_TOK[@]}"}"; do [ "$t" = "$tok" ] && dup=1; done
+    [ "$dup" -eq 1 ] && continue
+    V_TOK+=("$tok")
+done
+[ "${#V_TOK[@]}" -gt 0 ] || rp_die "$RP_EXIT_CONFIG" "no variants to build (check VARIANTS in retroplay.conf)."
+# Say out loud how many collections this run will produce. Each one is a full
+# copy on the drive, so "why is this taking all night" and "why is the disk
+# full" both start here.
+rp_info "Collections this run: ${V_TOK[*]}   (set VARIANTS in retroplay.conf to change)"
+if [ "${#V_TOK[@]}" -ge 4 ]; then
+    # Said on every run, plan included: on an SD card this is the line that
+    # explains a full drive or a build that takes all night.
+    rp_info "  Each is a complete collection: ${#V_TOK[@]} of them take about ${#V_TOK[@]} times the space and artwork-merge time of one."
+fi
+if [ -n "$DEST_OVERRIDE" ] && [ "${#V_TOK[@]}" -gt 1 ]; then
+    rp_die "$RP_EXIT_CONFIG" "--dest can only be used when building a single variant."
+fi
+
+for i in "${!V_TOK[@]}"; do
+    tok="${V_TOK[$i]}"
+    if [ -n "$DEST_OVERRIDE" ]; then
+        case "$DEST_OVERRIDE" in /*) d="$DEST_OVERRIDE" ;; *) d="$SCRIPT_DIR/$DEST_OVERRIDE" ;; esac
+    elif [ "$tok" = "default" ]; then
+        d="$RP_BUILD_ROOT/retro"
+    else
+        d="$RP_BUILD_ROOT/retro_$(rp_variant_suffix "$tok")"
+    fi
+    d="${d%/}"
+    V_DEST[$i]="$d"
+    V_KEY[$i]="${d##*/}"
+    V_EXCL[$i]="$(rp_exclude_tags_for "$tok")"
+    V_ART[$i]="${ART_OVERRIDE:-$(rp_art_order_for "$tok")}"
+    V_NEW[$i]="$RP_BUILD_ROOT/new_${V_KEY[$i]#retro_}"
+    V_MFLAGS[$i]="$(rp_variant_merge_args "$tok" | tr '\n' ' ')"
+done
+
+# Leftovers from an interrupted run are only temporary copies. The staging
+# folder lives under .retroplay and is cleared by rp_tidy_state in step 1,
+# which also reports how much it freed.
+if [ "$DRY_RUN" -eq 0 ]; then
+    rm -rf -- "$WORK_ROOT"
+    rm -f "$RP_LOG_ROOT/retroerror.log"
+fi
+
+finish() {
+    local st=$? errs=0 result body sname ssecs free_left namew
+    # Only a build that actually began has a build time. finish() runs for
+    # every exit, so without this a "nothing to do" run, or one stopped in
+    # Preflight, reported its plan or preflight time as "build".
+    [ "$BUILD_TIMER_STARTED" -eq 1 ] && stage_end build_seconds
+    if [ "$DRY_RUN" -eq 0 ]; then rp_lock_release; fi
+    rm -f "$REPORT_TMP".* 2>/dev/null        # .missing, .fetch and anything else
+    if [ "$DRY_RUN" -eq 1 ]; then rm -f "$REPORT_TMP"; return; fi
+    rm -rf -- "$WORK_ROOT" "$STAGE_ROOT"
+    [ -s "$RP_LOG_ROOT/retroerror.log" ] && errs="$(grep -c . "$RP_LOG_ROOT/retroerror.log")"
+    case "$st" in
+        0) result="Finished successfully" ;;
+        2) result="Nothing to do - everything is up to date" ;;
+        5) result="Finished, but some archives couldn't be extracted (exit 5: they'll be retried)" ;;
+        *) result="FAILED (exit $st: $(rp_exit_meaning "$st"))${FAIL_REASON:+ - $FAIL_REASON}" ;;
+    esac
+    # For the status view: the last run's result.
+    rp_state_init
+    printf 'code=%s\ntime=%s\nresult=%s\nreport=%s/%s.txt\n' "$st" "$(rp_ts)" "$result" "${REPORT_DIR##*/}" "$RUN_TS" \
+        | rp_atomic_write "$RP_STATE_DIR/last_run"
+    if [ "$st" -ne 2 ] || [ -s "$REPORT_TMP" ]; then
+        # The names clean-up opens this phase itself when it runs.
+        [ "$FINALISE_SHOWN" -eq 1 ] || rp_step 5 "$TOTAL_STEPS" "Finalise - report, notifications, tidy-up"
+        mkdir -p "$REPORT_DIR"
+        {
+            echo "Amiga Retroplay run report - $(date '+%Y-%m-%d %H:%M:%S')"
+            echo "Result:   $result"
+            if [ -n "$VARIANT_ROWS" ]; then
+                echo
+                # The name column is as wide as the longest name in this run
+                # (retro_aga_laced is 15), so the columns stay lined up.
+                namew="$(printf '%s' "$VARIANT_ROWS" | awk -F'|' 'BEGIN { w = 10 } length($1) > w { w = length($1) } END { print w }')"
+                printf "  %-${namew}s %6s %9s %9s  %-8s %s\n" "Collection" "Games" "Size(MB)" "Time" "Artwork" "Result"
+                printf "  %-${namew}s %6s %9s %9s  %-8s %s\n" "$(printf "%${namew}s" '' | tr ' ' '-')" "------" "--------" "--------" "--------" "-------"
+                printf '%s' "$VARIANT_ROWS" | while IFS='|' read -r k g m t a n || [ -n "$k" ]; do
+                    [ -n "$k" ] || continue
+                    printf "  %-${namew}s %6s %9s %9s  %-8s %s\n" "$k" "$g" "$m" "$t" "$a" "$n"
+                done
+                echo
+            fi
+            printf 'Total time: %d:%02d:%02d\n' $((SECONDS / 3600)) $(((SECONDS % 3600) / 60)) $((SECONDS % 60))
+            # Where the time actually went. Useful on a Pi, and the thing to
+            # look at before changing any JOBS setting.
+            if [ -n "$STAGE_TIMES" ]; then
+                echo "Time per stage (seconds):"
+                printf '%s' "$STAGE_TIMES" | while IFS='=' read -r sname ssecs; do
+                    [ -n "$sname" ] || continue
+                    printf '  %-22s %s\n' "${sname%_seconds}" "$ssecs"
+                done
+            fi
+            if [ $((EXTRACT_SECS + SORT_SECS + MERGE_SECS + INSTALL_SECS)) -gt 0 ]; then
+                echo "Inside the build (seconds, all collections together):"
+                printf '  %-22s %s\n' "extract" "$EXTRACT_SECS" "sort" "$SORT_SECS" \
+                    "artwork merge" "$MERGE_SECS" "install" "$INSTALL_SECS"
+            fi
+            echo
+            [ -s "$REPORT_TMP" ] && cat "$REPORT_TMP" && echo
+            if [ "$errs" -gt 0 ]; then
+                echo "Errors/warnings logged: $errs line(s) - see retroerror.log"
+            else
+                echo "No errors logged."
+            fi
+            free_left="$(rp_free_kb "$RP_OUTPUT_ROOT")"      # asked once, not twice
+            [ -n "$free_left" ] && echo "Free space left: $(( free_left / 1024 )) MB"
+        } > "$REPORT_DIR/$RUN_TS.txt"
+        echo
+        echo "======================== Summary ========================"
+        cat "$REPORT_DIR/$RUN_TS.txt"
+        echo "(saved as ${REPORT_DIR##*/}/$RUN_TS.txt)"
+        # Only the latest report is kept. Now that this run's is written, the
+        # earlier ones (and their no-artwork lists) go. Report names start
+        # with the run's timestamp, so anything not starting with this run's
+        # belongs to an older run. A run that writes no report - nothing to
+        # do - never gets here, so the previous report stays to be read.
+        for _rep in "$REPORT_DIR"/[0-9]*.txt; do
+            [ -f "$_rep" ] || continue
+            case "${_rep##*/}" in
+                "$RUN_TS"*) ;;
+                *) rm -f -- "$_rep" ;;
+            esac
+        done
+        unset _rep
+    fi
+    [ -n "${ARTWORK_NOTE:-}" ] && result="$result ($ARTWORK_NOTE)"
+    body="$(cat "$REPORT_DIR/$RUN_TS.txt" 2>/dev/null)"
+    if [ "$st" -ne 0 ] && [ "$st" -ne 2 ]; then
+        rp_notify "Amiga Retroplay: $(rp_exit_meaning "$st")" "${body:-$result}"
+    elif [ "$st" -eq 0 ] && [ "$RP_NOTIFY_ON_SUCCESS" = "yes" ]; then
+        rp_notify "Amiga Retroplay: run finished" "$body"
+    fi
+    rm -f "$REPORT_TMP"
+
+    # Last thing on the screen, after the summary, however the run ended:
+    # the PFS filename warning (only when building for PFS).
+    [ "$DRY_RUN" -eq 0 ] && rp_pfs_reminder
+}
+trap finish EXIT
+trap 'fail_with "$RP_EXIT_INTERRUPTED" "interrupted"' INT TERM
+
+# ----- Safety checks before touching anything -----
+# Everything from here on says what it is doing before it does it: the first
+# steps can take a while on a Pi (tidying folders, checking artwork), and
+# silence looks like a hung script.
+TOTAL_STEPS=5
+if ! rp_quiet; then
+echo
+echo "${RP_C_HEAD}Amiga Retroplay${RP_C_OFF} - $([ "$DRY_RUN" -eq 1 ] && echo "plan only, nothing will be changed" || echo "building: $(printf '%s ' "${V_KEY[@]}")")"
+echo "${RP_C_DIM}Collection: $RP_BUILD_ROOT   Archives: $RP_DOWNLOAD_ROOT   Artwork: $RP_ARTWORK_ROOT${RP_C_OFF}"
+fi
+if [ "$DRY_RUN" -eq 0 ]; then
+    stage_start
+    rp_step 1 "$TOTAL_STEPS" "Preflight - settings, tools and the output drive"
+    rp_restore_state_if_lost
+    # After the restore: this writes a timestamp into the state folder, and
+    # doing it earlier made a lost state folder look present.
+    rp_check_for_update
+    rp_info '      checking the tools this run needs...'
+    rp_require_tools lha 7z unar || fail "some tools this run needs are not on PATH - nothing was downloaded or changed"
+    command -v unlzx >/dev/null 2>&1 || rp_warn "unlzx is not installed - .lzx archives will be skipped (./setup.sh installs it)"
+    rp_require_bash4 || fail_with "$RP_EXIT_CONFIG" "cannot add artwork without bash 4 - nothing was downloaded or changed"
+    rp_info '      checking the output folder is there...'
+    rp_check_output_root || fail_with "$RP_EXIT_CONFIG" "the output folder did not pass its check (details above) - nothing was changed"
+    rp_info '      tidying the folder layout if needed...'
+    rp_migrate_layout      # only once the output drive is known to be there
+    rp_info '      tidying leftovers in .retroplay...'
+    rp_tidy_state
+    rp_info '      clearing old logs...'
+    rp_prune_logs
+    rp_info '      backing up the queue and build markers...'
+    rp_backup_state
+    rp_done "ready"
+else
+    rp_step 1 "$TOTAL_STEPS" "Preflight - settings and tools (plan only)"
+    rp_check_output_root dry || rp_die "$RP_EXIT_CONFIG" "the output folder did not pass its check (details above)"
+fi
+
+# ============================================================================
+# 0. Artwork check (before the game pipeline, inside this run's single lock)
+# ============================================================================
+# ARTWORK_SYNC: no = never here; ask = only when run by hand and artwork is
+# missing; auto/yes = check at most once every ARTWORK_CHECK_INTERVAL_HOURS.
+# artwork_sync.sh runs in library mode so it does NOT take a second lock.
+ARTWORK_NOTE=""
+stage_end preflight_seconds
+artwork_preflight() {
+    local due_stamp="$RP_STATE_DIR/artwork_last_check" rc=0 mode="$RP_ARTWORK_SYNC"
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    [ -f "$SCRIPT_DIR/artwork_sync.sh" ] || return 0
+    case "$mode" in
+        no) return 0 ;;
+        ask)
+            # Missing artwork is fetched without asking - a build without it
+            # produces a collection with no pictures, which is never wanted.
+            # (The question only remains for the interval check below.)
+            : ;;
+        auto|yes)
+            if [ -f "$due_stamp" ] && [ -z "$(find "$due_stamp" -mmin "+$(( RP_ARTWORK_CHECK_INTERVAL_HOURS * 60 ))" 2>/dev/null)" ]; then
+                rp_debug "artwork checked recently - skipping"
+                return 0
+            fi ;;
+    esac
+    # Only the artwork the variants in THIS run need; a full run (every
+    # variant in VARIANTS) fetches everything the source offers.
+    local art_args="" i_ nvar=0
+    for i_ in "${!V_TOK[@]}"; do art_args="$art_args --for ${V_TOK[$i_]}"; nvar=$((nvar + 1)); done
+    if [ "$nvar" -ge "$(printf '%s' "$RP_VARIANTS" | tr ',' ' ' | wc -w)" ]; then
+        art_args="--all-artwork"
+    fi
+    # Anything missing? Then fetch it now, before the collection is built.
+    local missing
+    missing="$(rp_artwork_missing "$(printf '%s ' "${V_TOK[@]}")" | tr '\n' ' ')"
+    if [ -n "$missing" ]; then
+        rp_info "  Artwork: not installed yet for $missing- downloading it now"
+    else
+        # Nothing missing: only check again when the interval says so.
+        if [ "$mode" != "auto" ] && [ "$mode" != "yes" ]; then
+            rp_debug "artwork present and ARTWORK_SYNC=$mode - not checking for updates"
+            return 0
+        fi
+        rp_info "  Artwork: checking the packs for updates ($art_args)"
+    fi
+    # shellcheck disable=SC2086
+    ./artwork_sync.sh --sync $art_args --called-from-all; rc=$?
+    rp_state_init
+    # The "checked recently" stamp is only written when the check actually
+    # finished. A pack that failed to download (a 503 from the source, a
+    # dropped connection) is NOT recorded as current: its manifest in
+    # .retroplay is left exactly as it was, and removing the stamp means the
+    # very next run tries again instead of waiting out the 24 hour interval.
+    case "$rc" in
+        0|2) : > "$due_stamp" ;;
+        *)   rm -f "$due_stamp" ;;
+    esac
+    case "$rc" in
+        0) ARTWORK_NOTE="artwork updated"; report "[Artwork] packs updated (see the messages above)" ;;
+        2) report "[Artwork] no changes" ;;
+        *)
+            ARTWORK_NOTE="artwork update had problems; the previous artwork was kept"
+            report "[Artwork] WARNING: update did not complete - your previous artwork was kept"
+            rp_warn "the pack(s) that failed were not recorded as up to date - the next run will try them again"
+            if [ "$RP_ARTWORK_FAILURE_POLICY" = "fail" ]; then
+                fail_with "$RP_EXIT_INTEGRITY" "artwork update failed and ARTWORK_FAILURE_POLICY=fail - stopping before any collection changes (queues are untouched)"
+            fi
+            WARN_ONLY=1 ;;
+    esac
+    return 0
+}
+# The five phases the run announces - Preflight, Updates, Plan, Build,
+# Finalise - are owned here. Artwork and the archive server are both
+# "updates", so they are lines under phase 2 rather than phases of their own.
+rp_step 2 "$TOTAL_STEPS" "Updates - artwork packs and new archives"
+stage_start
+artwork_preflight
+stage_end artwork_seconds
+
+# ============================================================================
+# 1. Check for updates
+# ============================================================================
+# Folders from older versions of these scripts get markers first, so that
+# anything downloaded now is queued for them.
+if [ "$DRY_RUN" -eq 0 ]; then
+    for i in "${!V_TOK[@]}"; do
+        # A build cut short while swapping the new collection in leaves the
+        # previous one under a .previous_ name: put it back before anything
+        # else looks at the folder.
+        rp_recover_swap "${V_DEST[$i]}"
+        # Likewise a batch of games cut off while being installed.
+        rp_recover_collection "${V_KEY[$i]}" "${V_DEST[$i]}"
+        rp_adopt_legacy "${V_KEY[$i]}" "${V_DEST[$i]}"
+    done
+fi
+
+stage_start
+if [ "$SKIP_UPDATE" -eq 0 ]; then
+    rp_info "  Archives: checking the Retroplay server for new ones"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        RP_CHILD=1 ./update.sh --dry-run
+    else
+        RP_CHILD=1 ./update.sh; ust=$?
+        case "$ust" in
+            0|2) ;;
+            3) fail_with "$RP_EXIT_REMOTE" "could not update from the Retroplay server (network or server problem) - will retry next run" ;;
+            4) fail_with "$RP_EXIT_CONFIG" "update.sh could not run (missing tool or bad setup - see above)" ;;
+            *) fail "update.sh failed (exit $ust)" ;;
+        esac
+    fi
+    echo
+else
+    rp_info "  Archives: not checked this run (--skip-update / --rebuild) - using what is already downloaded"
+fi
+
+# ============================================================================
+# 2. Decide what each variant needs
+# ============================================================================
+for i in "${!V_TOK[@]}"; do
+    state="$(rp_build_state "${V_KEY[$i]}" "${V_DEST[$i]}")"
+    q="$(rp_queue_count "${V_KEY[$i]}")"
+    if [ "$CLEAN" -eq 1 ]; then
+        V_ACT[$i]=full; V_WHY[$i]="rebuild requested"
+    elif [ "$state" = fresh ]; then
+        V_ACT[$i]=full; V_WHY[$i]="not built yet"
+    elif [ "$state" = incomplete ]; then
+        V_ACT[$i]=full; V_WHY[$i]="the last full build was interrupted - redoing it"
+    elif [ -n "$(rp_layout_problems "${V_DEST[$i]}")" ]; then
+        # e.g. a Users/<you>/Downloads/Amiga/... tree from the old path bug.
+        # Games in there never got artwork or sorting, so rebuild cleanly.
+        V_ACT[$i]=full
+        V_WHY[$i]="folders in the wrong place ($(rp_layout_problems "${V_DEST[$i]}" | tr '\n' ' ' | sed 's/ $//')) - rebuilding it correctly"
+    elif [ "$q" -gt 0 ]; then
+        V_ACT[$i]=update; V_WHY[$i]="$q new archive(s) queued"
+    elif [ "$REFRESH_ART" -eq 1 ]; then
+        V_ACT[$i]=gapfill; V_WHY[$i]="up to date - refreshing the artwork for every game"
+    elif [ "$FORCE" -eq 1 ]; then
+        V_ACT[$i]=gapfill; V_WHY[$i]="up to date - artwork gap-fill only"
+    elif rp_gapfill_due "${V_KEY[$i]}"; then
+        V_ACT[$i]=gapfill; V_WHY[$i]="up to date - artwork packs changed (or ${RP_GAPFILL_DAYS}-day check): filling in missing artwork"
+    else
+        V_ACT[$i]=none; V_WHY[$i]="up to date"
+    fi
+done
+
+stage_end update_seconds
+stage_start
+rp_step 3 "$TOTAL_STEPS" "Plan - working out what each collection needs"
+echo
+for i in "${!V_TOK[@]}"; do
+    printf '  %-16s %-8s %s%s\n' "${V_KEY[$i]}" "${V_ACT[$i]}" "${V_WHY[$i]}" \
+        "${V_EXCL[$i]:+  (leaving out: ${V_EXCL[$i]})}"
+done
+echo
+
+# Saved batches with the wrong layout are only broken copies (the games are
+# in the archives and get rebuilt) - remove them so they can't be copied on.
+for i in "${!V_TOK[@]}"; do
+    for b in "${V_NEW[$i]}"/*; do
+        [ -d "$b" ] && [ -n "$(rp_layout_problems "$b")" ] || continue
+        if [ "$DRY_RUN" -eq 1 ]; then
+            echo "Would remove ${b#"$RP_OUTPUT_ROOT"/} (wrong folder layout)"
+        else
+            rm -rf -- "$b"
+            echo "Removed ${b#"$RP_OUTPUT_ROOT"/} - it had the wrong folder layout"
+            report "Removed ${b#"$RP_OUTPUT_ROOT"/} (wrong folder layout from the old path bug)"
+        fi
+    done
+done
+
+# ============================================================================
+# Amiga-safe names (the first job of the Finalise phase)
+# ============================================================================
+# Runs amiga_names.py - which ships beside these scripts and is used exactly
+# as it is - over what this suite built, so accented letters and the
+# characters # ? \ never reach the Amiga in a file or drawer name. (- and +
+# are legal there and are left alone.)
+#
+# Purpose:       python3 amiga_names.py --apply <folder>, for every collection
+#                (build/retro_*) and every dated batch (build/new_*/<date>).
+# Inputs:        AMIGA_NAMES (retroplay.conf; --amiga-names/--no-amiga-names
+#                override it for one run). The script is looked for beside
+#                these scripts, then in the main folder (for a scripts/ layout
+#                where it was left behind).
+# Outputs:       a progress bar; one line in the run report; the full list of
+#                changes in logs/amiga_names.log (only when something changed).
+# Side effects:  renames files and folders INSIDE those folders. Run while
+#                this run still holds the lock, so nothing else is working on
+#                a collection at the same time.
+#
+# Why per folder and not once over build/: amiga_names.py never renames the
+# folder it is given, only what is inside it. The dated batch folders are
+# named by the suite (2026-11-15_020000) and rp_prune_batches sorts them by
+# that name to decide which is oldest, so no clean-up rule - today's or a
+# later one - may ever get to rewrite them. Handing over each collection and
+# each batch separately cleans everything inside them and leaves the names
+# the suite itself relies on alone.
+#
+# A problem here never fails the run: the collections are already installed.
+# (Defined here, ahead of the build, because the "nothing to do" exit just
+# below can call it too.)
+# The three pieces below are shared by the clean-up itself and by --dry-run,
+# which shows what the clean-up would do without doing it.
+
+# amiga_names_find: where to look and what to run.
+# Outputs:  AN_TARGETS (folders), AN_PY (the script), AN_WHY (why not, if so).
+# Returns:  0 ready; 1 nothing to check; 2 cannot run (AN_WHY says why).
+AN_TARGETS=(); AN_PY=""; AN_WHY=""; AN_TOTAL=0; AN_PYFAIL=0
+amiga_names_find() {
+    local c t seen
+    AN_TARGETS=(); AN_PY=""; AN_WHY=""
+    for c in "$RP_BUILD_ROOT"/retro "$RP_BUILD_ROOT"/retro_* "$RP_BUILD_ROOT"/new_*/*; do
+        [ -d "$c" ] && [ ! -L "$c" ] && AN_TARGETS+=("$c")
+    done
+    # A collection built somewhere else with --dest belongs to this run too.
+    for c in ${V_DEST[@]+"${V_DEST[@]}"}; do
+        [ -d "$c" ] || continue
+        seen=0
+        for t in ${AN_TARGETS[@]+"${AN_TARGETS[@]}"}; do [ "$t" = "$c" ] && seen=1; done
+        [ "$seen" -eq 1 ] || AN_TARGETS+=("$c")
+    done
+    [ "${#AN_TARGETS[@]}" -gt 0 ] || return 1
+    for c in "$SCRIPT_DIR/amiga_names.py" "$RP_BASE_DIR/amiga_names.py"; do
+        [ -f "$c" ] && { AN_PY="$c"; break; }
+    done
+    if [ -z "$AN_PY" ]; then AN_WHY="amiga_names.py is missing from $SCRIPT_DIR"; return 2; fi
+    if ! command -v python3 >/dev/null 2>&1; then AN_WHY="python3 is not installed"; return 2; fi
+    return 0
+}
+
+# amiga_names_scan <plan file>: ask what WOULD change - amiga_names.py with
+# no --apply, which renames nothing. This is what gives the bar a real total,
+# and on most nights it is the only pass.
+# Outputs:  <plan>      "<count><TAB><folder>" for each folder with changes
+#           <plan>.list every PREVIEW/SKIP line, as amiga_names.py printed it
+#           <plan>.err  anything it wrote to stderr
+#           AN_TOTAL (names that would change), AN_PYFAIL (folders it failed on)
+amiga_names_scan() {
+    local plan="$1" t planned checked=0
+    AN_TOTAL=0; AN_PYFAIL=0
+    : > "$plan"; : > "$plan.err"; : > "$plan.list"
+    RP_PROGRESS_LAST=""
+    for t in "${AN_TARGETS[@]}"; do
+        if ! PYTHONIOENCODING=utf-8 python3 "$AN_PY" "$t" > "$plan.out" 2>> "$plan.err" < /dev/null; then
+            AN_PYFAIL=$((AN_PYFAIL + 1))
+        fi
+        grep -E '^(PREVIEW|SKIP)' "$plan.out" >> "$plan.list" 2>/dev/null
+        planned="$(grep -c -E '^(PREVIEW|SKIP)' "$plan.out" 2>/dev/null)"
+        case "$planned" in ''|*[!0-9]*) planned=0 ;; esac
+        if [ "$planned" -gt 0 ]; then
+            printf '%s\t%s\n' "$planned" "$t" >> "$plan"
+            AN_TOTAL=$((AN_TOTAL + planned))
+        fi
+        checked=$((checked + 1))
+        rp_progress "$checked" "${#AN_TARGETS[@]}" "Checking names"
+    done
+    rm -f "$plan.out"
+}
+
+# amiga_names_plan: the --dry-run view. Reads only; renames nothing.
+amiga_names_plan() {
+    local plan="$REPORT_TMP.names" planned t n=0 line
+    if [ "$AMIGA_NAMES" != "yes" ]; then
+        echo "Amiga-safe names: off (AMIGA_NAMES=no or --no-amiga-names) - no names would be changed."
+        return 0
+    fi
+    amiga_names_find
+    case "$?" in
+        1) echo "Amiga-safe names: nothing built yet, so nothing to check."; return 0 ;;
+        2) echo "Amiga-safe names: would be skipped - $AN_WHY."; return 0 ;;
+    esac
+    echo "Amiga-safe names - what the clean-up at the end of a run would change, as things stand:"
+    amiga_names_scan "$plan"
+    if [ "$AN_PYFAIL" -gt 0 ]; then
+        echo "  (could not check $AN_PYFAIL folder(s): $(tail -1 "$plan.err" 2>/dev/null))"
+    fi
+    if [ "$AN_TOTAL" -eq 0 ]; then
+        echo "  nothing - every name in ${#AN_TARGETS[@]} folder(s) is already Amiga-safe"
+    else
+        while IFS="$(printf '\t')" read -r planned t; do
+            [ -n "$t" ] && printf '  %-34s %s name(s)\n' "${t#"$RP_BUILD_ROOT"/}" "$planned"
+        done < "$plan"
+        echo "  For example:"
+        while IFS= read -r line; do
+            n=$((n + 1)); [ "$n" -le 8 ] || break
+            line="${line#PREVIEW: }"
+            printf '    %s\n' "${line/"$RP_BUILD_ROOT"\//}"
+        done < "$plan.list"
+        [ "$AN_TOTAL" -gt 8 ] && echo "    ...and $((AN_TOTAL - 8)) more"
+        echo "  (SKIP = the Amiga-safe name is already taken, so that one is left as it is.)"
+    fi
+    echo "  Games this run would add are checked when they arrive."
+    rm -f "$plan" "$plan.err" "$plan.list"
+    return 0
+}
+
+amiga_names_cleanup() {
+    local planned line t
+    local plan="$REPORT_TMP.names" log="$RP_LOG_ROOT/amiga_names.log"
+    local n=0 renamed=0 skipped=0 errors=0 t0=$SECONDS total pyfail
+    [ "$DRY_RUN" -eq 0 ] || return 0
+    if [ "$AMIGA_NAMES" != "yes" ]; then
+        rp_verbose "Amiga-safe names: off (AMIGA_NAMES=no or --no-amiga-names)"
+        return 0
+    fi
+    amiga_names_find
+    case "$?" in
+        1) return 0 ;;
+        2)
+            rp_step 5 "$TOTAL_STEPS" "Finalise - Amiga-safe names, report, notifications, tidy-up"
+            FINALISE_SHOWN=1
+            rp_warn "$AN_WHY - names were not checked (./doctor.sh explains the fix; AMIGA_NAMES=\"no\" turns this off)"
+            report "[Amiga names] skipped - $AN_WHY"
+            return 0 ;;
+    esac
+
+    rp_step 5 "$TOTAL_STEPS" "Finalise - Amiga-safe names, report, notifications, tidy-up"
+    FINALISE_SHOWN=1
+
+    rp_info "      checking names in ${#AN_TARGETS[@]} folder(s) under $RP_BUILD_ROOT"
+    amiga_names_scan "$plan"
+    total="$AN_TOTAL"; pyfail="$AN_PYFAIL"
+    if [ "$pyfail" -gt 0 ]; then
+        rp_warn "amiga_names.py could not check $pyfail of ${#AN_TARGETS[@]} folder(s): $(tail -1 "$plan.err" 2>/dev/null)"
+        report "[Amiga names] WARNING: $pyfail folder(s) could not be checked - $(tail -1 "$plan.err" 2>/dev/null)"
+    fi
+
+    if [ "$total" -eq 0 ]; then
+        rp_info "      every name is already Amiga-safe"
+        [ "$pyfail" -gt 0 ] || report "[Amiga names] checked ${#AN_TARGETS[@]} folder(s) - every name is already Amiga-safe"
+    else
+        # Pass 2: the same command with --apply. amiga_names.py prints one
+        # line per name it handles (RENAMED / SKIP / ERROR); each line moves
+        # the bar on one and goes into the log. -u so the lines arrive as
+        # they happen rather than in bursts.
+        mkdir -p "$RP_LOG_ROOT" 2>/dev/null
+        {
+            echo "Amiga-safe names - $(rp_ts)"
+            echo "Command: python3 $AN_PY --apply <folder>   (for each folder named below)"
+            echo
+        } > "$log"
+        RP_PROGRESS_LAST=""
+        while IFS="$(printf '\t')" read -r planned t; do
+            [ -n "$t" ] || continue
+            printf '== %s\n' "$t" >> "$log"
+            while IFS= read -r line; do
+                printf '%s\n' "$line" >> "$log"
+                case "$line" in
+                    RENAMED:*) renamed=$((renamed + 1)) ;;
+                    SKIP*)     skipped=$((skipped + 1)) ;;
+                    ERROR:*)   errors=$((errors + 1)) ;;
+                    *)         continue ;;                 # a traceback line, kept in the log
+                esac
+                n=$((n + 1))
+                if [ "$n" -le "$total" ] && { [ $((n % 25)) -eq 0 ] || [ "$n" -eq "$total" ]; }; then
+                    rp_progress "$n" "$total" "Amiga-safe names"
+                fi
+            done < <(PYTHONIOENCODING=utf-8 python3 -u "$AN_PY" --apply "$t" 2>&1 < /dev/null)
+        done < "$plan"
+        # Finish the bar's line if the count came up short of the plan.
+        [ "$n" -lt "$total" ] && rp_progress "$total" "$total" "Amiga-safe names"
+
+        line="$renamed renamed"
+        [ "$skipped" -gt 0 ] && line="$line, $skipped left as they were (the Amiga-safe name is already taken)"
+        [ "$errors" -gt 0 ] && line="$line, $errors could not be renamed"
+        rp_info "      $line - list: ${RP_LOG_ROOT##*/}/amiga_names.log"
+        report "[Amiga names] $line (list: ${RP_LOG_ROOT##*/}/amiga_names.log)"
+        if [ "$errors" -gt 0 ]; then
+            # Counted with the run's other errors, so the summary cannot say
+            # "No errors logged" after a name failed to change.
+            {
+                printf '===== amiga_names.log =====\n'
+                grep '^ERROR:' "$log"
+                printf '\n'
+            } >> "$RP_LOG_ROOT/retroerror.log"
+        fi
+    fi
+    rm -f "$plan" "$plan.err" "$plan.list"
+    if [ "$pyfail" -eq 0 ] && [ "$errors" -eq 0 ]; then
+        rp_state_init
+        rp_ts | rp_atomic_write "$AMIGA_NAMES_MARK"
+    fi
+    STAGE_TIMES="${STAGE_TIMES}amiga_names_seconds=$(( SECONDS - t0 ))
+"
+    return 0
+}
+
+any_work=0
+for i in "${!V_TOK[@]}"; do [ "${V_ACT[$i]}" != none ] && any_work=1; done
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    for i in "${!V_TOK[@]}"; do
+        [ "${V_ACT[$i]}" = update ] || continue
+        echo "Queued for ${V_KEY[$i]}:"
+        n=0
+        while IFS= read -r p; do
+            n=$((n + 1)); [ "$n" -le 10 ] || continue
+            note=""
+            [ -f "$RP_DOWNLOAD_ROOT/$p" ] || note="  (superseded - will be skipped)"
+            [ -n "${V_EXCL[$i]}" ] && rp_archive_has_tag "$p" "${V_EXCL[$i]}" && note="  (left out: ${V_EXCL[$i]})"
+            echo "    $p$note"
+        done < "$(rp_queue_file "${V_KEY[$i]}")"
+        [ "$n" -gt 10 ] && echo "    ...and $((n - 10)) more"
+    done
+    for i in "${!V_TOK[@]}"; do
+        if [ "${V_ACT[$i]}" = full ]; then
+            akb="$(rp_du_kb "$RP_DOWNLOAD_ROOT")"
+            free_kb_now="$(rp_free_kb "$RP_OUTPUT_ROOT")"
+            echo "A full build needs roughly $(( akb * RP_SPACE_FACTOR * 2 / 1024 )) MB free; $(( ${free_kb_now:-0} / 1024 )) MB available."
+            break
+        fi
+    done
+    echo
+    amiga_names_plan
+    echo
+    echo "Dry run only - nothing was changed."
+    exit 0
+fi
+
+if [ "$any_work" -eq 0 ]; then
+    echo "Nothing new to process - every variant is up to date."
+    # Nothing was built, so there is nothing new to rename - except the first
+    # time: collections built before this clean-up existed (or while it was
+    # switched off) have never been through it. Once it has completed, quiet
+    # nights skip it again; it is a walk of every file in build/.
+    [ -f "$AMIGA_NAMES_MARK" ] || amiga_names_cleanup
+    exit 2
+fi
+stage_end plan_seconds
+stage_start
+BUILD_TIMER_STARTED=1
+mkdir -p "$WORK_ROOT" "$STAGE_ROOT"
+
+# extract.sh writes extract_errors.log into the folder it runs from; when
+# that's a temporary staging folder, move the log out before it's deleted.
+rescue_extract_log() {
+    if [ -s "$1/extract_errors.log" ]; then
+        cat "$1/extract_errors.log" >> "$RP_LOG_ROOT/extract_errors.log"
+    fi
+}
+
+# stage_failed <exit status> <what failed> <log heading>
+# Every stage failure says the same four things: which stage, the exit status
+# and what it means, that the previous collection is untouched, and where the
+# details are. "ERROR: sorting failed" said none of them, and nothing reached
+# the logs either.
+stage_failed() {
+    local rc="$1" what="$2" heading="$3"
+    collect_stage_logs "$heading" || true
+    mkdir -p "$RP_LOG_ROOT" 2>/dev/null
+    {
+        printf '===== %s failed =====\n' "$what"
+        printf '%s  exit status %s (%s)\n' "$(rp_ts)" "$rc" "$(rp_exit_meaning "$rc")"
+        printf 'The collection in %s was not changed; the archives stay queued.\n\n' "$RP_BUILD_ROOT"
+    } >> "$RP_LOG_ROOT/retroerror.log"
+    {
+        echo
+        echo "$what failed with exit status $rc ($(rp_exit_meaning "$rc"))."
+        echo "  Nothing in $RP_BUILD_ROOT was changed, and the archives stay queued for the next run."
+        echo "  Details: $RP_LOG_ROOT/retroerror.log"
+        echo "  The stage's own last message, just above this, usually names the cause."
+    } >&2
+    fail "$what failed (exit $rc) - see logs/retroerror.log"
+}
+
+# all.sh calls the stage scripts directly rather than through start.sh, so the
+# log gathering start.sh does at the end of a manual run never happens here.
+# Without this, retroerror.log stayed empty for a pipeline run and the summary
+# cheerfully reported "No errors logged" after a stage had written a full page
+# of them. Each stage log is appended under its own heading and then removed,
+# so the next stage's errors cannot be mistaken for this one's.
+collect_stage_logs() {   # collect_stage_logs <heading>
+    local f name found=0
+    for f in "$RP_LOG_ROOT"/extract_errors.log "$RP_LOG_ROOT"/merge_errors.log \
+             "$RP_LOG_ROOT"/sort.log "$RP_LOG_ROOT"/amiga_filename_issues.log; do
+        [ -s "$f" ] || { rm -f -- "$f"; continue; }
+        name="${f##*/}"
+        {
+            printf '===== %s%s =====\n' "$name" "${1:+  ($1)}"
+            cat "$f"
+            printf '\n'
+        } >> "$RP_LOG_ROOT/retroerror.log"
+        rm -f -- "$f"
+        found=1
+    done
+    return "$((1 - found))"
+}
+
+# Safety net: an extracted tree must only contain the archive folders at
+# its top level. Anything else (e.g. a whole absolute path such as
+# Users/<you>/Downloads/Amiga recreated inside it) means the extraction went
+# wrong - stop before it reaches a collection; the batch stays queued.
+check_layout() {
+    local bad
+    bad="$(rp_layout_problems "$1" | tr '\n' ' ')"
+    [ -z "$bad" ] || fail_with "$RP_EXIT_INTEGRITY" "unexpected folder(s) in the extracted files:$bad (expected only WHDLoad, HD_Loaders, JST) - nothing was installed"
+}
+
+# ----- Archives that fail to extract -----
+# Everything that DID extract is installed; failed archives stay queued and
+# are retried next run. After MAX_EXTRACT_ATTEMPTS failures an archive is
+# moved to old/corrupt-<date>/, so the next update downloads a fresh copy
+# (a corrupt download is the usual cause). The run exits 5 so you hear of it.
+INTEGRITY_ISSUES=0
+ATTEMPTS_FILE="$RP_STATE_DIR/extract_attempts.list"      # "<count><TAB><archive>"
+
+# run_extract <failure-accumulator> <extract.sh args...>  (from the current folder)
+run_extract() {
+    local acc="$1" tmp st t0=$SECONDS; shift
+    tmp="$WORK_ROOT/.failed.$$.${RANDOM:-0}"
+    # Run from the downloads folder so the paths inside the collection stay
+    # WHDLoad/... rather than downloads/WHDLoad/...
+    ( cd "$RP_DOWNLOAD_ROOT" && RP_EXTRACT_FAILED_LIST="$tmp" RP_CHILD=1 \
+        bash "$SCRIPT_DIR/extract.sh" --called-from-all "$@" ); st=$?
+    EXTRACT_SECS=$((EXTRACT_SECS + SECONDS - t0))
+    [ -s "$tmp" ] && cat "$tmp" >> "$acc"
+    rm -f "$tmp"
+    case "$st" in
+        0|5) return 0 ;;
+        130) fail_with "$RP_EXIT_INTERRUPTED" "interrupted" ;;
+        *)   fail "the extractor stopped unexpectedly (exit $st)" ;;
+    esac
+}
+
+# match_failures <failure-list> <archive-list>: prints the archives (from the
+# second list, relative paths) that failed. Matched by path SUFFIX, so the
+# way a folder's path happens to be spelled can never cause a mismatch.
+match_failures() {
+    local p line d
+    [ -s "$1" ] || return 0
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        while IFS= read -r line; do
+            case "$line" in
+                DIR:*) d="${line#DIR:}"; case "$d/" in *"/${p%/*}/") printf '%s\n' "$p"; break ;; esac ;;
+                *"/$p") printf '%s\n' "$p"; break ;;
+            esac
+        done < "$1"
+    done < "$2"
+}
+
+clear_extract_failures() {   # <file of archives that extracted fine>
+    [ -s "$ATTEMPTS_FILE" ] && [ -s "$1" ] || return 0
+    awk -F'\t' 'NR == FNR { ok[$0] = 1; next } !($2 in ok)' "$1" "$ATTEMPTS_FILE" | rp_atomic_write "$ATTEMPTS_FILE"
+}
+
+# handle_failed <archive>: counts the attempt; gives up after the limit.
+handle_failed() {
+    local rel="$1" n q dest
+    rp_state_init
+    n="$(awk -F'\t' -v r="$rel" '$2 == r { print $1 }' "$ATTEMPTS_FILE" 2>/dev/null)"
+    n=$(( ${n:-0} + 1 ))
+    { awk -F'\t' -v r="$rel" '$2 != r' "$ATTEMPTS_FILE" 2>/dev/null; printf '%s\t%s\n' "$n" "$rel"; } | rp_atomic_write "$ATTEMPTS_FILE"
+    INTEGRITY_ISSUES=1
+    if [ "$n" -ge "$RP_MAX_EXTRACT_ATTEMPTS" ]; then
+        dest="$RP_DOWNLOAD_ROOT/old/corrupt-$(date '+%Y-%m-%d')/$rel"
+        mkdir -p "$(dirname "$dest")"
+        [ -f "$RP_DOWNLOAD_ROOT/$rel" ] && mv "$RP_DOWNLOAD_ROOT/$rel" "$dest"
+        for q in "$RP_STATE_DIR"/queue/*.list; do
+            [ -f "$q" ] || continue
+            grep -vxF "$rel" "$q" 2>/dev/null | rp_atomic_write "$q"
+            [ -s "$q" ] || rm -f "$q"
+        done
+        awk -F'\t' -v r="$rel" '$2 != r' "$ATTEMPTS_FILE" | rp_atomic_write "$ATTEMPTS_FILE"
+        report "GAVE UP on $rel after $n failed extraction attempts - moved to old/corrupt-$(date '+%Y-%m-%d')/ so the next update downloads a fresh copy"
+    else
+        report "FAILED to extract $rel (attempt $n of $RP_MAX_EXTRACT_ATTEMPTS) - still queued, will retry next run"
+    fi
+}
+
+# merge_variant <index> <folder> [extra merge.sh options...]
+# The stage scripts are run directly. They used to be reached through
+# "./start.sh --merge" and "./start.sh --sort", which meant the pipeline
+# engine called the interactive dispatcher, and every variant re-printed its
+# banner and re-ran the startup checks - one build looked like several
+# unrelated tools starting up in turn. RP_CHILD tells them they are one stage
+# of this run: no banner, no header block, and their counts come back in
+# RP_RESULT_FILE as key=value rather than being read off the screen.
+STAGE_RESULT="$WORK_ROOT/.stage_result.$$"
+merge_variant() {   # (adds --refresh-artwork when asked for)
+    local i="$1" dir="$2"; shift 2
+    local refresh="" t0=$SECONDS st
+    [ "$REFRESH_ART" -eq 1 ] && refresh="--refresh-artwork"
+    mkdir -p "$WORK_ROOT" 2>/dev/null
+    # shellcheck disable=SC2086
+    RP_CHILD=1 RP_RESULT_FILE="$STAGE_RESULT" bash "$SCRIPT_DIR/merge.sh" \
+        ${V_MFLAGS[$i]} --art "${V_ART[$i]}" --demo-art "$DEMO_ART" \
+        -d "$dir" $DEBUG_FLAG $refresh --called-from-all "$@"
+    st=$?
+    MERGE_SECS=$((MERGE_SECS + SECONDS - t0))
+    return "$st"
+}
+
+sort_folder() {
+    local t0=$SECONDS st
+    mkdir -p "$WORK_ROOT" 2>/dev/null
+    # shellcheck disable=SC2086
+    RP_CHILD=1 RP_RESULT_FILE="$STAGE_RESULT" bash "$SCRIPT_DIR/sort.sh" \
+        "$FS_FLAG" $DETOX_FLAG --dest "$1" --called-from-all
+    st=$?
+    SORT_SECS=$((SORT_SECS + SECONDS - t0))
+    return "$st"
+}
+
+# stage_result <key> : the last stage's figure, or empty. Never parses text.
+stage_result() { sed -n "s/^$1=//p" "$STAGE_RESULT" 2>/dev/null | tail -1; }
+
+# After the packs have had their turn: ask the command you configured for
+# anything still missing (off unless ARTWORK_FETCH=yes). Counts go into the
+# run report; a failure here never affects the collection.
+FETCH_FOUND=0
+fetch_missing_artwork() {   # <index> <missing-list-file>
+    local out found
+    [ "$RP_ARTWORK_FETCH" = "yes" ] || return 0
+    [ -s "$2" ] || return 0
+    [ -f "$SCRIPT_DIR/artwork_fetch.sh" ] || return 0
+    out="$REPORT_TMP.fetch"
+    RP_RESULT_FILE="$out" ./artwork_fetch.sh --list "$2" --variant "${V_KEY[$1]}" --dest "${V_DEST[$1]}"
+    found="$(sed -n 's/^found=//p' "$out" 2>/dev/null | tail -1)"
+    case "$found" in ''|*[!0-9]*) found=0 ;; esac
+    if [ "$found" -gt 0 ]; then
+        FETCH_FOUND=$(( FETCH_FOUND + found ))
+        report "${V_KEY[$1]}: found artwork elsewhere for $found game(s) and converted it to IFF"
+    fi
+    rm -f "$out"
+    return 0
+}
+
+save_missing_list() {   # <index> <missing-list-file> ; prints the count
+    local n=0
+    if [ -s "$2" ]; then
+        n="$(grep -c . "$2")"
+        mkdir -p "$REPORT_DIR"
+        sort -u "$2" > "$REPORT_DIR/${RUN_TS}_${V_KEY[$1]}_no_artwork.txt"
+    fi
+    echo "$n"
+}
+
+# ============================================================================
+# 3. Full builds - every archive extracted and sorted ONCE for all of them
+# ============================================================================
+rp_step 4 "$TOTAL_STEPS" "Build - extract, sort, add artwork, install"
+FULL=()
+for i in "${!V_TOK[@]}"; do [ "${V_ACT[$i]}" = full ] && FULL+=("$i"); done
+# A preview shows what the NEW archives would add. A collection that does not
+# exist yet has nothing to add to, so those variants are left for an ordinary
+# run rather than silently building the whole thing under a preview name.
+if [ "$PREVIEW_ONLY" -eq 1 ] && [ "${#FULL[@]}" -gt 0 ]; then
+    for i in "${FULL[@]}"; do
+        rp_warn "${V_KEY[$i]} has not been built yet - there is nothing to preview against"
+        report "${V_KEY[$i]}: skipped - a preview needs an existing collection (run ./start.sh --sync first)"
+    done
+    FULL=()
+fi
+
+if [ "${#FULL[@]}" -gt 0 ]; then
+    names=""; for i in "${FULL[@]}"; do names="$names ${V_KEY[$i]}"; done
+    rp_task "Full build:$names"
+    arch_kb="$(rp_du_kb "$RP_DOWNLOAD_ROOT")"
+    [ "$arch_kb" -gt 0 ] || fail_with "$RP_EXIT_CONFIG" "no downloaded archives found yet (HD_Loaders/, JST/, WHDLoad/) - run once without --rebuild/--skip-update first"
+    est_kb=$((arch_kb * RP_SPACE_FACTOR))
+    rp_require_space "$RP_OUTPUT_ROOT" "$est_kb" "extracting the archives" || fail_with "$RP_EXIT_CONFIG" "not enough disk space to extract the archives"
+    for i in "${FULL[@]}"; do rp_mark_building "${V_KEY[$i]}" "${V_DEST[$i]}"; done
+
+    # Tags some of these variants must leave out (e.g. AGA,CD32 for ECS).
+    # Archives WITHOUT any of them go into "common" (used by every variant);
+    # archives WITH them are extracted separately, so a variant that must
+    # leave them out simply doesn't receive that part. Still one extraction
+    # per archive in the usual setup.
+    ALL_EXCL=""
+    for i in "${FULL[@]}"; do
+        IFS=, read -r -a _tags <<< "${V_EXCL[$i]}"
+        for t in "${_tags[@]+"${_tags[@]}"}"; do
+            [ -n "$t" ] || continue
+            case ",$ALL_EXCL," in *",$t,"*) ;; *) ALL_EXCL="${ALL_EXCL:+$ALL_EXCL,}$t" ;; esac
+        done
+    done
+
+    COMMON="$WORK_ROOT/common"
+    if [ -n "$ALL_EXCL" ]; then
+        rp_subtask "Extracting archives without $ALL_EXCL (shared by all variants)"
+        run_extract "$WORK_ROOT/failed_fresh.list" -u -d "$COMMON" --exclude-tags "$ALL_EXCL" $DEBUG_FLAG
+    else
+        rp_subtask "Extracting all archives"
+        run_extract "$WORK_ROOT/failed_fresh.list" -u -d "$COMMON" $DEBUG_FLAG
+    fi
+    mkdir -p "$COMMON"
+    rp_subtask "Sorting and checking filenames"
+    sort_folder "$COMMON" || stage_failed "$?" "sorting the extracted games" "sort"
+    collect_stage_logs "sort" || true
+    check_layout "$COMMON"
+
+    # One "extra" part per distinct set of left-out tags that isn't "all of
+    # them" (normally just one: the AGA/CD32 releases for AGA and RTG).
+    EXTRA_SET=(); EXTRA_DIR=()
+    for i in "${FULL[@]}"; do
+        ex="${V_EXCL[$i]}"
+        [ -n "$ALL_EXCL" ] || continue
+        [ "$ex" = "$ALL_EXCL" ] && continue
+        seen=0; for s in "${EXTRA_SET[@]+"${EXTRA_SET[@]}"}"; do [ "$s" = "$ex" ] && seen=1; done
+        [ "$seen" -eq 1 ] && continue
+        n="${#EXTRA_SET[@]}"
+        EXTRA_SET+=("$ex"); EXTRA_DIR+=("$WORK_ROOT/extra_$n")
+        rp_subtask "Extracting the $ALL_EXCL archives${ex:+ (without $ex)}"
+        if [ -n "$ex" ]; then
+            run_extract "$WORK_ROOT/failed_fresh.list" -u -d "$WORK_ROOT/extra_$n" --only-tags "$ALL_EXCL" --exclude-tags "$ex" $DEBUG_FLAG
+        else
+            run_extract "$WORK_ROOT/failed_fresh.list" -u -d "$WORK_ROOT/extra_$n" --only-tags "$ALL_EXCL" $DEBUG_FLAG
+        fi
+        mkdir -p "$WORK_ROOT/extra_$n"
+        sort_folder "$WORK_ROOT/extra_$n" || stage_failed "$?" "sorting the releases only some variants get (extra_$n)" "sort"
+        collect_stage_logs "sort" || true
+        check_layout "$WORK_ROOT/extra_$n"
+    done
+
+    remaining="${#FULL[@]}"
+    for i in "${FULL[@]}"; do
+        remaining=$((remaining - 1))
+        dest="${V_DEST[$i]}"; key="${V_KEY[$i]}"
+        extra=""
+        for n in ${EXTRA_SET[@]+"${!EXTRA_SET[@]}"}; do [ "${EXTRA_SET[$n]}" = "${V_EXCL[$i]}" ] && extra="${EXTRA_DIR[$n]}"; done
+        # When this collection's own work starts. ${vstart:-$SECONDS} was the
+        # fallback for a variable nothing ever set, so every "Time" in the
+        # summary came out as zero.
+        vstart=$SECONDS
+        rp_task "$key: installing and adding artwork"
+        # The last variant MOVES the shared tree rather than copying it, so only
+        # the extras need room. Work out which measurement is wanted first and
+        # take it once: this is a full walk of the staged collection.
+        if [ "$remaining" -eq 0 ]; then
+            need_kb="$(rp_du_kb ${extra:+"$extra"})"
+        else
+            need_kb="$(rp_du_kb "$COMMON" ${extra:+"$extra"})"
+        fi
+        free_kb="$(rp_free_kb "$RP_OUTPUT_ROOT")"
+        # The new collection is now built BESIDE the finished one and only
+        # swapped in when it is complete, so the space for both is needed at
+        # once. That is the price of never leaving the drive without a usable
+        # collection if the power goes out mid-build.
+        if [ -n "$free_kb" ] && [ $((need_kb + RP_MIN_FREE_MB * 1024)) -gt "$free_kb" ]; then
+            fail_with "$RP_EXIT_CONFIG" "not enough disk space to build $key beside the collection you already have (needs about $((need_kb / 1024)) MB free; the previous collection is kept until the new one is finished)"
+        fi
+        staged="$(rp_staged_path "$dest")"
+        rm -rf -- "$staged"
+        mkdir -p "$(dirname "$dest")"
+        _it0=$SECONDS
+        if [ "$remaining" -eq 0 ]; then
+            mv "$COMMON" "$staged" || fail "could not move the build into $staged"
+        else
+            cp -a "$COMMON" "$staged" || fail "could not copy the build into $staged"
+        fi
+        INSTALL_SECS=$((INSTALL_SECS + SECONDS - _it0))
+        [ -n "$extra" ] && { cp -a "$extra/." "$staged/" || fail "could not copy the $ALL_EXCL releases into $staged"; }
+        miss="$REPORT_TMP.missing"; : > "$miss"
+        merge_variant "$i" "$staged" --report-missing "$miss" || stage_failed "$?" "adding artwork to $key" "$key"
+        collect_stage_logs "$key" || true
+        # Everything is in place and merged: now, and only now, the previous
+        # collection is replaced - two renames in one folder, so the moment
+        # where neither is complete is as short as the filesystem can make it.
+        _it0=$SECONDS
+        rp_swap_collection "$dest" || fail "could not put the new $key in place - your previous collection was kept"
+        INSTALL_SECS=$((INSTALL_SECS + SECONDS - _it0))
+        variant_row "$key" "${vstart:-$SECONDS}" "built"
+        rp_mark_complete "$key" "$dest"
+        rp_queue_clear "$key"
+        rp_gapfill_done "$key"          # a full build merged everything
+        mark_success "$key"
+        fetch_missing_artwork "$i" "$miss"
+        games="$(rp_count_games "$dest")"; nomiss="$(save_missing_list "$i" "$miss")"
+        line="$key: full build - $games games${V_EXCL[$i]:+ (without ${V_EXCL[$i]} releases)}, $nomiss without artwork"
+        [ "$nomiss" -gt 0 ] && line="$line (list: ${REPORT_DIR##*/}/${RUN_TS}_${key}_no_artwork.txt)"
+        report "$line"
+    done
+    rm -rf -- "$WORK_ROOT/common" "$WORK_ROOT"/extra_*
+
+    if [ -s "$WORK_ROOT/failed_fresh.list" ]; then
+        ( cd "$RP_DOWNLOAD_ROOT" && find -H HD_Loaders JST WHDLoad -type f \( -iname '*.lha' -o -iname '*.lzx' -o -iname '*.zip' \) 2>/dev/null \
+            | sed 's|^\./||' ) > "$WORK_ROOT/all_archives.list"
+        match_failures "$WORK_ROOT/failed_fresh.list" "$WORK_ROOT/all_archives.list" | sort -u > "$WORK_ROOT/fresh_failed.list"
+        while IFS= read -r rel; do
+            [ -n "$rel" ] || continue
+            for i in "${FULL[@]}"; do
+                q="$(rp_queue_file "${V_KEY[$i]}")"
+                grep -qxF "$rel" "$q" 2>/dev/null || { cat "$q" 2>/dev/null; printf '%s\n' "$rel"; } | rp_atomic_write "$q"
+            done
+            handle_failed "$rel"
+        done < "$WORK_ROOT/fresh_failed.list"
+    fi
+fi
+
+# ============================================================================
+# 4. Updates - queued archives staged, extracted and sorted once per group
+# ============================================================================
+INC=()
+for i in "${!V_TOK[@]}"; do [ "${V_ACT[$i]}" = update ] && INC+=("$i"); done
+
+G_SIG=(); G_MEMBERS=()
+for i in "${INC[@]+"${INC[@]}"}"; do
+    key="${V_KEY[$i]}"
+    cp "$(rp_queue_file "$key")" "$STAGE_ROOT/processed_$key.list"
+    : > "$STAGE_ROOT/applicable_$key.list"
+    while IFS= read -r p; do
+        [ -n "$p" ] && [ -f "$RP_DOWNLOAD_ROOT/$p" ] || continue        # superseded meanwhile
+        [ -n "${V_EXCL[$i]}" ] && rp_archive_has_tag "$p" "${V_EXCL[$i]}" && continue
+        printf '%s\n' "$p" >> "$STAGE_ROOT/applicable_$key.list"
+    done < "$STAGE_ROOT/processed_$key.list"
+    sig="$(sort "$STAGE_ROOT/applicable_$key.list" | cksum | tr ' ' _)"
+    found=""
+    for g in ${G_SIG[@]+"${!G_SIG[@]}"}; do [ "${G_SIG[$g]}" = "$sig" ] && found="$g"; done
+    if [ -n "$found" ]; then
+        G_MEMBERS[$found]="${G_MEMBERS[$found]} $i"
+    else
+        G_SIG+=("$sig"); G_MEMBERS+=("$i")
+    fi
+done
+
+for g in ${G_SIG[@]+"${!G_SIG[@]}"}; do
+    set -- ${G_MEMBERS[$g]}
+    lead="$1"; members="$*"; nmembers=$#
+    list="$STAGE_ROOT/applicable_${V_KEY[$lead]}.list"
+    names=""; for i in $members; do names="$names ${V_KEY[$i]}"; done
+    rp_task "Update:$names"
+
+    if [ ! -s "$list" ]; then
+        for i in $members; do
+            rp_queue_remove_processed "${V_KEY[$i]}" "$STAGE_ROOT/processed_${V_KEY[$i]}.list"
+            report "${V_KEY[$i]}: nothing to add (queued archives were superseded${V_EXCL[$i]:+ or ${V_EXCL[$i]} releases})"
+        done
+        continue
+    fi
+
+    src="$STAGE_ROOT/src_$g"; batch="$WORK_ROOT/batch_$g"
+    narch=0
+    while IFS= read -r p; do
+        mkdir -p "$src/$(dirname "$p")"
+        ln "$RP_DOWNLOAD_ROOT/$p" "$src/$p" 2>/dev/null || cp -p "$RP_DOWNLOAD_ROOT/$p" "$src/$p" || fail "could not stage $p"
+        narch=$((narch + 1))
+    done < "$list"
+
+    est_kb=$(( $(rp_du_kb "$src") * RP_SPACE_FACTOR ))
+    rp_require_space "$RP_OUTPUT_ROOT" $((est_kb * (1 + 2 * nmembers))) "processing $narch new archive(s)" \
+        || fail_with "$RP_EXIT_CONFIG" "not enough disk space to process the new downloads"
+
+    rp_subtask "Extracting $narch new archive(s)"
+    : > "$STAGE_ROOT/failed_$g.list"
+    _xt0=$SECONDS
+    (cd "$src" && RP_EXTRACT_FAILED_LIST="$STAGE_ROOT/failed_$g.list" RP_CHILD=1 \
+        bash "$SCRIPT_DIR/extract.sh" --called-from-all -u -d "$batch" $DEBUG_FLAG)
+    xst=$?
+    EXTRACT_SECS=$((EXTRACT_SECS + SECONDS - _xt0))
+    rescue_extract_log "$src"
+    case "$xst" in
+        0|5) ;;
+        130) fail_with "$RP_EXIT_INTERRUPTED" "interrupted" ;;
+        *)   fail "the extractor stopped unexpectedly (exit $xst)" ;;
+    esac
+    failed_rels="$STAGE_ROOT/failed_rels_$g.list"
+    match_failures "$STAGE_ROOT/failed_$g.list" "$list" | sort -u > "$failed_rels"
+    if [ -s "$failed_rels" ]; then
+        grep -vxF -f "$failed_rels" "$list" > "$STAGE_ROOT/ok_$g.list" || true
+        for i in $members; do       # failed archives stay queued for next time
+            grep -vxF -f "$failed_rels" "$STAGE_ROOT/processed_${V_KEY[$i]}.list" > "$STAGE_ROOT/processed_${V_KEY[$i]}.tmp" || true
+            mv "$STAGE_ROOT/processed_${V_KEY[$i]}.tmp" "$STAGE_ROOT/processed_${V_KEY[$i]}.list"
+        done
+        while IFS= read -r rel; do handle_failed "$rel"; done < "$failed_rels"
+    else
+        cp "$list" "$STAGE_ROOT/ok_$g.list"
+    fi
+    clear_extract_failures "$STAGE_ROOT/ok_$g.list"
+    nfailed="$(grep -c . "$failed_rels" 2>/dev/null)"; nfailed="${nfailed:-0}"
+    mkdir -p "$batch"
+    rp_subtask "Sorting and checking filenames"
+    sort_folder "$batch" || stage_failed "$?" "sorting the new archives" "sort (new batch)"
+    collect_stage_logs "sort (new batch)" || true
+    mkdir -p "$batch"          # sort.sh removes empty folders
+    check_layout "$batch"
+    bgames="$(rp_count_games "$batch")"
+    if [ ! -s "$STAGE_ROOT/ok_$g.list" ]; then
+        for i in $members; do
+            rp_queue_remove_processed "${V_KEY[$i]}" "$STAGE_ROOT/processed_${V_KEY[$i]}.list"
+            report "${V_KEY[$i]}: nothing installed - all $narch new archive(s) failed to extract (they will be retried)"
+        done
+        rm -rf -- "$src" "$batch"
+        continue
+    fi
+
+    remaining="$nmembers"
+    for i in $members; do
+        remaining=$((remaining - 1))
+        key="${V_KEY[$i]}"; dest="${V_DEST[$i]}"; vcopy="$WORK_ROOT/v_$key"
+        vstart=$SECONDS
+        rp_task "$key: adding artwork and installing the new batch"
+        if [ "$remaining" -eq 0 ]; then
+            mv "$batch" "$vcopy" || fail "could not prepare the batch for $key"
+        else
+            cp -a "$batch" "$vcopy" || fail "could not prepare the batch for $key"
+        fi
+        miss="$REPORT_TMP.missing"; : > "$miss"
+        merge_variant "$i" "$vcopy" --report-missing "$miss" || stage_failed "$?" "adding artwork to the new batch for $key" "$key (new batch)"
+        collect_stage_logs "$key (new batch)" || true
+        if [ "$PREVIEW_ONLY" -eq 1 ]; then
+            rp_info "  preview only - $key itself was not changed"
+        else
+            _it0=$SECONDS
+            # The marker says "games are being swapped into this collection";
+            # if the run dies before it is removed, the next run finishes or
+            # undoes each swap before doing anything else (rp_recover_collection).
+            mkdir -p "$RP_STATE_DIR/installing" 2>/dev/null
+            printf 'pid=%s\nrun_id=%s\nstarted=%s\n' "$$" "${RUN_ID:-}" "$(rp_ts)" \
+                | rp_atomic_write "$RP_STATE_DIR/installing/$key"
+            rp_replace_and_copy "$vcopy" "$dest" || fail "copying the new batch into $dest failed - every game already installed is complete, the rest stay queued"
+            rm -f -- "$RP_STATE_DIR/installing/$key"
+            INSTALL_SECS=$((INSTALL_SECS + SECONDS - _it0))
+        fi
+
+        # Keep a dated copy of just this batch (e.g. for copying to the Amiga).
+        rp_migrate_new_dir "${V_NEW[$i]}"
+        mkdir -p "${V_NEW[$i]}"
+        mv "$vcopy" "${V_NEW[$i]}/$RUN_TS" || fail "could not save the batch to ${V_NEW[$i]}"
+        if [ "$PREVIEW_ONLY" -eq 1 ]; then
+            printf '%s\n' \
+                "PREVIEW ONLY - this is NOT a collection." \
+                "" \
+                "These are the games from the archives downloaded on $RUN_TS," \
+                "with artwork added, so you can look at them before they go in." \
+                "$key itself was not changed, and these archives are still" \
+                "queued: the next ordinary run installs them properly." \
+                > "${V_NEW[$i]}/$RUN_TS/PREVIEW_ONLY.txt"
+            # The machine-readable marker: what the tools check. The .txt is
+            # for people browsing the folder.
+            printf 'preview=1\ncollection=%s\ncreated_at=%s\nrun_id=%s\nsuite_version=%s\n' \
+                "$key" "$(rp_ts)" "${RUN_ID:-}" "$RP_SUITE_VERSION" \
+                > "${V_NEW[$i]}/$RUN_TS/.preview_marker"
+        fi
+        rp_prune_batches "${V_NEW[$i]}" "$RP_KEEP_NEW_BATCHES"
+
+        # Fill in artwork for anything in the collection still missing it.
+        # (only when an artwork pack changed, or every GAPFILL_DAYS days)
+        gapnote=""
+        if [ "$PREVIEW_ONLY" -eq 0 ] && { [ "$REFRESH_ART" -eq 1 ] || rp_gapfill_due "$key"; }; then
+            gapmode="--only-missing"
+            [ "$REFRESH_ART" -eq 1 ] && gapmode=""      # every game, not just the gaps
+            echo "  refreshing artwork for $key..."
+            # shellcheck disable=SC2086
+            if merge_variant "$i" "$dest" $gapmode; then collect_stage_logs "$key (gap-fill)" || true; rp_gapfill_done "$key"
+            else gapnote=" (artwork gap-fill reported errors - see retroerror.log)"; fi
+        fi
+        if [ "$PREVIEW_ONLY" -eq 0 ]; then
+            mark_success "$key"
+            rp_queue_remove_processed "$key" "$STAGE_ROOT/processed_$key.list"
+        fi
+        fetch_missing_artwork "$i" "$miss"
+        nomiss="$(save_missing_list "$i" "$miss")"
+        if [ "$PREVIEW_ONLY" -eq 1 ]; then
+            line="$key: PREVIEW - $bgames game(s) from $narch archive(s) put in ${V_NEW[$i]##*/}/$RUN_TS; $key itself was not changed and the archives stay queued"
+        else
+        line="$key: $bgames game(s) added/updated from $narch archive(s) - batch saved in ${V_NEW[$i]##*/}/$RUN_TS, $nomiss without artwork"
+        [ "$nomiss" -gt 0 ] && line="$line (list: ${REPORT_DIR##*/}/${RUN_TS}_${key}_no_artwork.txt)"
+        [ "$nfailed" -gt 0 ] && line="$line; $nfailed archive(s) failed and stay queued"
+        fi
+        if [ "$PREVIEW_ONLY" -eq 1 ]; then
+            variant_row "${V_KEY[$i]}" "${vstart:-$SECONDS}" "preview"
+        else
+            variant_row "${V_KEY[$i]}" "${vstart:-$SECONDS}" "updated"
+        fi
+        report "$line$gapnote"
+    done
+    rm -rf -- "$src"
+done
+
+# ============================================================================
+# 5. Up-to-date variants with --force: artwork gap-fill only
+# ============================================================================
+for i in "${!V_TOK[@]}"; do
+    [ "${V_ACT[$i]}" = gapfill ] || continue
+    vstart=$SECONDS
+    rp_task "${V_KEY[$i]}: artwork gap-fill"
+    if [ "$REFRESH_ART" -eq 1 ]; then
+        echo "  refreshing artwork for ${V_KEY[$i]} (every game)..."
+        gapmode=""
+    else
+        echo "  filling in missing artwork for ${V_KEY[$i]}..."
+        gapmode="--only-missing"
+    fi
+    miss="$REPORT_TMP.missing"; : > "$miss"
+    # shellcheck disable=SC2086
+    merge_variant "$i" "${V_DEST[$i]}" $gapmode --report-missing "$miss" || stage_failed "$?" "the artwork gap-fill for ${V_KEY[$i]}" "${V_KEY[$i]} (gap-fill)"
+    collect_stage_logs "${V_KEY[$i]} (gap-fill)" || true
+    rp_gapfill_done "${V_KEY[$i]}"
+    mark_success "${V_KEY[$i]}"
+    fetch_missing_artwork "$i" "$miss"
+    variant_row "${V_KEY[$i]}" "${vstart:-$SECONDS}" "artwork refreshed"
+    report "${V_KEY[$i]}: up to date - artwork gap-fill done; $(save_missing_list "$i" "$miss") game(s) still without artwork"
+done
+
+# ----- Saved backups -----
+# State backups and previous artwork versions build up over time. The run
+# used to ask here whether to delete them - but "here" is before the summary,
+# so a finished build sat looking unfinished, waiting up to three minutes on
+# a question about something else. Now it only says how much they use, once
+# they are worth mentioning, and deleting them is its own command:
+#   ./start.sh --clean-backups
+# Nothing is ever deleted without that explicit request.
+note_backup_space() {
+    local kb
+    [ "$DRY_RUN" -eq 0 ] || return 0
+    kb="$(rp_du_kb "$RP_BACKUP_DIR" "$RP_STATE_DIR/artwork/backups")"
+    [ "${kb:-0}" -ge $((RP_BACKUP_NOTE_MB * 1024)) ] || return 0
+    report "Saved backups use $((kb / 1024)) MB (state backups and previous artwork). To remove them: ./start.sh --clean-backups"
+    return 0
+}
+note_backup_space
+
+# Everything is installed: the build is over, and the Finalise phase starts
+# with the names clean-up. The build's time is closed off here so that the
+# report shows the two separately (finish() only times a build still running).
+stage_end build_seconds
+BUILD_TIMER_STARTED=0
+amiga_names_cleanup
+
+# All possible work is done; report extraction failures with exit 5.
+[ "$INTEGRITY_ISSUES" -eq 1 ] && exit "$RP_EXIT_INTEGRITY"
+exit 0

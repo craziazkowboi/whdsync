@@ -1,0 +1,1287 @@
+#!/usr/bin/env bash
+# retroplay-suite: 2026.11.15.1   (every script in the set must carry the same stamp)
+# Remember where the user ran this from, before any cd: retroplay.conf is
+# looked for there first (see lib.sh).
+RP_INVOKED_FROM="${RP_INVOKED_FROM:-$PWD}"; export RP_INVOKED_FROM
+RP_ORIG_ARGS="$*"      # remembered for the lock record and the logs
+# Unset variables are a bug (this is how the empty "Operating System:"
+# line went unnoticed for so long), and a pipeline reports the first
+# failure rather than the last. NOT -e: the pipeline deliberately
+# tolerates non-zero from some commands and checks exit codes itself,
+# and errexit would turn "3 archives could not be extracted" into
+# "the whole build stopped".
+set -u -o pipefail
+#
+# Purpose: Adds iGame/TinyLauncher artwork to a collection.
+#   Options: --aga --ecs --rtg --aga-laced --ecs-laced --set NAME --custom
+#            -d/--dest DIR --art LIST --demo-art LIST --only-missing
+#            --report-missing FILE --a314 --debug --help
+# Run 'merge.sh --help' for the authoritative, current list.
+#
+
+# Amiga Retroplay - Artwork Merger
+#
+# WHAT THIS SCRIPT DOES:
+#   For every WHDLoad game/magazine/demo directory under DEST/WHDLoad, finds
+#   the best available iGame-style icon artwork (iGame.iff + its paired
+#   .data file) and copies it in, falling back through TinyLauncher
+#   screenshots if no iGame artwork exists at all.
+#
+#   "Best available" is not just one folder - it's an ordered FALLBACK
+#   CHAIN of artwork sets (see the "Artwork fallback chain" section further
+#   down), so a game missing artwork in your preferred set (say, AGA) can
+#   still pick it up from a lower-priority set (AGA_Laced, then the generic
+#   iGame_art pool, then ECS, etc.) rather than being left with nothing.
+#
+#   This is the "merge artwork" step of the pipeline, run after extract.sh
+#   has put game files in place and before sort.sh organizes everything by
+#   variant/language. quick.sh and start.sh --auto both call this script.
+#
+# MAJOR PHASES IN THIS FILE, IN ORDER:
+#   1. Discover every iGame_* (or IGame_*, case-insensitive) directory next
+#      to this script - these are the available "artwork sets".
+#   2. Parse command-line options and resolve which set (or --custom pick,
+#      or --set NAME) the user actually asked for.
+#   3. Build the fallback chain for that selection (see below).
+#   4. Index every source in that chain ONCE up front into one big lookup
+#      table, so per-game matching is a fast in-memory lookup, not a fresh
+#      filesystem search for every single game.
+#   5. Walk every WHDLoad subdirectory, find its best match via the chain,
+#      copy the artwork across (or fall back to TinyLauncher), and report.
+#
+# This script's artwork-set indexing uses associative arrays and other
+# Bash 4+ features. macOS ships Bash 3.2 by default, so auto-upgrade to a
+# newer Bash if one is available (e.g. via Homebrew), or fail clearly.
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+    for _cand in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+        if [ -x "$_cand" ]; then
+            exec "$_cand" "$0" "$@"
+        fi
+    done
+    echo "ERROR: This script requires Bash 4.0 or newer (found ${BASH_VERSION:-an unknown version})." >&2
+    echo "macOS ships an old Bash 3.2 by default. Install a modern one with:" >&2
+    echo "  brew install bash" >&2
+    echo "then re-run this script - it will be detected and used automatically." >&2
+    exit 1
+fi
+unset _cand
+
+# Amiga Retroplay iGame Artwork Merger
+# macOS 10.15.7+ | Debian 12 | Debian 13 | Raspberry Pi Compatible
+# Part of the whdsync suite - the one version is RP_SUITE_VERSION in lib.sh. (Priority-ordered merge, dynamic artwork sets, tier fallback)
+
+BAR_WIDTH=40
+# Colour follows the same rule as lib.sh: any non-empty NO_COLOR turns it
+# off (that is the published convention - NO_COLOR=true must work, not just
+# NO_COLOR=1), and never on anything that isn't a terminal. Re-applied from
+# lib.sh once that is loaded, so --color=always|never wins.
+if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ]; then
+  RED=""; GREEN=""; YELLOW=""; BLUE=""; BOLD=""; NC="";
+else
+  RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m';
+  BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m';
+fi
+DEBUG=0
+# Run as one stage of an all.sh pipeline: no banner, no header block, and the
+# counts go back in a key=value file instead of being read off the screen.
+CALLED_FROM_ALL="${RP_CHILD:-0}"
+WHY_GAME=""      # --why NAME: explain how artwork is looked up for one game
+processed=0
+CUSTOM=0
+REPORT_MISSING=""  # --report-missing FILE: append each game that got no artwork
+REFRESH_ART=0    # --refresh-artwork: kept for compatibility - artwork is always refreshed now
+ART_NEW=0        # artwork files added
+ART_REPLACED=0   # artwork files replaced with the packs' current version
+ONLY_MISSING=0   # --only-missing: skip any target that already has an
+                 # iGame.iff-family file AND a .data file - used for a
+                 # cheap "fill gaps" pass over an existing collection
+                 # rather than a full re-merge of everything.
+# Defaults come from retroplay.conf (ART_ORDER / DEMO_ART_ORDER) so running
+# merge.sh by hand matches what the engine does; --art overrides them.
+ART_GIVEN=0      # set when --art is used; otherwise the variant decides
+GAME_ART_PRIORITY="${RP_ART_ORDER:-Screens,Covers,Titles}"
+DEMO_ART_PRIORITY="${RP_DEMO_ART_ORDER:-Titles,Screens,Covers}"  # default order for demos
+DEMO_ART_OVERRIDE=0                        # set to 1 if --demo-art is used
+
+
+# Progress update step (tuned later per platform)
+PROGRESS_STEP=100
+
+# Platform hint (optional override, e.g. --a314)
+PLATFORM_HINT=""
+
+progress_bar() {   # progress_bar <current> <total> [width] - shared display (lib.sh)
+    rp_progress "$1" "$2" "Adding artwork"
+}
+
+format_elapsed_time() { rp_format_duration "$1"; }   # shared (lib.sh)
+
+wait_for_job_slot() {
+    local max_jobs="$1" job_count
+    while true; do
+        job_count=$(jobs -r | wc -l | tr -d ' ')
+        [ "$job_count" -lt "$max_jobs" ] && break
+        rp_short_sleep
+    done
+}
+
+debug_log() {
+    if [ "$DEBUG" -eq 1 ]; then
+        echo "[DEBUG] $*" >&2
+    fi
+}
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Settings from retroplay.conf (via the shared lib.sh), if present.
+if [ ! -f "$SCRIPT_DIR/lib.sh" ]; then
+    echo "ERROR: lib.sh is missing from $SCRIPT_DIR - it ships with these scripts." >&2
+    exit 4
+fi
+. "$SCRIPT_DIR/lib.sh"
+# One colour decision for the whole suite (NO_COLOR, --color, terminal or not).
+rp_set_colours
+rp_load_config
+rp_banner "merge.sh"
+# Artwork sets matched ONLY by the standard Covers|Screens|Titles/<Games|
+# Demos|Magazines>/<letter>/<game> layout. Every other set (iGame_art,
+# custom packs, ...) ALSO matches a game folder anywhere inside it.
+STRUCTURED_SETS=" $(printf '%s' "$RP_STRUCTURED_ART_SETS" | tr '[:lower:]' '[:upper:]') "
+
+# TinyLauncher lives with the other artwork packs, which artwork_sync.sh
+# installs into $RP_ARTWORK_ROOT (artwork/ by default). This used to point at
+# $SCRIPT_DIR/TinyLauncher - the pre-migration location - so the TinyLauncher
+# fallback silently never fired on any current install. The old spot is still
+# honoured for anyone who has not moved their folders.
+TINYLAUNCHER_SRC="$RP_ARTWORK_ROOT/TinyLauncher"
+[ -d "$TINYLAUNCHER_SRC" ] || [ ! -d "$SCRIPT_DIR/TinyLauncher" ] || TINYLAUNCHER_SRC="$SCRIPT_DIR/TinyLauncher"
+DEFAULT_DEST="$RP_BUILD_ROOT/retro"      # only used when nothing else fits
+ART_SRC=""
+SET_OPT=""
+DEST=""
+
+# -----------------------------------------------------------------------------
+# Artwork SET discovery: any directory named "iGame_<something>" directly
+# under $RP_ARTWORK_ROOT (artwork/ by default) is a selectable artwork set -
+# not just ECS/AGA/RTG.
+# This lets people drop in iGame_CD32, iGame_NTSC, iGame_MyPack, etc. and have
+# it show up automatically, with no code changes needed here.
+# -----------------------------------------------------------------------------
+declare -a IGAME_SET_NAMES=()   # display names, in discovery order
+declare -A IGAME_SET_DIR=()     # NAME (uppercased) -> full directory path
+
+shopt -s nullglob
+for _igdir in "$RP_ARTWORK_ROOT"/[Ii][Gg]ame_*/; do
+    _igdir="${_igdir%/}"
+    [ -d "$_igdir" ] || continue
+    _igbase="$(basename "$_igdir")"
+    _igname="${_igbase#[Ii][Gg]ame_}"
+    [ -z "$_igname" ] && continue
+    _igkey="${_igname^^}"
+    # keep the first match if two directories somehow map to the same key
+    if [ -z "${IGAME_SET_DIR[$_igkey]+_}" ]; then
+        IGAME_SET_NAMES+=("$_igname")
+        IGAME_SET_DIR["$_igkey"]="$_igdir"
+    fi
+done
+shopt -u nullglob
+unset _igdir _igbase _igname _igkey
+
+# The artwork packs from the source are per section (Covers/Screens/Titles)
+# and per flavour, so iGame_AGA and iGame_ECS hold "laced/" and "lores/"
+# subfolders. Map the sets onto them:
+#     --aga        -> iGame_AGA/lores      --aga-laced -> iGame_AGA/laced
+#     --ecs        -> iGame_ECS/lores      --ecs-laced -> iGame_ECS/laced
+#     --rtg        -> iGame_RTG            (no flavours)
+# A pack still laid out the old flat way keeps working: if there is no
+# laced/ or lores/ subfolder, the folder itself is used as before.
+for _base in AGA ECS; do
+    _dir="${IGAME_SET_DIR[$_base]:-}"
+    [ -n "$_dir" ] || continue
+    if [ -d "$_dir/laced" ]; then
+        IGAME_SET_DIR["${_base}_LACED"]="$_dir/laced"
+        case " ${IGAME_SET_NAMES[*]} " in *" ${_base}_Laced "*) ;; *) IGAME_SET_NAMES+=("${_base}_Laced") ;; esac
+    fi
+    if [ -d "$_dir/lores" ]; then
+        IGAME_SET_DIR["$_base"]="$_dir/lores"
+        # Artwork installed the older, flat way (iGame_AGA/Covers/...) still
+        # counts: it is kept as an extra fallback right after the flavour
+        # folder, so games only present there keep their artwork.
+        for _sec in Covers Screens Titles; do
+            if [ -d "$_dir/$_sec" ]; then
+                IGAME_SET_DIR["${_base}_FLAT"]="$_dir"
+                break
+            fi
+        done
+    fi
+done
+unset _base _dir
+
+# Resolve a requested set name (any case) to ART_SRC. Returns 1 if not found.
+# On success also records the uppercased key in SELECTED_SET_KEY, used to
+# build the artwork fallback chain later.
+SELECTED_SET_KEY=""
+resolve_art_set() {
+    local key="${1^^}"
+    if [ -n "${IGAME_SET_DIR[$key]+_}" ]; then
+        ART_SRC="${IGAME_SET_DIR[$key]}"
+        SELECTED_SET_KEY="$key"
+        return 0
+    fi
+    return 1
+}
+
+# Prefer ECS for backward compatibility; otherwise take whatever was found first.
+default_art_set() {
+    resolve_art_set "ECS" && return 0
+    [ "${#IGAME_SET_NAMES[@]}" -gt 0 ] && resolve_art_set "${IGAME_SET_NAMES[0]}"
+}
+
+show_artwork_menu() {
+    echo
+    echo "=========================================="
+    echo "Select iGame Artwork Set"
+    echo "=========================================="
+
+    if [ "${#IGAME_SET_NAMES[@]}" -eq 0 ]; then
+        echo "No iGame_* artwork folders found in: $RP_ARTWORK_ROOT"
+        echo "Get the artwork with: ./start.sh --artwork-sync"
+        echo "=========================================="
+        exit 1
+    fi
+
+    local i=1
+    for name in "${IGAME_SET_NAMES[@]}"; do
+        echo "$i) $name"
+        i=$((i + 1))
+    done
+    echo "=========================================="
+    echo
+    echo "No input within 30 seconds will default to: ${IGAME_SET_NAMES[0]}"
+    echo
+
+    if read -r -t 30 -p "Enter your choice (1-${#IGAME_SET_NAMES[@]}): " choice; then
+        :
+    else
+        echo    # ensure newline after timeout
+        echo "No selection made, defaulting to ${IGAME_SET_NAMES[0]}."
+        choice="1"
+    fi
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#IGAME_SET_NAMES[@]}" ]; then
+        local picked="${IGAME_SET_NAMES[$((choice - 1))]}"
+        resolve_art_set "$picked"
+        echo "Selected: $picked"
+    else
+        echo "Invalid choice. Defaulting to ${IGAME_SET_NAMES[0]}."
+        resolve_art_set "${IGAME_SET_NAMES[0]}"
+    fi
+}
+
+# ----- argument parsing -----
+
+while [ $# -gt 0 ]; do
+    opt_lc="${1,,}"
+    case "$opt_lc" in
+        --why)
+            rp_require_option_value "$1" "$#" "${2-}"
+            WHY_GAME="$2"; shift 2
+            ;;
+        --custom) CUSTOM=1; shift ;;
+        --ecs) SET_OPT="ECS"; shift ;;
+        --aga) SET_OPT="AGA"; shift ;;
+        --rtg) SET_OPT="RTG"; shift ;;
+        --ecs-laced) SET_OPT="ECS_LACED"; shift ;;
+        --aga-laced) SET_OPT="AGA_LACED"; shift ;;
+        --set)
+          rp_require_option_value "$1" "$#" "${2-}"
+            if [ -z "${2:-}" ]; then
+                echo "Error: --set requires a NAME argument (matching an iGame_NAME directory)" >&2
+                exit 1
+            fi
+            SET_OPT="$2"
+            shift 2
+            ;;
+        -d|--dest) rp_require_option_value "$1" "$#" "${2-}"; DEST="$2"; shift 2 ;;
+        --art)
+          rp_require_option_value "$1" "$#" "${2-}"
+        GAME_ART_PRIORITY="$2"; ART_GIVEN=1
+        shift 2
+        ;;
+    --demo-art)
+      rp_require_option_value "$1" "$#" "${2-}"
+        DEMO_ART_PRIORITY="$2"
+        DEMO_ART_OVERRIDE=1
+        shift 2
+        ;; 
+        --a314) PLATFORM_HINT="a314"; shift ;;
+        --only-missing) ONLY_MISSING=1; shift ;;
+        --refresh-artwork|--overwrite-artwork)
+            REFRESH_ART=1            # artwork is refreshed anyway; kept so the
+            shift ;;                 # option keeps working in scripts and cron
+        --report-missing) rp_require_option_value "$1" "$#" "${2-}"; REPORT_MISSING="$2"; shift 2 ;;
+        --debug) DEBUG=1; shift ;;
+        --called-from-all) CALLED_FROM_ALL=1; shift ;;
+        --jobs) rp_require_option_value "$1" "$#" "${2-}"; RP_JOBS_OVERRIDE="$2"; shift 2 ;;
+        -h|--help)
+            echo
+            echo "Amiga Retroplay iGame Artwork Merger"
+            echo "Version: ${RP_SUITE_VERSION} (release ${RP_RELEASE})"
+            echo "Usage: $(basename "$0") [--custom] [--ecs|--aga|--rtg|--ecs-laced|--aga-laced|--set NAME] [-d DEST] [--art ORDER] [--debug]"
+  echo "  -h, --help            Show this help and exit."
+  echo "  --why NAME            Explain where artwork for NAME was looked for, and"
+  echo "                        what is actually in the artwork folder."
+            echo
+            echo "Artwork sets:"
+            echo "  Any directory named iGame_<NAME> under $RP_ARTWORK_ROOT is a usable"
+            echo "  artwork set - not just ECS/AGA/RTG. Drop in iGame_CD32, iGame_MyPack,"
+            echo "  etc. and it is picked up automatically; no code changes needed."
+            if [ "${#IGAME_SET_NAMES[@]}" -gt 0 ]; then
+                echo "  Sets found here: ${IGAME_SET_NAMES[*]}"
+            else
+                echo "  No iGame_* directories were found here."
+            fi
+            echo
+            echo "Options:"
+            echo "  --custom          Show interactive menu listing every discovered set"
+            echo "  --ecs             Shortcut for --set ECS (default if present)"
+            echo "  --aga             Shortcut for --set AGA"
+            echo "  --rtg             Shortcut for --set RTG"
+            echo "  --ecs-laced       Shortcut for --set ECS_LACED (matches iGame_ECS_Laced)"
+            echo "  --aga-laced       Shortcut for --set AGA_LACED (matches iGame_AGA_Laced)"
+            echo "  --set NAME        Use the iGame_NAME directory as the artwork source"
+            echo "                    (case-insensitive, e.g. --set cd32 matches iGame_CD32)"
+            echo "  -d, --dest DIR    Collection to add artwork to. With no --dest, the"
+            echo "                    collection matching the variant is used, e.g. --aga"
+            echo "                    -> $RP_BUILD_ROOT/retro_aga"
+            echo "  --art ORDER       Merge priority for games and magazines"
+            echo "                    (default: Screens,Covers,Titles)"
+            echo "  --demo-art ORDER  Merge priority for demos"
+            echo "                    (default: Titles,Screens,Covers)"
+            echo "  --only-missing    Skip any target that already has an iGame.iff-family"
+            echo "                    file AND a .data file - a cheap pass to fill gaps in"
+            echo "                    an existing collection rather than re-checking"
+            echo "                    everything that is already merged."
+            echo "  --refresh-artwork Accepted for compatibility: artwork in the collection"
+            echo "                    is always written from the packs' current version"
+            echo "                    anyway. Use --only-missing to leave it alone."
+            echo "  --report-missing FILE   Append each game that got no artwork to FILE"
+            echo "  --a314            Hint: running on A314 (lower parallelism, fewer updates)"
+            echo "  --quiet           Errors, warnings and the final result only"
+            echo "  --verbose         More detail about each step"
+            echo "  --color=MODE      auto (default), always or never. NO_COLOR is honoured."
+            echo "  --debug           Enable debug output to trace artwork matching"
+            echo
+            echo "Artwork fallback chain:"
+            echo "  If a game has no artwork in the selected/requested set, these sets are"
+            echo "  tried next, in order, before giving up on iGame artwork for that game:"
+            echo "    --rtg       : RTG -> AGA_Laced -> AGA -> iGame_art -> ECS_Laced -> ECS"
+            echo "    --aga       : AGA -> iGame_art -> ECS"
+            echo "    --aga-laced : AGA_Laced -> AGA -> iGame_art -> ECS"
+            echo "    --ecs       : ECS -> iGame_art"
+            echo "    --ecs-laced : ECS_Laced -> ECS -> iGame_art"
+            echo "    --set/--custom (anything else): the chosen set -> iGame_art"
+            echo "  TinyLauncher is tried after all of the above, then any other"
+            echo "  discovered iGame_* directory not already covered."
+            echo
+            echo "Platforms: macOS 10.15.7+ | Debian 12/13 | Raspberry Pi"
+            echo "Merges artwork from Screens/Screen/Titles/Title/Covers/Cover hierarchies and TinyLauncher."
+            echo "Supports singular and plural section/category names."
+            exit 0
+            ;;
+        *)
+            # --quiet / --verbose / --color are understood by every script in
+            # the suite; lib.sh handles them so they behave the same way here
+            # as they do in start.sh.
+            rp_common_opt "$1" "${2-}"; _co=$?
+            case "$_co" in
+                0) shift; continue ;;
+                2) shift 2; continue ;;
+            esac
+            echo "Unknown option: $1"; exit 4 ;;
+    esac
+done
+unset opt_lc
+
+if [ "$CUSTOM" -eq 1 ]; then
+    show_artwork_menu
+elif [ -n "$SET_OPT" ]; then
+    if ! resolve_art_set "$SET_OPT"; then
+        rp_warn "no iGame_$SET_OPT artwork found under: $RP_ARTWORK_ROOT"
+        rp_info "  Will still try the artwork fallback chain (see --help) for a match."
+        rp_info "  To fetch it:  ./start.sh --artwork-sync --for $(printf '%s' "$SET_OPT" | tr '[:upper:]_' '[:lower:]-')"
+        SELECTED_SET_KEY="${SET_OPT^^}"
+        ART_SRC=""
+    fi
+else
+    if ! default_art_set; then
+        echo "ERROR: No iGame_* artwork folders found under: $RP_ARTWORK_ROOT"
+        echo "Get the artwork with: ./start.sh --artwork-sync   (or --artwork-plan to see what it would fetch)"
+        exit 1
+    fi
+fi
+
+# Artwork order: unless --art was given, the variant decides. RTG shows
+# covers best, so ART_ORDER_RTG differs from the default - running
+# "merge.sh --rtg" by hand must honour that just as all.sh does.
+if [ "$ART_GIVEN" -eq 0 ] && [ -n "${SELECTED_SET_KEY:-}" ]; then
+    _v="$(printf '%s' "$SELECTED_SET_KEY" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+    GAME_ART_PRIORITY="$(rp_art_order_for "$_v")"
+    unset _v
+fi
+
+# DEST comes from -d/--dest, or from start.sh. With neither, use the
+# collection that matches the variant asked for (--aga -> build/retro_aga),
+# or the only collection there is.
+if [ -z "${DEST:-}" ]; then
+    _want="$(printf '%s' "${SELECTED_SET_KEY:-}" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+    if _auto="$(rp_default_collection "$_want")"; then
+        DEST="$_auto"
+        rp_info "Using collection: ${DEST##*/}   (no --dest given)"
+    elif [ -n "$_want" ]; then
+        # A variant was asked for by name and there is no collection for it.
+        # Falling back to build/retro here is what made "--aga-laced" report
+        # "destination folder not found: build/retro" on a machine that had
+        # three perfectly good collections. Name the real problem instead.
+        rp_error "no collection for '$_want' yet: $RP_BUILD_ROOT/retro_$(rp_variant_suffix "$_want")"
+        _have="$(rp_list_collections)"
+        [ -n "$_have" ] && rp_info "Collections here:$_have"
+        rp_action "./start.sh --sync --$_want      (build it), or pass -d <folder> to use one of the above"
+        exit "$RP_EXIT_CONFIG"
+    else
+        DEST="$DEFAULT_DEST"
+    fi
+fi
+unset _want _auto _have
+DEST="${DEST%/}"
+
+# Parse section priority order (non-demos baseline)
+IFS=',' read -r -a ART_ORDER <<< "$GAME_ART_PRIORITY"
+
+# Decide which TinyLauncher SCR index becomes iGame.iff based on first art entry
+primary_section="${ART_ORDER[0]}"
+case "$primary_section" in
+    Covers)  tl_primary_index=0 ;; # iGame.iff from _SCR0
+    Titles)  tl_primary_index=1 ;; # iGame.iff from _SCR1
+    Screens) tl_primary_index=2 ;; # iGame.iff from _SCR2
+    *)       tl_primary_index=0 ;; # sensible default
+esac
+
+# -----------------------------------------------------------------------------
+# Artwork fallback chain: when the requested/selected set doesn't have a
+# match for a given game, these are the other iGame_* sets (and finally
+# TinyLauncher) to try instead, in order. TINYLAUNCHER is a sentinel handled
+# separately below, not an iGame_* directory.
+# -----------------------------------------------------------------------------
+case "$SELECTED_SET_KEY" in
+    RTG)
+        FALLBACK_CHAIN=(RTG AGA_LACED AGA ART ECS_LACED ECS TINYLAUNCHER)
+        ;;
+    AGA)
+        FALLBACK_CHAIN=(AGA ART ECS TINYLAUNCHER)
+        ;;
+    AGA_LACED)
+        FALLBACK_CHAIN=(AGA_LACED AGA ART ECS TINYLAUNCHER)
+        ;;
+    ECS)
+        FALLBACK_CHAIN=(ECS ART TINYLAUNCHER)
+        ;;
+    ECS_LACED)
+        FALLBACK_CHAIN=(ECS_LACED ECS ART TINYLAUNCHER)
+        ;;
+    "")
+        # Nothing selected at all (shouldn't normally happen - default_art_set
+        # always sets SELECTED_SET_KEY on success)
+        FALLBACK_CHAIN=(ART TINYLAUNCHER)
+        ;;
+    *)
+        # A custom --set NAME or an interactive --custom pick outside the
+        # named tiers above: try it, then the generic pool, then TinyLauncher.
+        FALLBACK_CHAIN=("$SELECTED_SET_KEY" ART TINYLAUNCHER)
+        ;;
+esac
+
+# The chain templates use the literal placeholder "ART" for the generic
+# artwork pool - but not everyone names that folder exactly "iGame_art"
+# (e.g. "iGame_Art_Pack"). If no directory maps to the exact key "ART",
+# fall back to the first discovered set whose key STARTS WITH "ART" and
+# use that instead, so a differently-named generic pool still fills the
+# same slot rather than the placeholder silently matching nothing.
+if [ -z "${IGAME_SET_DIR[ART]+_}" ]; then
+    _art_resolved=""
+    for _fbname in "${IGAME_SET_NAMES[@]}"; do
+        _fbkey="${_fbname^^}"
+        case "$_fbkey" in
+            ART*) _art_resolved="$_fbkey"; break ;;
+        esac
+    done
+    if [ -n "$_art_resolved" ]; then
+        for _lci in "${!FALLBACK_CHAIN[@]}"; do
+            [ "${FALLBACK_CHAIN[$_lci]}" = "ART" ] && FALLBACK_CHAIN[$_lci]="$_art_resolved"
+        done
+        unset _lci
+    fi
+    unset _art_resolved
+fi
+
+
+# Put each "_FLAT" fallback directly after the set it belongs to.
+_chain_with_flat=()
+for _c in "${FALLBACK_CHAIN[@]}"; do
+    _chain_with_flat+=("$_c")
+    [ -n "${IGAME_SET_DIR[${_c}_FLAT]:-}" ] && _chain_with_flat+=("${_c}_FLAT")
+done
+FALLBACK_CHAIN=("${_chain_with_flat[@]}")
+unset _chain_with_flat _c
+
+# Append any other discovered iGame_* sets not already in the chain, so a
+# fresh iGame_MyPack directory is still tried as a last resort even though
+# nothing above knows its name in advance.
+for _fbname in "${IGAME_SET_NAMES[@]}"; do
+    _fbkey="${_fbname^^}"
+    _fbalready=0
+    for _fbc in "${FALLBACK_CHAIN[@]}"; do
+        [ "$_fbc" = "$_fbkey" ] && _fbalready=1 && break
+    done
+    [ "$_fbalready" -eq 0 ] && FALLBACK_CHAIN+=("$_fbkey")
+done
+unset _fbname _fbkey _fbalready _fbc
+
+debug_log "Artwork fallback chain: ${FALLBACK_CHAIN[*]}"
+
+# -----------------------------------------------------------------------------
+# Artwork index: pre-scan every source in the fallback chain once, so
+# per-game lookups are pure associative-array hits with no filesystem I/O.
+# Key: "SRC|Section|GameName" -> directory path (SRC is a FALLBACK_CHAIN
+# entry like RTG, AGA_LO, ART, or a custom set name).
+# -----------------------------------------------------------------------------
+
+declare -A IGAME_INDEX
+# Same index keyed by lower-case game name: packs and the Retroplay archives
+# occasionally differ only in capitalisation, and an exact-only match would
+# report those games as having no artwork.
+declare -A IGAME_INDEX_LC
+# How many artwork folders the index holds, so the run can say so out loud.
+INDEX_ENTRIES=0
+
+index_source() {
+    local src_key="$1" src_root="$2"
+    local sec category dir_prefix sec_name cat_name base_path game_dir game_name key
+
+    for sec in Screens Covers Titles; do
+        case "$sec" in
+            Screens) section_variants=(Screens Screen) ;;
+            Covers)  section_variants=(Covers Cover) ;;
+            Titles)  section_variants=(Titles Title) ;;
+        esac
+
+        for category in Games Magazines Demos; do
+            case "$category" in
+                Games)     category_variants=(Games Game) ;;
+                Magazines) category_variants=(Magazines Magazine) ;;
+                Demos)     category_variants=(Demos Demo) ;;
+            esac
+
+            for sec_name in "${section_variants[@]}"; do
+                for cat_name in "${category_variants[@]}"; do
+                    base_path="$src_root/$sec_name/$cat_name"
+                    [ -d "$base_path" ] || continue
+
+                    # Game folders sit one letter-folder down: Screens/Games/A/<game>.
+                    # This used to run one `find` per letter - 36 per section and
+                    # category, 324 per source, over 2000 for an RTG chain. On a
+                    # Pi reading a USB drive that is minutes of pure process
+                    # startup before anything is printed. One find at depth 2 per
+                    # section+category finds exactly the same folders.
+                    while IFS= read -r -d '' game_dir; do
+                        # Keep the old letter-folder rule: A-Z and 0-9 only, so a
+                        # stray folder at that level is still ignored.
+                        dir_prefix="${game_dir%/*}"; dir_prefix="${dir_prefix##*/}"
+                        case "$dir_prefix" in
+                            [A-Za-z0-9]) ;;
+                            *) continue ;;
+                        esac
+                        game_name="${game_dir##*/}"
+                        key="$src_key|$sec|$game_name"
+                        # Only keep the first hit per source+section+game
+                        if [ -z "${IGAME_INDEX[$key]+_}" ]; then
+                            IGAME_INDEX["$key"]="$game_dir"
+                            # merge.sh is the Bash 4+ script of the suite, so the
+                            # lower-case key is a parameter expansion, not two
+                            # forked processes per artwork folder (that cost tens
+                            # of thousands of forks on a full collection).
+                            _lckey="${key,,}"
+                            [ -n "${IGAME_INDEX_LC[$_lckey]:-}" ] || IGAME_INDEX_LC["$_lckey"]="${IGAME_INDEX[$key]}"
+                            INDEX_ENTRIES=$((INDEX_ENTRIES + 1))
+                        fi
+                    done < <(find "$base_path" -mindepth 2 -maxdepth 2 -type d -print0 2>/dev/null)
+                done
+            done
+        done
+    done
+}
+
+# For sets NOT in STRUCTURED_ART_SETS: additionally index every folder, at
+# any depth, that holds an iGame.iff - matched by that folder's name. This
+# only ADDS entries the standard index above didn't find, so a set laid out
+# the standard way behaves exactly as before. If the match sits somewhere
+# under a Covers/Screens/Titles folder it keeps that section's priority;
+# otherwise it's filed as "Any", tried after every section for that set.
+index_source_any() {
+    local src_key="$1" src_root="${2%/}" f dir parent rel sec key added=0
+    while IFS= read -r f; do
+        dir="${f%/*}"
+        [ "$dir" = "$src_root" ] && continue
+        parent="${dir%/*}"
+        rel="/${parent#"$src_root"}/"
+        case "$rel" in
+            */[Cc]overs/*|*/[Cc]over/*)   sec=Covers ;;
+            */[Ss]creens/*|*/[Ss]creen/*) sec=Screens ;;
+            */[Tt]itles/*|*/[Tt]itle/*)   sec=Titles ;;
+            *) sec=Any ;;
+        esac
+        key="$src_key|$sec|${dir##*/}"
+        if [ -z "${IGAME_INDEX[$key]+_}" ]; then
+            IGAME_INDEX["$key"]="$dir"
+            _lckey="${key,,}"
+            [ -n "${IGAME_INDEX_LC[$_lckey]:-}" ] || IGAME_INDEX_LC["$_lckey"]="${IGAME_INDEX[$key]}"
+            added=$((added + 1))
+            INDEX_ENTRIES=$((INDEX_ENTRIES + 1))
+        fi
+    done < <(find "$src_root" -type f -iname 'igame.iff' 2>/dev/null | sort)
+    debug_log "  + $added extra match(es) found anywhere inside $src_root"
+}
+
+debug_log "Script directory: $SCRIPT_DIR"
+debug_log "Primary artwork source: ${ART_SRC:-<none - relying on fallback chain>}"
+debug_log "Destination: $DEST"
+debug_log "Art merge order: ${ART_ORDER[*]}"
+
+# The destination and the run settings are settled BEFORE the artwork packs
+# are read: indexing is minutes of work on a Pi, and spending it only to then
+# announce "destination folder not found" wasted all of it. The banner prints
+# first for the same reason - it is the proof the run started.
+
+if [ ! -d "$DEST/WHDLoad" ]; then
+    # Not an error: artwork only applies to WHDLoad/, and a batch of new
+    # downloads can legitimately contain only HD_Loaders or JST releases
+    # (this used to stop the whole run with "No WHDLoad directory found").
+    if [ -d "$DEST" ]; then
+        echo "No WHDLoad folder in $DEST - nothing to add artwork to (only HD_Loaders/JST content)."
+        exit 0
+    fi
+    echo "ERROR: destination folder not found: $DEST"
+    _have="$(rp_list_collections)"
+    [ -n "$_have" ] && echo "Collections here:$_have  - pick one with -d, or name a variant (e.g. --aga)"
+    echo "(Build it first, e.g. ./start.sh --sync --aga, or pass -d <folder>.)"
+    exit 4
+fi
+
+
+CORES=""
+if command -v nproc >/dev/null 2>&1; then
+    CORES=$(nproc 2>/dev/null)
+elif command -v getconf >/dev/null 2>&1; then
+    CORES=$(getconf _NPROCESSORS_ONLN 2>/dev/null)
+fi
+if [ -z "$CORES" ] && command -v sysctl >/dev/null 2>&1; then
+    CORES=$(sysctl -n hw.ncpu 2>/dev/null)
+fi
+
+CORES=${CORES:-2}
+[ "$CORES" -gt 8 ] && CORES=8
+max_parallel="$(rp_jobs merge "$CORES")"
+
+# Basic platform tuning for progress and parallelism
+UNAME_OUT="$(uname 2>/dev/null || echo Unknown)"
+case "$UNAME_OUT" in
+    Darwin)
+        PROGRESS_STEP=100
+        ;;
+    Linux)
+        PROGRESS_STEP=100
+        ;;
+    *)
+        PROGRESS_STEP=100
+        ;;
+esac
+
+# Optional manual hint: --a314 slows down I/O, so be gentler
+if [ "$PLATFORM_HINT" = "a314" ]; then
+    max_parallel=2
+    PROGRESS_STEP=500
+fi
+
+# ----- Pi Zero 2W / A314 detection -----
+# 1) Detect Raspberry Pi Zero 2W and reduce parallelism for slow I/O
+if [ -r /sys/firmware/devicetree/base/model ] && \
+   grep -q "Raspberry Pi Zero 2 W" /sys/firmware/devicetree/base/model 2>/dev/null; then
+    max_parallel=2
+    PROGRESS_STEP=500
+# 2) Fallback: detect A314 device node or /proc entry
+elif [ -e /proc/a314 ] || rp_glob_matches '/dev/a314*'; then
+    max_parallel=2
+    PROGRESS_STEP=500
+fi
+
+if [ "$CALLED_FROM_ALL" -eq 0 ]; then
+echo -e "${BOLD}==========================================${NC}"
+echo -e "${BOLD} Amiga Retroplay iGame Artwork Merger ${NC}"
+echo -e "${BOLD} Version: ${RP_SUITE_VERSION} (release ${RP_RELEASE}) ${NC}"
+echo -e "${BOLD}==========================================${NC}"
+echo -e "Platform: ${YELLOW}$(uname)${NC}"
+echo -e "Detected CPU core(s): ${YELLOW}$CORES${NC}"
+echo -e "Parallel job limit: ${YELLOW}$max_parallel${NC}"
+echo -e "Destination directory: ${YELLOW}$DEST${NC}"
+echo -e "Selected artwork source: ${YELLOW}${ART_SRC:-<none found - using fallback chain>}${NC}"
+echo -e "Artwork fallback chain: ${YELLOW}${FALLBACK_CHAIN[*]}${NC}"
+echo -e "Game/Mag art order: ${YELLOW}$GAME_ART_PRIORITY${NC}"
+echo -e "Demo art order: ${YELLOW}$DEMO_ART_PRIORITY${NC}"
+[ -d "$TINYLAUNCHER_SRC" ] && echo -e "TinyLauncher source: ${YELLOW}$TINYLAUNCHER_SRC${NC}"
+[ "$DEBUG" -eq 1 ] && echo -e "${YELLOW}Debug mode: ENABLED${NC}"
+echo -e "${BOLD}==========================================${NC}"
+fi
+echo
+
+# Reading the artwork packs is the longest silent stretch of a run: several
+# thousand folders per source, and an RTG build indexes seven sources. It used
+# to print nothing at all until the first game was merged, which on a Pi looks
+# exactly like a crash - so say which source is being read, and how big it was.
+indexed_any_source=0
+_idx_todo=0
+for _fbc in "${FALLBACK_CHAIN[@]}"; do
+    [ "$_fbc" = "TINYLAUNCHER" ] && continue
+    [ -n "${IGAME_SET_DIR[$_fbc]+_}" ] && _idx_todo=$((_idx_todo + 1))
+done
+[ "$_idx_todo" -gt 0 ] && rp_info "Reading artwork ($_idx_todo source$([ "$_idx_todo" -eq 1 ] || echo s) to index; this is the slow part on a Pi)"
+_idx_done=0
+_idx_start=$SECONDS
+for _fbc in "${FALLBACK_CHAIN[@]}"; do
+    [ "$_fbc" = "TINYLAUNCHER" ] && continue
+    if [ -n "${IGAME_SET_DIR[$_fbc]+_}" ]; then
+        _idx_done=$((_idx_done + 1))
+        _idx_before=$INDEX_ENTRIES
+        index_source "$_fbc" "${IGAME_SET_DIR[$_fbc]}"
+        case "$STRUCTURED_SETS" in
+            *" $_fbc "*) ;;
+            *) index_source_any "$_fbc" "${IGAME_SET_DIR[$_fbc]}" ;;
+        esac
+        indexed_any_source=1
+        rp_info "  [$_idx_done/$_idx_todo] $_fbc: $((INDEX_ENTRIES - _idx_before)) artwork folders"
+        debug_log "Indexed artwork source: $_fbc -> ${IGAME_SET_DIR[$_fbc]}"
+    fi
+done
+[ "$indexed_any_source" -eq 1 ] && rp_info "Artwork index ready: $INDEX_ENTRIES folders in $((SECONDS - _idx_start))s"
+unset _fbc _idx_todo _idx_done _idx_start _idx_before
+
+if [ "$indexed_any_source" -eq 0 ] && [ ! -d "$TINYLAUNCHER_SRC" ]; then
+    echo "ERROR: none of the artwork fallback chain's directories exist, and no"
+    echo "TinyLauncher directory was found either: ${FALLBACK_CHAIN[*]}"
+    exit 1
+fi
+
+whdload_path="$DEST/WHDLoad"
+# (the game list itself is built below, by one rule - see "What counts as a
+# game" - and the count comes from it, so the number reported here is
+# exactly the number of games processed.)
+
+start_time="$(date +%s)"
+
+# (count printed once the game list is built, below)
+echo
+
+# One private folder per run, made by mktemp so the name cannot be guessed
+# and TMPDIR is honoured. These used to be /tmp/artwork_merger_*.$$ - a
+# predictable name in a world-writable folder, and one that ignored TMPDIR.
+# cleanup_merge (further down) removes the folder however the script ends.
+MERGE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/whdsync_merge.XXXXXX")" || {
+    rp_error "could not make a temporary folder in ${TMPDIR:-/tmp}"; exit "$RP_EXIT_CONFIG"; }
+rp_mark_temp_owner "$MERGE_TMP"     # so a killed run's folder is swept up later
+ERROR_LOG="$MERGE_TMP/errors"
+IGAMEECS_LOG="$MERGE_TMP/igame"
+TINYLAUNCHER_LOG="$MERGE_TMP/tinylauncher"
+
+: > "$ERROR_LOG"
+: > "$IGAMEECS_LOG"
+: > "$TINYLAUNCHER_LOG"
+
+# Folders left by runs that were killed outright are swept up here: each
+# carries the PID that made it, and one whose process is gone is fair game.
+rp_sweep_stale_temp "${TMPDIR:-/tmp}"/whdsync_merge.*
+unset _tf _pid
+# However this ends - finished, Ctrl-C, or killed outright (the OOM killer
+# on a small Pi) - stop and reap the background workers before removing the
+# temp files, and keep the original exit status. extract.sh and sort.sh use
+# the same shape; a bare "rm -f" trap left orphaned workers behind when the
+# parent was killed without a signal handler running.
+cleanup_merge() {
+    local st=$?
+    rp_lock_release
+    trap - EXIT INT TERM
+    rp_reap_children            # workers AND anything they launched
+    [ -n "${MERGE_TMP:-}" ] && [ -d "$MERGE_TMP" ] && rm -rf -- "$MERGE_TMP"
+    exit "$st"
+}
+# Run by hand? Then this is the run, and it takes the same lock all.sh
+# uses, so it cannot work on a collection a nightly build is midway through.
+rp_lock_for_stage "merge.sh ${RP_ORIG_ARGS:-}"
+trap cleanup_merge EXIT
+trap 'echo; echo "Aborted. Cleaning up..."; exit 130' INT TERM
+
+merge_targets=()
+
+# What counts as a game
+# ---------------------
+# A game is a drawer with its own "<name>.info" icon (the WHDLoad
+# convention), that is NOT itself inside another game. That rules out:
+#   * category and letter folders (Games/, Demos/, S/ ...) - no icon
+#   * drawers inside a game (data/, Maps/, Docs/, MapsFr/CATACOMBES) - they
+#     ship icons too, which is why they used to be reported as missing
+#     artwork in their hundreds
+# Some archives wrap the game in a versioned folder, e.g.
+#   Might&Magic3_v1.2_2346/Might&Magic3/ ,  Elvira_v1.4_De_0474/ElviraDe/
+# The wrapper has an icon but no .slave; the game inside has both. In that
+# case the inner folder is the game, so artwork is looked up under the name
+# the artwork packs actually use.
+# A game installed without an icon at all is still picked up when it sits
+# directly in a letter folder under a category.
+_inside_a_game() {                 # any ancestor with its own icon?
+    local p="${1%/*}"
+    while [ -n "$p" ] && [ "$p" != "$whdload_path" ] && [ "$p" != "/" ]; do
+        [ -e "$p.info" ] && return 0
+        p="${p%/*}"
+    done
+    return 1
+}
+_in_letter_folder() {              # .../<category>/<letter>/<this>
+    local parent="${1%/*}" letter cat
+    letter="${parent##*/}"; cat="${parent%/*}"; cat="${cat##*/}"
+    case "$cat" in
+        Games|Demos|Magazines|Beta|Game|Demo|Magazine) [ "${#letter}" -le 2 ] && return 0 ;;
+    esac
+    return 1
+}
+_unwrap_game() {                   # follow a versioned wrapper to the game
+    local d="$1" kids files n child
+    while :; do
+        # A wrapper holds nothing but the game folder: no files of its own
+        # (no .slave, no icons for anything else). A real game always has
+        # files, so this never walks into data/, Maps/ or Docs/.
+        kids=0; files=0; child=""
+        for n in "$d"/* "$d"/.[!.]*; do
+            [ -e "$n" ] || continue
+            if [ -d "$n" ]; then
+                [ -e "$n.info" ] || continue
+                kids=$((kids + 1)); child="$n"
+            else
+                case "$n" in
+                    *.info) [ -d "${n%.info}" ] || files=$((files + 1)) ;;   # icon for a drawer is not a file of its own
+                    *) files=$((files + 1)) ;;
+                esac
+            fi
+        done
+        { [ "$kids" -eq 1 ] && [ "$files" -eq 0 ]; } || break
+        d="$child"
+    done
+    printf '%s\n' "$d"
+}
+
+while IFS= read -r dir; do
+    _inside_a_game "$dir" && continue
+    if [ -e "${dir}.info" ] || _in_letter_folder "$dir"; then
+        merge_targets+=( "$(_unwrap_game "$dir")" )
+    fi
+done < <(find "$whdload_path" -mindepth 1 -maxdepth 8 -type d 2>/dev/null | LC_ALL=C sort)
+
+# --why NAME: show exactly where this game's artwork was looked for.
+if [ -n "$WHY_GAME" ]; then
+    echo
+    echo "Looking up artwork for: $WHY_GAME"
+    echo "Artwork folder: $RP_ARTWORK_ROOT"
+    echo "Sets tried, in order:"
+    for _c in "${FALLBACK_CHAIN[@]}"; do
+        _d="${IGAME_SET_DIR[$_c]:-}"
+        if [ -z "$_d" ]; then printf '  %-12s (no folder for this set)\n' "$_c"; continue; fi
+        printf '  %-12s %s\n' "$_c" "$_d"
+        for _sec in $(printf '%s' "$GAME_ART_PRIORITY" | tr ',' ' ') Any; do
+            _k="$_c|$_sec|$WHY_GAME"
+            if [ -n "${IGAME_INDEX[$_k]:-}" ]; then
+                printf '      %-8s FOUND: %s\n' "$_sec" "${IGAME_INDEX[$_k]}"
+            else
+                printf '      %-8s not in this set\n' "$_sec"
+            fi
+        done
+    done
+    echo
+    echo "Anything in the artwork folder with a similar name:"
+    find "$RP_ARTWORK_ROOT" -maxdepth 8 -iname "*${WHY_GAME}*" 2>/dev/null | head -20 | sed 's|^|  |'
+    echo "  (nothing else found)"
+    echo
+    echo "And in the collection:"
+    find "$DEST" -maxdepth 8 -iname "*${WHY_GAME}*" 2>/dev/null | head -10 | sed 's|^|  |'
+    exit 0
+fi
+
+total_targets="${#merge_targets[@]}"
+[ "$total_targets" -eq 0 ] && { echo "ERROR: No games found under WHDLoad (a game is a folder with its matching .info icon)."; exit 4; }
+echo "Found $total_targets game(s) to check for artwork."
+if [ "$ONLY_MISSING" -eq 1 ]; then
+    echo "Mode: filling gaps only - games that already have artwork are skipped."
+else
+    echo "Mode: refreshing - artwork is written from the packs' current version."
+fi
+
+shopt -s nullglob
+# Given best_dir/best_section/best_src already set (by searching
+# IGAME_INDEX for the current dest_sub/dest_name), copies that source's
+# artwork into dest_sub. Returns 0 if iGame.iff was actually found and
+# copied there (the game is considered handled), 1 otherwise - in which
+# case the caller should keep looking elsewhere (TinyLauncher, or any
+# further fallback-chain entries) rather than treat this as done.
+# art_should_copy <source> <destination>
+# Always copy. Checking first (timestamps, then sizes) was measured SLOWER
+# than simply copying: on 1500 games, checking took 23s against 11s for
+# copying, because each comparison spawns processes while a copy is one.
+# So artwork in the collection is always the artwork packs' current version.
+# (Use --only-missing if you want games that already have artwork skipped.)
+art_should_copy() { return 0; }
+
+try_copy_matched_artwork() {
+    [ -n "$best_dir" ] && [ -d "$best_dir" ] || return 1
+
+    # When refreshing, clear the whole iGame.iff family first. Changing
+    # ART_ORDER changes which slot each section goes to, so an old iGame.iff
+    # from a previous order would otherwise stay and keep being shown.
+    if [ "$REFRESH_ART" -eq 1 ]; then
+        rm -f "$dest_sub"/iGame.iff "$dest_sub"/igame1.iff "$dest_sub"/igame2.iff 2>/dev/null
+    fi
+
+    # 1) Copy all non-IFF artwork files from this section into the game dir
+    #    Preserve original names; replace one already there only when the
+    #    pack's copy is newer or bigger (see art_should_copy).
+    for f in "$best_dir"/*; do
+        [ -f "$f" ] || continue
+        base="${f##*/}"
+        case "$base" in
+            *:a314) continue ;;  # A314 bridge metadata sidecar file, not real artwork
+        esac
+        case "${base,,}" in
+            *.iff) continue ;;  # handled separately below
+        esac
+        dest_file="$dest_sub/$base"
+        if art_should_copy "$f" "$dest_file"; then
+            if [ -e "$dest_file" ]; then ART_REPLACED=$((ART_REPLACED + 1)); else ART_NEW=$((ART_NEW + 1)); fi
+            debug_log " Non-IFF copy: $base -> ${dest_file##*/}"
+            if ! cp -p "$f" "$dest_file" 2>/dev/null; then
+                echo "ERROR copying non-IFF $best_section for $dest_name from $f" >> "$ERROR_LOG"
+            fi
+        fi
+    done
+
+    # 2) Handle the iGame.iff file according to priority index
+    priority_idx=-1
+    for i in "${!ART_ORDER[@]}"; do
+        if [ "${ART_ORDER[$i]}" = "$best_section" ]; then
+            priority_idx="$i"
+            break
+        fi
+    done
+
+    chosen_src_iff=""
+    for f in "$best_dir"/*; do
+        [ -f "$f" ] || continue
+        base="${f##*/}"
+        case "$base" in
+            *:a314) continue ;;  # A314 bridge metadata sidecar file
+        esac
+        case "${base,,}" in
+            igame.iff)
+                chosen_src_iff="$f"
+                break
+                ;;
+        esac
+    done
+
+    [ -z "$chosen_src_iff" ] && return 1
+
+    base="${chosen_src_iff##*/}"
+    dest_file="$dest_sub/$base"
+
+    # Priority-based renaming for iGame.iff
+    case "$priority_idx" in
+        0) dest_file="$dest_sub/iGame.iff" ;;
+        1) dest_file="$dest_sub/igame1.iff" ;;
+        2) dest_file="$dest_sub/igame2.iff" ;;
+    esac
+
+    debug_log " iGame.iff copy: ${chosen_src_iff##*/} -> ${dest_file##*/}"
+
+    if cp -f "$chosen_src_iff" "$dest_file" 2>/dev/null; then
+        igameecs_found=1
+
+        # 3) Paired .data handling: same stem as chosen_src_iff. Written when
+        #    missing, or always with --refresh-artwork.
+        src_stem="${chosen_src_iff%.*}"
+        data_src="${src_stem}.data"
+        if [ -f "$data_src" ]; then
+            data_base="${data_src##*/}"
+            data_dst="$dest_sub/$data_base"
+            if art_should_copy "$data_src" "$data_dst"; then
+                if [ -e "$data_dst" ]; then ART_REPLACED=$((ART_REPLACED + 1)); else ART_NEW=$((ART_NEW + 1)); fi
+                debug_log " Paired .data copy: $data_base -> ${data_dst##*/}"
+                if ! cp -p "$data_src" "$data_dst" 2>/dev/null; then
+                    echo "ERROR copying .data for $dest_name from $data_src" >> "$ERROR_LOG"
+                fi
+            else
+                debug_log " Paired .data exists, skipping: $data_base"
+            fi
+        fi
+
+        # Log iGame section usage (optional) – this drives igameecs_count
+        files=( "$best_dir"/* )
+        if [ ${#files[@]} -gt 0 ] && [ -e "${files[0]}" ]; then
+            echo "$best_section $dest_name: ${#files[@]} files" >> "$IGAMEECS_LOG"
+        fi
+        return 0
+    else
+        echo "ERROR copying $best_section for $dest_name from $chosen_src_iff" >> "$ERROR_LOG"
+        return 1
+    fi
+}
+
+for dest_sub in "${merge_targets[@]}"; do
+    [ -z "$dest_sub" ] && continue
+    dest_name="${dest_sub##*/}"
+    debug_log "Processing target: $dest_name -> $dest_sub"
+
+    # --only-missing: skip this target entirely if it already has an
+    # iGame.iff-family file (whichever priority slot it landed in) AND a
+    # .data file - cheap early-out so a "fill gaps" pass doesn't redo the
+    # (more expensive) fallback-chain lookup for everything that's already
+    # merged, just for whatever's still actually missing.
+    if [ "$ONLY_MISSING" -eq 1 ]; then
+        has_iff=0
+        has_data=0
+        for _omf in "$dest_sub"/iGame.iff "$dest_sub"/igame1.iff "$dest_sub"/igame2.iff; do
+            [ -f "$_omf" ] && has_iff=1 && break
+        done
+        for _omf in "$dest_sub"/*.data; do
+            [ -f "$_omf" ] && has_data=1 && break
+        done
+        if [ "$has_iff" -eq 1 ] && [ "$has_data" -eq 1 ]; then
+            debug_log "Skipping (already has artwork, --only-missing): $dest_name"
+            processed=$((processed + 1))
+            if (( processed % PROGRESS_STEP == 0 || processed == total_targets )); then
+                progress_bar "$processed" "$total_targets" "$BAR_WIDTH"
+            fi
+            continue
+        fi
+    fi
+
+    # Select artwork order for this directory
+    # Default: non-demos use GAME_ART_PRIORITY; Demos use DEMO_ART_PRIORITY (unless overridden)
+    if [[ "$dest_sub" == *"/Demos/"* ]]; then
+        # Use demo-specific order (default Titles,Screens,Covers, or CLI override)
+        IFS=',' read -r -a ART_ORDER <<< "$DEMO_ART_PRIORITY"
+    else
+        # Use standard game/mag order
+        IFS=',' read -r -a ART_ORDER <<< "$GAME_ART_PRIORITY"
+    fi
+
+    # Decide TinyLauncher primary index based on first section for this directory
+    primary_section="${ART_ORDER[0]}"
+    case "$primary_section" in
+        Covers) tl_primary_index=0 ;; # iGame.iff from _SCR0
+        Titles) tl_primary_index=1 ;; # iGame.iff from _SCR1
+        Screens) tl_primary_index=2 ;; # iGame.iff from _SCR2
+        *)      tl_primary_index=0 ;; # sensible default
+    esac
+
+    igameecs_found=0
+    tinylauncher_found=0
+
+    best_section=""
+    best_dir=""
+    best_src=""
+
+    # Walk the fallback chain in order; within each source, respect this
+    # target's section priority (ART_ORDER). First hit anywhere wins.
+    # (Obvious helper directories like data/txt/cfg were already filtered
+    # out of merge_targets above, so every dest_sub here is worth checking
+    # against both the iGame index and, below, TinyLauncher - a game that
+    # only has TinyLauncher artwork and no iGame_* match must still reach
+    # that check rather than being skipped early.)
+    # Pass 1: everything explicitly listed BEFORE TinyLauncher in the
+    # chain (the named tiers for whichever set was selected). Anything
+    # appended after TINYLAUNCHER (other discovered iGame_* directories)
+    # is deliberately NOT checked here - those are only tried in pass 2,
+    # below, after TinyLauncher itself has already had its chance, to
+    # match the intended priority order (named chain -> TinyLauncher ->
+    # anything else).
+    for _fbc in "${FALLBACK_CHAIN[@]}"; do
+        [ "$_fbc" = "TINYLAUNCHER" ] && break
+        for section in "${ART_ORDER[@]}" Any; do
+            key="$_fbc|$section|$dest_name"
+            if [ -z "${IGAME_INDEX[$key]:-}" ]; then      # try ignoring capitalisation
+                _lck="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')"
+                [ -n "${IGAME_INDEX_LC[$_lck]:-}" ] && IGAME_INDEX["$key"]="${IGAME_INDEX_LC[$_lck]}"
+            fi
+            if [ -n "${IGAME_INDEX[$key]+_}" ]; then
+                best_section="$section"
+                best_dir="${IGAME_INDEX[$key]}"
+                best_src="$_fbc"
+                break 2
+            fi
+        done
+    done
+    if [ -n "$best_src" ]; then
+        debug_log "Matched $dest_name via $best_src ($best_section)"
+    fi
+
+    if try_copy_matched_artwork; then
+        processed=$((processed + 1))
+        if (( processed % PROGRESS_STEP == 0 || processed == total_targets )); then
+            progress_bar "$processed" "$total_targets" "$BAR_WIDTH"
+        fi
+        continue
+    fi
+
+    # TinyLauncher processing (fallback only if no iGame artwork was found)
+    if [ -d "$TINYLAUNCHER_SRC" ] && [ "$igameecs_found" -eq 0 ]; then
+        for subdir in Game Demo Magazine Beta; do
+            search_dir="$TINYLAUNCHER_SRC/$subdir"
+            [ ! -d "$search_dir" ] && continue
+            debug_log "Checking TinyLauncher $subdir: $search_dir"
+            tl_src=""
+
+            for ext in iff IFF; do
+                candidate="$search_dir/${dest_name}_SCR${tl_primary_index}.${ext}"
+                if [ -f "$candidate" ]; then
+                    debug_log " FOUND TinyLauncher candidate: ${candidate##*/}"
+                    tl_src="$candidate"
+                    break
+                fi
+            done
+
+            if [ -n "$tl_src" ]; then
+                dest_file="$dest_sub/iGame.iff"
+                debug_log " Copying TinyLauncher -> $dest_file"
+
+                if cp -f "$tl_src" "$dest_file" 2>/dev/null; then
+                    tinylauncher_found=1
+                    echo "1" >> "$TINYLAUNCHER_LOG"
+                else
+                    echo "ERROR: Failed to copy TinyLauncher artwork for '$dest_name' from '$tl_src'" >> "$ERROR_LOG"
+                fi
+
+                # We found one TinyLauncher match for this dest_name; stop checking other TL subdirs
+                break
+            fi
+        done
+    fi
+
+    # Pass 2: still nothing after the named chain AND TinyLauncher - try
+    # any OTHER discovered iGame_* directory (appended to FALLBACK_CHAIN
+    # after TINYLAUNCHER). This is deliberately the LAST resort, tried
+    # only once everything explicitly listed has already missed.
+    if [ "$igameecs_found" -eq 0 ] && [ "$tinylauncher_found" -eq 0 ]; then
+        best_section=""
+        best_dir=""
+        best_src=""
+        _past_tl=0
+        for _fbc in "${FALLBACK_CHAIN[@]}"; do
+            if [ "$_past_tl" -eq 0 ]; then
+                [ "$_fbc" = "TINYLAUNCHER" ] && _past_tl=1
+                continue
+            fi
+            for section in "${ART_ORDER[@]}" Any; do
+                key="$_fbc|$section|$dest_name"
+            if [ -z "${IGAME_INDEX[$key]:-}" ]; then      # try ignoring capitalisation
+                _lck="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')"
+                [ -n "${IGAME_INDEX_LC[$_lck]:-}" ] && IGAME_INDEX["$key"]="${IGAME_INDEX_LC[$_lck]}"
+            fi
+                if [ -n "${IGAME_INDEX[$key]+_}" ]; then
+                    best_section="$section"
+                    best_dir="${IGAME_INDEX[$key]}"
+                    best_src="$_fbc"
+                    break 2
+                fi
+            done
+        done
+        unset _past_tl
+        if [ -n "$best_src" ]; then
+            debug_log "Matched $dest_name via $best_src ($best_section) [after TinyLauncher]"
+        fi
+        try_copy_matched_artwork
+    fi
+
+    if [ "$igameecs_found" -eq 0 ] && [ "$tinylauncher_found" -eq 0 ]; then
+        debug_log "NO ARTWORK FOUND for $dest_name"
+        # Only real game folders (those with a drawer icon beside them) are
+        # reported, so structural folders like AGA/ or S/ never show up.
+        if [ -n "$REPORT_MISSING" ] && [ -e "$dest_sub.info" ]; then
+            printf '%s\n' "${dest_sub#"$DEST"/}" >> "$REPORT_MISSING"
+        fi
+    fi
+
+    # Progress and counters for this dest_sub
+    processed=$((processed + 1))
+    if (( processed % PROGRESS_STEP == 0 || processed == total_targets )); then
+        progress_bar "$processed" "$total_targets" "$BAR_WIDTH"
+    fi
+done
+
+shopt -u nullglob
+
+# Draw the finished bar only if the loop did not already (it does whenever it
+# counts the last game; drawing it again printed the 100% line twice).
+if (( total_targets > 0 && processed != total_targets )); then
+    progress_bar "$total_targets" "$total_targets" "$BAR_WIDTH"
+fi
+
+printf "\n"
+
+if [ -s "$ERROR_LOG" ]; then errors=$(wc -l < "$ERROR_LOG" | tr -d ' '); else errors=0; fi
+if [ -s "$IGAMEECS_LOG" ]; then igameecs_count=$(wc -l < "$IGAMEECS_LOG" | tr -d ' '); else igameecs_count=0; fi
+if [ -s "$TINYLAUNCHER_LOG" ]; then tinylauncher_count=$(wc -l < "$TINYLAUNCHER_LOG" | tr -d ' '); else tinylauncher_count=0; fi
+
+elapsed=$(( $(date +%s) - start_time ))
+fmt_time="$(format_elapsed_time "$elapsed")"
+
+rp_child_result "stage=merge" "status=$([ "$errors" -eq 0 ] && echo ok || echo warnings)" \
+    "seconds=$SECONDS" "merged=$igameecs_count" "tinylauncher=$tinylauncher_count" \
+    "added=$ART_NEW" "refreshed=$ART_REPLACED" "errors=$errors" "dest=$DEST"
+echo -e "${BOLD}=================== MERGE REPORT ===================${NC}"
+echo "Destination: $DEST"
+echo "Artwork Source: $ART_SRC"
+echo "Game/Mag art order: $GAME_ART_PRIORITY"
+echo "Demo art order: $DEMO_ART_PRIORITY"
+echo "Elapsed Time: $fmt_time"
+echo "iGame artwork merged: $igameecs_count"
+echo "TinyLauncher screenshots: $tinylauncher_count"
+echo "Artwork files added: $ART_NEW"
+echo "Artwork files refreshed: $ART_REPLACED"
+echo "Copy errors: $errors"
+echo -e "${BOLD}====================================================${NC}"
+
+if [ $errors -ne 0 ]; then
+  # Into logs/, which is where start.sh gathers the run's errors from and
+  # where all.sh counts them. This used to land beside the scripts, so merge
+  # errors never reached retroerror.log and the summary reported none.
+  mkdir -p "$RP_LOG_ROOT" 2>/dev/null
+  cp "$ERROR_LOG" "$RP_LOG_ROOT/merge_errors.log"
+  echo
+  echo -e "${RED}ERROR: $errors errors occurred during merge.${NC}"
+  echo -e "${YELLOW}See $RP_LOG_ROOT/merge_errors.log for details.${NC}"
+fi
+
+if [ "$DEBUG" -eq 1 ] && [ -s "$IGAMEECS_LOG" ]; then
+    echo
+    echo "--- iGame Artwork Details ---"
+    cat "$IGAMEECS_LOG"
+fi
+
+rm -f "$ERROR_LOG" "$IGAMEECS_LOG" "$TINYLAUNCHER_LOG"
+
+echo
+echo "Merge complete."
